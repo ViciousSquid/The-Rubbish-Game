@@ -14,7 +14,7 @@ CITY_H = 60
 class WasteCityGame:
     def __init__(self):
         pygame.init()
-        pygame.display.set_caption("Waste Borough - UK Refuse Management Sim")
+        pygame.display.set_caption("The Rubbish Game")
         self.screen = pygame.display.set_mode((1280, 720), pygame.RESIZABLE)
         self.clock = pygame.time.Clock()
 
