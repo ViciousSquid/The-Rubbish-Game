@@ -337,13 +337,12 @@ class UIManager:
         x = 14
         inner = HUD_W - 28
         half = (inner - 8) // 2
-        y = 340
         self.buttons = [
-            {"rect": pygame.Rect(x, y, half, 34), "label": "Pause", "action": "pause"},
-            {"rect": pygame.Rect(x + half + 8, y, half, 34), "label": "1x", "action": "speed"},
-            {"rect": pygame.Rect(x, y + 42, inner, 34), "label": "Procure Vehicle", "action": "fleet_tab"},
-            {"rect": pygame.Rect(x, y + 80, inner, 34), "label": "Hire Crew", "cost": 2500, "action": "worker"},
-            {"rect": pygame.Rect(x, y + 118, inner, 34), "label": "Collection Planner", "action": "planner"},
+            {"rect": pygame.Rect(x,            0, half,  34), "label": "Pause",              "action": "pause",     "row_offset": 0},
+            {"rect": pygame.Rect(x + half + 8, 0, half,  34), "label": "1x",                 "action": "speed",     "row_offset": 0},
+            {"rect": pygame.Rect(x,            0, inner, 34), "label": "Procure Vehicle",     "action": "fleet_tab", "row_offset": 42},
+            {"rect": pygame.Rect(x,            0, inner, 34), "label": "Hire Crew", "cost": 2500, "action": "worker",   "row_offset": 80},
+            {"rect": pygame.Rect(x,            0, inner, 34), "label": "Collection Planner",  "action": "planner",   "row_offset": 118},
         ]
 
     def handle_click(self, pos):
@@ -388,6 +387,12 @@ class UIManager:
         self._current_event = event
         self._event_visible = True
         self._event_timer_active = 0
+        # Critical events get a longer initial display window; they also persist
+        # in the banner for as long as they remain the active_event (see
+        # _draw_event_banner), so the transient duration only matters for the
+        # first appearance before the active_event is set.
+        critical = event.get("effect") in ("crewStrike", "truckBreakdown")
+        self._event_duration = 10.0 if critical else 5.5
 
     def _flash_insufficient(self):
         self._insufficient_funds_flash = True
@@ -415,14 +420,15 @@ class UIManager:
         self.ui = UIPrimitives(screen, self.fonts)
         w, h = screen.get_size()
         self._draw_hud(screen, w, h)
-        self._draw_event_banner(screen, w)
         self._draw_crisis_banner(screen, w, h)
         self._draw_win_banner(screen, w, h)
         self._draw_inspect_panel(screen, w, h)
         if self.game.planner_open:
             self._draw_planner(screen, w, h)
-        self._draw_procurement_bar(screen, w)
         self._draw_toast(screen, w, h)
+        # Procurement bar drawn before event banner so events always render on top.
+        self._draw_procurement_bar(screen, w)
+        self._draw_event_banner(screen, w)
 
     def _draw_toast(self, screen, w, h):
         if not getattr(self.game, "toast", "") or self.game.toast_timer <= 0:
@@ -470,7 +476,17 @@ class UIManager:
         bw = min(surf.get_width() + pad * 2, w - 40)
         bh = 36
         bx = (w - bw) // 2
-        by = 10
+
+        # If a critical event banner is visible (strike / breakdown), push the
+        # procurement bar below it so neither obscures the other.
+        active = eco.active_event
+        CRITICAL_EFFECTS = ("crewStrike", "truckBreakdown")
+        critical_showing = (
+            (self._event_visible and self._current_event and
+             self._current_event.get("effect") in CRITICAL_EFFECTS)
+            or (active and active.get("effect") in CRITICAL_EFFECTS)
+        )
+        by = 120 if critical_showing else 10
 
         # Background
         pygame.draw.rect(screen, (0, 0, 0, 80), pygame.Rect(bx + 2, by + 2, bw, bh), border_radius=6)
@@ -569,7 +585,7 @@ class UIManager:
         ui.section_header(x, y, "CONTROLS", w=HUD_W - 28)
         y += 24
         for btn in self.buttons:
-            btn["rect"].y = y + (self.buttons.index(btn) * 38)
+            btn["rect"].y = y + btn["row_offset"]
             self._draw_button(screen, btn, ui)
         y = self.buttons[-1]["rect"].bottom + 16
         ui.section_header(x, y, "COLLECTIONS", w=HUD_W - 28)
@@ -588,24 +604,53 @@ class UIManager:
         y += 26
 
     def _draw_event_banner(self, screen, w):
-        if not self._event_visible or not self._current_event:
+        active = self.game.economy.active_event
+        CRITICAL_EFFECTS = ("crewStrike", "truckBreakdown")
+
+        # Determine which event (if any) to display.
+        # Priority: transient visible banner > persistent critical active event.
+        is_critical_active = active and active.get("effect") in CRITICAL_EFFECTS
+        if not self._event_visible and not is_critical_active:
             return
+
+        event = self._current_event if self._event_visible else active
+        if not event:
+            return
+
         ui = self.ui
         c = ui.c
+
+        # Choose accent colour by severity.
+        effect = event.get("effect", "")
+        if effect == "crewStrike":
+            accent = c.STATUS_BAD          # red  — most severe
+        elif effect == "truckBreakdown":
+            accent = c.STATUS_WARN         # orange — serious
+        else:
+            accent = c.ACCENT_AMBER        # amber  — standard
+
+        # Animation progress: slide in/out for the transient window.
+        # For persistent critical events (active but transient expired), hold fully open.
+        if self._event_visible:
+            progress = min(1.0, self._event_timer_active / 0.45)
+            if self._event_timer_active > self._event_duration - 0.45:
+                progress = 1.0 - min(1.0,
+                    (self._event_timer_active - (self._event_duration - 0.45)) / 0.45)
+        else:
+            progress = 1.0  # persistent: fully open, no animation
+
         bw = min(520, max(360, w // 2))
         bh = 80
         bx = (w - bw) // 2
-        progress = min(1.0, self._event_timer_active / 0.45)
-        if self._event_timer_active > self._event_duration - 0.45:
-            progress = 1.0 - min(1.0, (self._event_timer_active - (self._event_duration - 0.45)) / 0.45)
         by = int(-100 + (130 * progress))
+
         pygame.draw.rect(screen, (0, 0, 0, 80), pygame.Rect(bx + 3, by + 3, bw, bh), border_radius=8)
-        pygame.draw.rect(screen, c.BG_CARD, pygame.Rect(bx, by, bw, bh), border_radius=8)
-        pygame.draw.rect(screen, c.ACCENT_AMBER, pygame.Rect(bx, by, 5, bh), border_radius=8)
-        pygame.draw.rect(screen, c.BORDER, pygame.Rect(bx, by, bw, bh), 1, border_radius=8)
-        e = self._current_event
-        ui.text("h2", e["name"], c.ACCENT_AMBER, bx + 20, by + 14)
-        ui.text("body", e["desc"], c.TEXT_SECONDARY, bx + 20, by + 44)
+        pygame.draw.rect(screen, c.BG_CARD,     pygame.Rect(bx, by, bw, bh),         border_radius=8)
+        pygame.draw.rect(screen, accent,         pygame.Rect(bx, by, 5, bh),          border_radius=8)
+        pygame.draw.rect(screen, c.BORDER,       pygame.Rect(bx, by, bw, bh), 1,      border_radius=8)
+
+        ui.text("h2",   event["name"], accent,        bx + 20, by + 14)
+        ui.text("body", event["desc"], c.TEXT_SECONDARY, bx + 20, by + 44)
 
     def _draw_crisis_banner(self, screen, w, h):
         if not self._insufficient_funds_flash and not self.game.economy.is_budget_crisis():

@@ -181,13 +181,11 @@ class WasteCityGame:
         new_day = self.economy.update(sim_dt, self.city, self.fleet, self.waste)
 
         if new_day:
-            # Deliver any vehicles that have arrived.
-            delivered = self.fleet.process_deliveries(self.economy.day)
-            if delivered:
+            delivered, events_triggered = self.fleet.process_deliveries(self.economy.day)
+            if delivered:                          # ← must stay indented under new_day
                 self.set_toast("Delivered: " + ", ".join(str(d) for d in delivered))
-            # Once-per-day service-quality snapshot (one scan, not per frame).
             self.economy.register_day_quality(
-            self.city, self.waste.satisfaction_ceiling())
+                self.city, self.waste.satisfaction_ceiling())
 
         if self.economy.pending_event:
             self.ui.show_event(self.economy.pending_event)

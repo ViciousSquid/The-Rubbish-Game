@@ -1,21 +1,26 @@
 import pygame
 import math
 import os
+import random                           # was previously imported inline per-call
 from city import AREA_COLS, AREA_ROWS, DAY_NAMES
 
-# Try to load truck.png for truck sprites
-try:
-    from PIL import Image
-    _ico_path = "truck.png"
-    _truck_icon = None
-    if os.path.exists(_ico_path):
-        img = Image.open(_ico_path)
-        # Convert to RGBA and create pygame surface
-        img = img.convert("RGBA")
-        _truck_icon = pygame.image.fromstring(img.tobytes(), img.size, "RGBA")
-except Exception:
-    _truck_icon = None
+# ─── module-level font cache ──────────────────────────────────────────────────
+# pygame.font.SysFont() is an OS call that can take several milliseconds.
+# Calling it every frame (as the original code did) is the single biggest
+# per-frame cost in the renderer.  Cache by (family, size, bold) and reuse.
+_FONT_CACHE: dict = {}
 
+
+def _get_font(name: str, size: int, bold: bool = False) -> pygame.font.Font:
+    key = (name, size, bold)
+    f = _FONT_CACHE.get(key)
+    if f is None:
+        f = pygame.font.SysFont(name, size, bold=bold)
+        _FONT_CACHE[key] = f
+    return f
+
+
+# ─── shared helpers ───────────────────────────────────────────────────────────
 
 def _shade(color, f):
     """Multiply an (r,g,b) or hex colour by factor f, clamped to 0..255."""
@@ -58,16 +63,16 @@ STYLE_FOOTPRINT = {
     "shop": 0.90, "office": 0.80, "warehouse": 0.92, "highrise": 0.66,
 }
 
-# Zone type colors for ground tiles - clearly differentiated
-RESIDENTIAL_ZONE = (104, 150, 86)      # Warm green for residential
-COMMERCIAL_ZONE = (96, 116, 84)         # Cooler blue-green for commercial
-ROAD_COLOR = (78, 80, 86)
-GREEN_ZONE = (95, 145, 85)
+# Zone type colors for ground tiles
+RESIDENTIAL_ZONE  = (104, 150, 86)
+COMMERCIAL_ZONE   = (96, 116, 84)
+ROAD_COLOR        = (78, 80, 86)
+GREEN_ZONE        = (95, 145, 85)
 
 # Area overlay colors by route type
 RESIDENTIAL_AREA_COLOR = (200, 220, 180, 40)
-COMMERCIAL_AREA_COLOR = (180, 200, 230, 40)
-MIXED_AREA_COLOR = (220, 210, 180, 40)
+COMMERCIAL_AREA_COLOR  = (180, 200, 230, 40)
+MIXED_AREA_COLOR       = (220, 210, 180, 40)
 
 
 class Renderer:
@@ -77,7 +82,13 @@ class Renderer:
         self.tile_w = 64
         self.tile_h = 32
 
-        # Load truck icon if available
+        # Pre-computed iso half-extents — avoids the division inside to_iso()
+        # which is called thousands of times per frame.
+        self._iso_hw = self.tile_w >> 1   # 32
+        self._iso_hh = self.tile_h >> 1   # 16
+
+        # Load truck icon — done once here only (original code also loaded at
+        # module level, wasting an import + PIL decode before the display was ready).
         self._truck_icon = None
         try:
             from PIL import Image
@@ -90,13 +101,49 @@ class Renderer:
 
         # Static cache for batch rendering
         self._static_cache = None
-        self._cache_key = None
+        self._cache_key    = None
 
-    # ----------------------------------------------------------------- render
+        # ── per-frame SRCALPHA surface pool ───────────────────────────────────
+        # Creating pygame.Surface(…, SRCALPHA) allocates memory every call.
+        # We reuse surfaces of the same pixel dimensions by clearing them instead.
+        # Each surface is draw→blit before being returned to the pool, so
+        # concurrent reuse within a single frame is safe.
+        self._surf_cache: dict = {}
+
+        # ── weather overlay ───────────────────────────────────────────────────
+        # Weather previously created 60-120 tiny SRCALPHA surfaces per frame.
+        # Now we rebuild a single screen-sized surface every 80 ms (matching the
+        # animation granularity of the original code) and blit it once.
+        self._weather_surf: pygame.Surface | None = None
+        self._weather_seed: int  = -1
+        self._weather_size: tuple = (0, 0)
+
+        # ── FPS limiter ───────────────────────────────────────────────────────
+        self._clock = pygame.time.Clock()
+
+    # ─── SRCALPHA surface pool ────────────────────────────────────────────────
+
+    def _get_alpha_surf(self, w: int, h: int) -> pygame.Surface:
+        """Return a cached, freshly-cleared SRCALPHA surface of size (w, h).
+
+        Callers must follow the draw→blit→done pattern within the same scope
+        before requesting the same (w, h) again, which all callers in this file do.
+        """
+        key = (w, h)
+        s = self._surf_cache.get(key)
+        if s is None:
+            s = pygame.Surface((w, h), pygame.SRCALPHA)
+            self._surf_cache[key] = s
+        else:
+            s.fill((0, 0, 0, 0))
+        return s
+
+    # ─── render ───────────────────────────────────────────────────────────────
+
     def render(self, city, fleet, selected_tile=None, today=0, show_areas=False,
                hovered_tile=None, economy=None, ambient=None):
-        cx = self.screen.get_width() // 2 + self.camera["x"]
-        cy = 120 + self.camera["y"]
+        cx   = self.screen.get_width() // 2 + self.camera["x"]
+        cy   = 120 + self.camera["y"]
         zoom = self.camera["zoom"]
         sw, sh = self.screen.get_size()
 
@@ -107,21 +154,32 @@ class Renderer:
         use_cache = self._static_cache is not None
         if use_cache:
             cache = self._static_cache
-            self.screen.blit(cache["surface"], (int(cx - cache["offset_x"]), int(cy - cache["offset_y"])))
+            self.screen.blit(cache["surface"],
+                             (int(cx - cache["offset_x"]), int(cy - cache["offset_y"])))
+
+        # Pre-compute selection / hover grid positions for O(1) per-tile matching.
+        sel_pos = (selected_tile["x"], selected_tile["y"]) if selected_tile else None
+        hov_pos = (hovered_tile["x"],  hovered_tile["y"])  if hovered_tile  else None
+
+        # Pre-multiply frustum-cull margins so they're not recomputed per tile.
+        cull_x_lo = -80  * zoom
+        cull_x_hi =  sw  + 80  * zoom
+        cull_y_lo = -320 * zoom
+        cull_y_hi =  sh  + 80  * zoom
 
         for y in range(city.height):
             for x in range(city.width):
                 iso = self.to_iso(x, y)
-                ix = cx + iso[0] * zoom
-                iy = cy + iso[1] * zoom
-                if ix < -80 * zoom or ix > sw + 80 * zoom:
+                ix  = cx + iso[0] * zoom
+                iy  = cy + iso[1] * zoom
+                if ix < cull_x_lo or ix > cull_x_hi:
                     continue
-                if iy < -320 * zoom or iy > sh + 80 * zoom:
+                if iy < cull_y_lo or iy > cull_y_hi:
                     continue
 
-                tile = city.get_tile(x, y)
-                selected = selected_tile and selected_tile["x"] == x and selected_tile["y"] == y
-                hovered = hovered_tile and hovered_tile["x"] == x and hovered_tile["y"] == y
+                tile     = city.get_tile(x, y)
+                selected = sel_pos == (x, y)
+                hovered  = hov_pos == (x, y)
 
                 if not use_cache:
                     self.draw_tile(ix, iy, tile, selected, zoom, city)
@@ -129,14 +187,27 @@ class Renderer:
                         self.draw_building(ix, iy, tile, zoom, today, hovered, selected)
                 else:
                     if tile.type not in ("road", "green", "landfill"):
-                        self._draw_building_dynamic(ix, iy, tile, zoom, today, hovered, selected)
+                        # Skip the dynamic pass entirely when there is nothing to
+                        # draw — this avoids iterating every building tile every
+                        # frame when most of them are in a neutral state.
+                        days_ov = getattr(tile, "days_overflowing", 0)
+                        if (selected or hovered
+                                or tile.bin_fill > 85
+                                or days_ov > 0
+                                or (zoom >= 1.55
+                                    and tile.collection_due == today
+                                    and tile.bin_fill > 20)):
+                            self._draw_building_dynamic(
+                                ix, iy, tile, zoom, today, hovered, selected)
 
                 # Selection outline for non-building tiles
                 if selected and tile.type in ("road", "green", "landfill"):
-                    hw = (self.tile_w / 2) * zoom
-                    hh = (self.tile_h / 2) * zoom
-                    points = [(ix, iy), (ix + hw, iy + hh), (ix, iy + 2 * hh), (ix - hw, iy + hh)]
-                    pygame.draw.polygon(self.screen, (245, 245, 245), points, max(2, int(2 * zoom)))
+                    hw     = (self.tile_w / 2) * zoom
+                    hh     = (self.tile_h / 2) * zoom
+                    points = [(ix, iy), (ix + hw, iy + hh),
+                              (ix, iy + 2 * hh), (ix - hw, iy + hh)]
+                    pygame.draw.polygon(self.screen, (245, 245, 245), points,
+                                        max(2, int(2 * zoom)))
 
         # Landfill site (large refuse mound in a corner)
         self.draw_landfill(cx, cy, city, zoom)
@@ -181,7 +252,12 @@ class Renderer:
         if economy:
             self.draw_weather(economy.weather, economy.day_timer, economy.day_duration)
 
-    # --------------------------------------------------------------- static cache
+        # ── 60 FPS cap ────────────────────────────────────────────────────────
+        # Anything faster than 60 FPS is wasted work on this target hardware.
+        self._clock.tick(60)
+
+    # ─── static cache ─────────────────────────────────────────────────────────
+
     def _needs_static_cache_update(self, city, zoom):
         key = (id(city), round(zoom, 2))
         if self._cache_key != key:
@@ -190,8 +266,8 @@ class Renderer:
         return False
 
     def _render_static(self, city, zoom):
-        """Render all static city geometry (ground tiles + buildings) to an off-screen
-        surface. Returns None if the cache would be too large."""
+        """Render all static city geometry (ground tiles + buildings) to an
+        off-screen surface.  Returns None if the cache would be too large."""
         corners = [
             self.to_iso(0, 0),
             self.to_iso(city.width, 0),
@@ -203,11 +279,10 @@ class Renderer:
         min_iy = min(c[1] for c in corners)
         max_iy = max(c[1] for c in corners)
 
-        pad = 200
+        pad     = 200
         cache_w = int((max_ix - min_ix) * zoom) + pad * 2
         cache_h = int((max_iy - min_iy) * zoom) + pad * 2 + int(160 * zoom)
 
-        # Don't cache if the surface would be enormous (e.g. at very high zoom)
         MAX_CACHE_PIXELS = 25_000_000
         if cache_w * cache_h > MAX_CACHE_PIXELS:
             return None
@@ -218,24 +293,26 @@ class Renderer:
         surface = pygame.Surface((cache_w, cache_h), pygame.SRCALPHA)
         surface.fill((0, 0, 0, 0))
 
-        old_screen = self.screen
+        old_screen  = self.screen
         self.screen = surface
         try:
             for y in range(city.height):
                 for x in range(city.width):
                     iso = self.to_iso(x, y)
-                    ix = offset_x + iso[0] * zoom
-                    iy = offset_y + iso[1] * zoom
+                    ix  = offset_x + iso[0] * zoom
+                    iy  = offset_y + iso[1] * zoom
                     tile = city.get_tile(x, y)
                     self.draw_tile(ix, iy, tile, False, zoom, city, static_only=True)
                     if tile.type not in ("road", "green", "landfill"):
-                        self.draw_building(ix, iy, tile, zoom, 0, False, False, static_only=True)
+                        self.draw_building(ix, iy, tile, zoom, 0, False, False,
+                                           static_only=True)
         finally:
             self.screen = old_screen
 
         return {"surface": surface, "offset_x": offset_x, "offset_y": offset_y}
 
-    # --------------------------------------------------------------- ground
+    # ─── ground ───────────────────────────────────────────────────────────────
+
     def _draw_ground_plane(self, cx, cy, city, zoom):
         corners = [
             self.to_iso(0, 0),
@@ -248,96 +325,95 @@ class Renderer:
 
     def _draw_city_boundary(self, cx, cy, city, zoom):
         self._draw_edge_line(cx, cy, 0, 0, city.width, 0, zoom, (120, 120, 130))
-        self._draw_edge_line(cx, cy, city.width, 0, city.width, city.height, zoom, (100, 100, 110))
-        self._draw_edge_line(cx, cy, city.width, city.height, 0, city.height, zoom, (80, 80, 90))
+        self._draw_edge_line(cx, cy, city.width, 0, city.width, city.height,
+                             zoom, (100, 100, 110))
+        self._draw_edge_line(cx, cy, city.width, city.height, 0, city.height,
+                             zoom, (80, 80, 90))
         self._draw_edge_line(cx, cy, 0, city.height, 0, 0, zoom, (100, 100, 110))
 
     def _draw_edge_line(self, cx, cy, x1, y1, x2, y2, zoom, color):
         start = self.to_iso(x1, y1)
-        end = self.to_iso(x2, y2)
-        pygame.draw.line(self.screen, color,
-                         (cx + start[0] * zoom, cy + start[1] * zoom),
-                         (cx + end[0] * zoom, cy + end[1] * zoom),
-                         max(2, int(3 * zoom)))
+        end   = self.to_iso(x2, y2)
+        pygame.draw.line(
+            self.screen, color,
+            (cx + start[0] * zoom, cy + start[1] * zoom),
+            (cx + end[0]   * zoom, cy + end[1]   * zoom),
+            max(2, int(3 * zoom)))
 
-    # ------------------------------------------------------------- iso maths
+    # ─── iso maths ────────────────────────────────────────────────────────────
+
     def to_iso(self, x, y):
-        return ((x - y) * (self.tile_w / 2), (x + y) * (self.tile_h / 2))
+        # Use pre-computed half-extents instead of dividing tile_w/tile_h each call.
+        hw, hh = self._iso_hw, self._iso_hh
+        return ((x - y) * hw, (x + y) * hh)
 
     def screen_to_tile(self, screen_x, screen_y, screen_w, screen_h):
-        ix = (screen_x - screen_w // 2 - self.camera["x"]) / self.camera["zoom"]
-        iy = (screen_y - 120 - self.camera["y"]) / self.camera["zoom"]
+        ix     = (screen_x - screen_w // 2 - self.camera["x"]) / self.camera["zoom"]
+        iy     = (screen_y - 120            - self.camera["y"]) / self.camera["zoom"]
         tile_x = (ix / (self.tile_w / 2) + iy / (self.tile_h / 2)) / 2
         tile_y = (iy / (self.tile_h / 2) - ix / (self.tile_w / 2)) / 2
         return {"x": round(tile_x), "y": round(tile_y)}
 
-    # ------------------------------------------------------------- tile floor
+    # ─── tile floor ───────────────────────────────────────────────────────────
+
     def draw_tile(self, x, y, tile, is_selected, zoom, city=None, static_only=False):
-        hw = (self.tile_w / 2) * zoom
-        hh = (self.tile_h / 2) * zoom
+        hw     = (self.tile_w / 2) * zoom
+        hh     = (self.tile_h / 2) * zoom
         points = [(x, y), (x + hw, y + hh), (x, y + 2 * hh), (x - hw, y + hh)]
 
-        # ---- ROAD  ----
+        # ── ROAD ──
         if tile.type == "road":
             pygame.draw.polygon(self.screen, ROAD_COLOR, points)
             if is_selected and not static_only:
-                pygame.draw.polygon(self.screen, (245, 245, 245), points, max(2, int(2 * zoom)))
+                pygame.draw.polygon(self.screen, (245, 245, 245), points,
+                                    max(2, int(2 * zoom)))
             return
 
-        # ---- GREEN SPACE ----
+        # ── GREEN SPACE ──
         if tile.type == "green":
             pygame.draw.polygon(self.screen, GREEN_ZONE, points)
             if is_selected and not static_only:
-                pygame.draw.polygon(self.screen, (245, 245, 245), points, max(2, int(2 * zoom)))
+                pygame.draw.polygon(self.screen, (245, 245, 245), points,
+                                    max(2, int(2 * zoom)))
             return
 
-        # ---- LANDFILL ----
+        # ── LANDFILL ──
         if tile.type == "landfill":
-            pygame.draw.polygon(self.screen, (74, 64, 48), points)   # churned earth
+            pygame.draw.polygon(self.screen, (74, 64, 48), points)
             if zoom >= 0.7 and not static_only:
-                # a few scattered refuse specks so the ground reads as a tip
                 seed = ((int(x) * 73856093) ^ (int(y) * 19349663)) & 0xffff
                 for k in range(3):
-                    sx = x + ((seed >> (k * 3)) % 7 - 3) * hw * 0.18
-                    sy = y + hh + ((seed >> (k * 2)) % 5 - 2) * hh * 0.18
+                    sx  = x + ((seed >> (k * 3)) % 7 - 3) * hw * 0.18
+                    sy  = y + hh + ((seed >> (k * 2)) % 5 - 2) * hh * 0.18
                     col = [(40, 40, 40), (120, 40, 40), (40, 80, 120)][k % 3]
                     pygame.draw.circle(self.screen, col, (int(sx), int(sy)),
                                        max(1, int(1.6 * zoom)))
             if is_selected and not static_only:
-                pygame.draw.polygon(self.screen, (245, 245, 245), points, max(2, int(2 * zoom)))
+                pygame.draw.polygon(self.screen, (245, 245, 245), points,
+                                    max(2, int(2 * zoom)))
             return
 
-        # ---- RESIDENTIAL / COMMERCIAL ----
-        if tile.type == "commercial":
-            base = COMMERCIAL_ZONE
-        else:
-            base = RESIDENTIAL_ZONE
-
+        # ── RESIDENTIAL / COMMERCIAL ──
+        base = COMMERCIAL_ZONE if tile.type == "commercial" else RESIDENTIAL_ZONE
         pygame.draw.polygon(self.screen, base, points)
 
-        # Zone indicator dot
         if zoom >= 0.8 and not static_only:
-            if tile.type == "commercial":
-                indicator = (120, 145, 110)
-            else:
-                indicator = (130, 175, 110)
-            cx = x
-            cy = y + hh
-            pygame.draw.circle(self.screen, indicator, (int(cx), int(cy)), max(1, int(2 * zoom)))
+            indicator = (120, 145, 110) if tile.type == "commercial" else (130, 175, 110)
+            pygame.draw.circle(self.screen, indicator,
+                               (int(x), int(y + hh)), max(1, int(2 * zoom)))
 
         detail = zoom >= 1.15
 
-        # ---- SELECTION TINT ----
         if is_selected and not static_only:
             tint_color = None
             if tile.type == "residential":
-                tint_color = (120, 255, 120, 110)   # transparent green
+                tint_color = (120, 255, 120, 110)
             elif tile.type == "commercial":
-                tint_color = (120, 200, 255, 110)   # transparent blue
+                tint_color = (120, 200, 255, 110)
 
             if tint_color:
-                tint_surf = pygame.Surface((int(hw * 2.4), int(hh * 2.4)), pygame.SRCALPHA)
-                tint_pts = [
+                tint_surf = self._get_alpha_surf(int(hw * 2.4), int(hh * 2.4))
+                tint_pts  = [
                     (int(hw * 1.2), int(hh * 0.2)),
                     (int(hw * 2.2), int(hh * 1.2)),
                     (int(hw * 1.2), int(hh * 2.2)),
@@ -346,54 +422,58 @@ class Renderer:
                 pygame.draw.polygon(tint_surf, tint_color, tint_pts)
                 self.screen.blit(tint_surf, (int(x - hw * 0.2), int(y - hh * 0.2)))
 
-            pygame.draw.polygon(self.screen, (245, 245, 245), points, max(2, int(2 * zoom)))
+            pygame.draw.polygon(self.screen, (245, 245, 245), points,
+                                max(2, int(2 * zoom)))
         elif detail and not static_only:
             pygame.draw.polygon(self.screen, (40, 46, 40), points, max(1, int(zoom)))
 
-    # ------------------------------------------------------------- buildings
+    # ─── buildings ────────────────────────────────────────────────────────────
+
     def _color_cache(self, tile):
         light = pygame.Color(tile.wall_color_light)
-        dark = pygame.Color(tile.wall_color_dark)
-        roof = pygame.Color(tile.roof_color)
+        dark  = pygame.Color(tile.wall_color_dark)
+        roof  = pygame.Color(tile.roof_color)
         return {
-            "wr": _shade(light, 1.0),
-            "wl": _shade(dark, 0.78),
-            "seam": _shade(dark, 0.55),
-            "roof": _shade(roof, 1.0),
-            "roof_l": _shade(roof, 0.78),
-            "roof_d": _shade(roof, 0.6),
-            "roof_h": _shade(roof, 1.22),
-            "parapet": _shade(roof, 0.55),
+            "wr":     _shade(light, 1.0),
+            "wl":     _shade(dark,  0.78),
+            "seam":   _shade(dark,  0.55),
+            "roof":   _shade(roof,  1.0),
+            "roof_l": _shade(roof,  0.78),
+            "roof_d": _shade(roof,  0.6),
+            "roof_h": _shade(roof,  1.22),
+            "parapet":_shade(roof,  0.55),
         }
 
     def _box(self, x, y, hw, hh, f, H):
         cxc, cyc = x, y + hh
-        B_top = (cxc, cyc - hh * f)
-        B_right = (cxc + hw * f, cyc)
-        B_bot = (cxc, cyc + hh * f)
+        B_top  = (cxc,          cyc - hh * f)
+        B_right= (cxc + hw * f, cyc)
+        B_bot  = (cxc,          cyc + hh * f)
         B_left = (cxc - hw * f, cyc)
-        R_top = (B_top[0], B_top[1] - H)
-        R_right = (B_right[0], B_right[1] - H)
-        R_bot = (B_bot[0], B_bot[1] - H)
-        R_left = (B_left[0], B_left[1] - H)
-        right_face = (B_bot, B_right, R_right, R_bot)
-        left_face = (B_bot, B_left, R_left, R_bot)
+        R_top  = (B_top[0],   B_top[1]   - H)
+        R_right= (B_right[0], B_right[1] - H)
+        R_bot  = (B_bot[0],   B_bot[1]   - H)
+        R_left = (B_left[0],  B_left[1]  - H)
         return {
             "cxc": cxc, "cyc": cyc,
-            "B_top": B_top, "B_right": B_right, "B_bot": B_bot, "B_left": B_left,
-            "R_top": R_top, "R_right": R_right, "R_bot": R_bot, "R_left": R_left,
-            "right": right_face, "left": left_face,
+            "B_top": B_top, "B_right": B_right,
+            "B_bot": B_bot, "B_left": B_left,
+            "R_top": R_top, "R_right": R_right,
+            "R_bot": R_bot, "R_left": R_left,
+            "right": (B_bot, B_right, R_right, R_bot),
+            "left":  (B_bot, B_left,  R_left,  R_bot),
         }
 
-    def draw_building(self, x, y, tile, zoom, today, is_hovered=False, is_selected=False, static_only=False):
+    def draw_building(self, x, y, tile, zoom, today, is_hovered=False,
+                      is_selected=False, static_only=False):
         if tile.type in ("road", "green"):
             return
 
-        hw = (self.tile_w / 2) * zoom
-        hh = (self.tile_h / 2) * zoom
+        hw    = (self.tile_w / 2) * zoom
+        hh    = (self.tile_h / 2) * zoom
         style = tile.building_style
-        f = STYLE_FOOTPRINT.get(style, 0.82)
-        H = tile.building_height * zoom
+        f     = STYLE_FOOTPRINT.get(style, 0.82)
+        H     = tile.building_height * zoom
 
         b = self._box(x, y, hw, hh, f, H)
 
@@ -407,27 +487,31 @@ class Renderer:
 
         if shadow:
             pygame.draw.polygon(self.screen, (20, 24, 34), [
-                (b["cxc"] - hw * f, b["cyc"] + 1),
-                (b["cxc"], b["cyc"] + hh * f + 1),
+                (b["cxc"] - hw * f,        b["cyc"] + 1),
+                (b["cxc"],                 b["cyc"] + hh * f + 1),
                 (b["cxc"] + hw * f * 1.15, b["cyc"] + hh * 0.25),
-                (b["cxc"] + hw * 0.1, b["cyc"] - hh * f * 0.3),
+                (b["cxc"] + hw * 0.1,      b["cyc"] - hh * f * 0.3),
             ])
 
-        # ---- SELECTION TINT & WIREFRAME ----
+        # Pre-compute building tint surface dimensions (shared by sel/hover/overflow)
+        ts_w = int(hw * 2.6)
+        ts_h = int(hh * 2.6 + H)
+
+        # ── SELECTION TINT & WIREFRAME ──
         if is_selected and not static_only:
             if tile.type == "residential":
-                sel_color = (120, 255, 120, 120)   # brighter green
+                sel_color  = (120, 255, 120, 120)
                 wire_color = (80, 220, 80)
             elif tile.type == "commercial":
-                sel_color = (120, 200, 255, 120)   # brighter blue
+                sel_color  = (120, 200, 255, 120)
                 wire_color = (80, 170, 255)
             else:
-                sel_color = None
+                sel_color  = None
                 wire_color = (255, 255, 255)
 
             if sel_color:
-                sel_surf = pygame.Surface((int(hw * 2.6), int(hh * 2.6 + H)), pygame.SRCALPHA)
-                sel_pts = [
+                sel_surf = self._get_alpha_surf(ts_w, ts_h)
+                sel_pts  = [
                     (int(hw * 1.3), int(hh * 1.3)),
                     (int(hw * 2.3), int(hh * 0.3)),
                     (int(hw * 2.3), int(hh * 0.3 - H)),
@@ -438,32 +522,31 @@ class Renderer:
                 pygame.draw.polygon(sel_surf, sel_color, sel_pts)
                 self.screen.blit(sel_surf, (int(x - hw * 1.3), int(y - hh * 1.3)))
 
-            # Wireframe outline around the building silhouette
             outline_pts = [
-                (x - hw * f, y + hh * f),       # B_left
-                (x, y + 2 * hh * f),             # B_bot
-                (x + hw * f, y + hh * f),        # B_right
-                (x + hw * f, y + hh * f - H),    # R_right
-                (x, y - H),                       # R_top (approx)
-                (x - hw * f, y + hh * f - H),    # R_left
+                (x - hw * f, y + hh * f),
+                (x,          y + 2 * hh * f),
+                (x + hw * f, y + hh * f),
+                (x + hw * f, y + hh * f - H),
+                (x,          y - H),
+                (x - hw * f, y + hh * f - H),
             ]
             for i in range(len(outline_pts)):
-                p1 = outline_pts[i]
-                p2 = outline_pts[(i + 1) % len(outline_pts)]
-                pygame.draw.line(self.screen, wire_color, p1, p2, max(2, int(2 * zoom)))
+                pygame.draw.line(self.screen, wire_color,
+                                 outline_pts[i], outline_pts[(i + 1) % len(outline_pts)],
+                                 max(2, int(2 * zoom)))
 
-        # ---- HOVER TINT ----
+        # ── HOVER TINT ──
         elif is_hovered and not static_only:
             if tile.type == "residential":
-                hover_color = (120, 255, 120, 70)   # subtle green
+                hover_color = (120, 255, 120, 70)
             elif tile.type == "commercial":
-                hover_color = (120, 200, 255, 70)   # subtle blue
+                hover_color = (120, 200, 255, 70)
             else:
                 hover_color = None
 
             if hover_color:
-                hover_surf = pygame.Surface((int(hw * 2.6), int(hh * 2.6 + H)), pygame.SRCALPHA)
-                hover_pts = [
+                hover_surf = self._get_alpha_surf(ts_w, ts_h)
+                hover_pts  = [
                     (int(hw * 1.3), int(hh * 1.3)),
                     (int(hw * 2.3), int(hh * 0.3)),
                     (int(hw * 2.3), int(hh * 0.3 - H)),
@@ -478,7 +561,8 @@ class Renderer:
         pygame.draw.polygon(self.screen, cc["wr"], list(b["right"]))
         pygame.draw.polygon(self.screen, cc["wl"], list(b["left"]))
         if shadow:
-            pygame.draw.line(self.screen, cc["seam"], b["B_bot"], b["R_bot"], max(1, int(zoom)))
+            pygame.draw.line(self.screen, cc["seam"], b["B_bot"], b["R_bot"],
+                             max(1, int(zoom)))
 
         # Style-specific top + detailing
         if style in ("detached", "bungalow"):
@@ -503,20 +587,19 @@ class Renderer:
             self._roof_mono(b, cc, zoom)
             if detail:
                 self._warehouse_details(tile, b, zoom)
-        else:  # office / highrise
+        else:   # office / highrise
             self._roof_flat(b, cc, zoom)
             if detail:
                 self._glass_details(tile, b, zoom)
             if style == "highrise":
                 self._rooftop_kit(b, zoom, mast=True)
 
-        # Zone type indicator on building (small icon for commercial)
+        # Zone type indicator (small £ for commercial buildings)
         if tile.type == "commercial" and zoom >= 1.3 and not static_only:
-            # Small "£" indicator for commercial buildings
-            font = pygame.font.SysFont("segoeui", max(6, int(8 * zoom)), bold=True)
+            font = _get_font("segoeui", max(6, int(8 * zoom)), bold=True)
             text = font.render("£", True, (255, 220, 100))
-            text_rect = text.get_rect(center=(int(b["R_top"][0]), int(b["R_top"][1] + 8 * zoom)))
-            self.screen.blit(text, text_rect)
+            self.screen.blit(text, text.get_rect(
+                center=(int(b["R_top"][0]), int(b["R_top"][1] + 8 * zoom))))
 
         # Kerbside wheelie bin if due today (close-up only)
         if detail and not static_only and tile.collection_due == today and tile.bin_fill > 20:
@@ -531,10 +614,9 @@ class Renderer:
         # Heatmap overflow tint: intensity grows with days_overflowing
         days_ov = getattr(tile, "days_overflowing", 0)
         if days_ov > 0 and not static_only:
-            alpha = min(170, 28 + days_ov * 35)
-            tint_surf = pygame.Surface(
-                (int(hw * 2.6), int(hh * 2.6 + H)), pygame.SRCALPHA)
-            tint_pts = [
+            alpha    = min(170, 28 + days_ov * 35)
+            tint_surf = self._get_alpha_surf(ts_w, ts_h)
+            tint_pts  = [
                 (int(hw * 1.3), int(hh * 1.3)),
                 (int(hw * 2.3), int(hh * 0.3)),
                 (int(hw * 2.3), int(hh * 0.3 - H)),
@@ -549,33 +631,37 @@ class Renderer:
         if days_ov > 0 and not static_only and zoom >= 0.9:
             self._draw_litter(b, days_ov, zoom)
 
-    def _draw_building_dynamic(self, x, y, tile, zoom, today, is_hovered=False, is_selected=False):
+    def _draw_building_dynamic(self, x, y, tile, zoom, today,
+                               is_hovered=False, is_selected=False):
         """Draw only the dynamic parts of a building (selection, hover, bins, overflow).
         Called when the static cache is active."""
         if tile.type in ("road", "green"):
             return
 
-        hw = (self.tile_w / 2) * zoom
-        hh = (self.tile_h / 2) * zoom
+        hw    = (self.tile_w / 2) * zoom
+        hh    = (self.tile_h / 2) * zoom
         style = tile.building_style
-        f = STYLE_FOOTPRINT.get(style, 0.82)
-        H = tile.building_height * zoom
-        b = self._box(x, y, hw, hh, f, H)
+        f     = STYLE_FOOTPRINT.get(style, 0.82)
+        H     = tile.building_height * zoom
+        b     = self._box(x, y, hw, hh, f, H)
+
+        ts_w = int(hw * 2.6)
+        ts_h = int(hh * 2.6 + H)
 
         if is_selected:
             if tile.type == "residential":
-                sel_color = (120, 255, 120, 120)
+                sel_color  = (120, 255, 120, 120)
                 wire_color = (80, 220, 80)
             elif tile.type == "commercial":
-                sel_color = (120, 200, 255, 120)
+                sel_color  = (120, 200, 255, 120)
                 wire_color = (80, 170, 255)
             else:
-                sel_color = None
+                sel_color  = None
                 wire_color = (255, 255, 255)
 
             if sel_color:
-                sel_surf = pygame.Surface((int(hw * 2.6), int(hh * 2.6 + H)), pygame.SRCALPHA)
-                sel_pts = [
+                sel_surf = self._get_alpha_surf(ts_w, ts_h)
+                sel_pts  = [
                     (int(hw * 1.3), int(hh * 1.3)),
                     (int(hw * 2.3), int(hh * 0.3)),
                     (int(hw * 2.3), int(hh * 0.3 - H)),
@@ -588,16 +674,16 @@ class Renderer:
 
             outline_pts = [
                 (x - hw * f, y + hh * f),
-                (x, y + 2 * hh * f),
+                (x,          y + 2 * hh * f),
                 (x + hw * f, y + hh * f),
                 (x + hw * f, y + hh * f - H),
-                (x, y - H),
+                (x,          y - H),
                 (x - hw * f, y + hh * f - H),
             ]
             for i in range(len(outline_pts)):
-                p1 = outline_pts[i]
-                p2 = outline_pts[(i + 1) % len(outline_pts)]
-                pygame.draw.line(self.screen, wire_color, p1, p2, max(2, int(2 * zoom)))
+                pygame.draw.line(self.screen, wire_color,
+                                 outline_pts[i], outline_pts[(i + 1) % len(outline_pts)],
+                                 max(2, int(2 * zoom)))
 
         elif is_hovered:
             if tile.type == "residential":
@@ -608,8 +694,8 @@ class Renderer:
                 hover_color = None
 
             if hover_color:
-                hover_surf = pygame.Surface((int(hw * 2.6), int(hh * 2.6 + H)), pygame.SRCALPHA)
-                hover_pts = [
+                hover_surf = self._get_alpha_surf(ts_w, ts_h)
+                hover_pts  = [
                     (int(hw * 1.3), int(hh * 1.3)),
                     (int(hw * 2.3), int(hh * 0.3)),
                     (int(hw * 2.3), int(hh * 0.3 - H)),
@@ -628,13 +714,11 @@ class Renderer:
                                (int(b["R_top"][0]), int(b["R_top"][1] - 6 * zoom)),
                                max(2, int(3 * zoom)))
 
-        # Heatmap overflow tint: intensity grows with days_overflowing
         days_ov = getattr(tile, "days_overflowing", 0)
         if days_ov > 0:
-            alpha = min(170, 28 + days_ov * 35)
-            tint_surf = pygame.Surface(
-                (int(hw * 2.6), int(hh * 2.6 + H)), pygame.SRCALPHA)
-            tint_pts = [
+            alpha    = min(170, 28 + days_ov * 35)
+            tint_surf = self._get_alpha_surf(ts_w, ts_h)
+            tint_pts  = [
                 (int(hw * 1.3), int(hh * 1.3)),
                 (int(hw * 2.3), int(hh * 0.3)),
                 (int(hw * 2.3), int(hh * 0.3 - H)),
@@ -645,32 +729,31 @@ class Renderer:
             pygame.draw.polygon(tint_surf, (210, 30, 30, alpha), tint_pts)
             self.screen.blit(tint_surf, (int(x - hw * 1.3), int(y - hh * 1.3)))
 
-        # Litter bags accumulate outside overflowing buildings
         if days_ov > 0 and zoom >= 0.9:
             self._draw_litter(b, days_ov, zoom)
 
-    # --------------------------------------------------------------- roofs
+    # ─── roofs ────────────────────────────────────────────────────────────────
+
     def _roof_hip(self, b, cc, zoom):
         ridge = 14 * zoom
-        apex = ((b["R_top"][0] + b["R_bot"][0]) / 2,
-                ((b["R_top"][1] + b["R_bot"][1]) / 2) - ridge)
+        apex  = ((b["R_top"][0] + b["R_bot"][0]) / 2,
+                 ((b["R_top"][1] + b["R_bot"][1]) / 2) - ridge)
         pygame.draw.polygon(self.screen, cc["roof_d"], [b["R_top"], b["R_right"], apex])
-        pygame.draw.polygon(self.screen, cc["roof_l"], [b["R_top"], b["R_left"], apex])
-        pygame.draw.polygon(self.screen, cc["roof"], [b["R_right"], b["R_bot"], apex])
-        pygame.draw.polygon(self.screen, cc["roof_l"], [b["R_left"], b["R_bot"], apex])
+        pygame.draw.polygon(self.screen, cc["roof_l"], [b["R_top"], b["R_left"],  apex])
+        pygame.draw.polygon(self.screen, cc["roof"],   [b["R_right"], b["R_bot"], apex])
+        pygame.draw.polygon(self.screen, cc["roof_l"], [b["R_left"],  b["R_bot"], apex])
         pygame.draw.line(self.screen, cc["roof_h"], b["R_bot"], apex, max(1, int(zoom)))
         b["_apex"] = apex
 
     def _roof_gable(self, b, cc, zoom):
-        # Ridge runs from the R_left..R_right axis, raised; two slopes + gables.
         rise = 15 * zoom
-        m1 = ((b["R_top"][0] + b["R_left"][0]) / 2, (b["R_top"][1] + b["R_left"][1]) / 2 - rise)
-        m2 = ((b["R_right"][0] + b["R_bot"][0]) / 2, (b["R_right"][1] + b["R_bot"][1]) / 2 - rise)
-        # right slope (sunlit), left slope (shaded)
-        pygame.draw.polygon(self.screen, cc["roof"], [b["R_top"], b["R_right"], m2, m1])
-        pygame.draw.polygon(self.screen, cc["roof_l"], [b["R_left"], b["R_bot"], m2, m1])
-        # gable ends
-        pygame.draw.polygon(self.screen, cc["roof_d"], [b["R_top"], b["R_left"], m1])
+        m1   = ((b["R_top"][0] + b["R_left"][0]) / 2,
+                (b["R_top"][1] + b["R_left"][1]) / 2 - rise)
+        m2   = ((b["R_right"][0] + b["R_bot"][0]) / 2,
+                (b["R_right"][1] + b["R_bot"][1]) / 2 - rise)
+        pygame.draw.polygon(self.screen, cc["roof"],   [b["R_top"], b["R_right"], m2, m1])
+        pygame.draw.polygon(self.screen, cc["roof_l"], [b["R_left"], b["R_bot"],  m2, m1])
+        pygame.draw.polygon(self.screen, cc["roof_d"], [b["R_top"],  b["R_left"], m1])
         pygame.draw.polygon(self.screen, cc["roof_d"], [b["R_right"], b["R_bot"], m2])
         pygame.draw.line(self.screen, cc["roof_h"], m1, m2, max(1, int(zoom)))
         b["_apex"] = ((m1[0] + m2[0]) / 2, (m1[1] + m2[1]) / 2)
@@ -685,31 +768,30 @@ class Renderer:
                       (b["R_top"][1] + b["R_bot"][1]) / 2)
 
     def _roof_mono(self, b, cc, zoom):
-        # Single-pitch (warehouse): raise the far edge only.
-        rise = 12 * zoom
-        far_t = (b["R_top"][0], b["R_top"][1] - rise)
+        rise  = 12 * zoom
+        far_t = (b["R_top"][0],   b["R_top"][1]   - rise)
         far_r = (b["R_right"][0], b["R_right"][1] - rise)
         pygame.draw.polygon(self.screen, cc["roof"],
                             [far_t, far_r, b["R_bot"], b["R_left"]])
         pygame.draw.polygon(self.screen, cc["roof_d"],
                             [b["R_top"], b["R_right"], far_r, far_t])
-        # corrugation lines
         for u in (0.3, 0.5, 0.7):
             p1 = (far_t[0] + (b["R_left"][0] - far_t[0]) * u,
                   far_t[1] + (b["R_left"][1] - far_t[1]) * u)
-            p2 = (far_r[0] + (b["R_bot"][0] - far_r[0]) * u,
-                  far_r[1] + (b["R_bot"][1] - far_r[1]) * u)
+            p2 = (far_r[0] + (b["R_bot"][0]  - far_r[0]) * u,
+                  far_r[1] + (b["R_bot"][1]  - far_r[1]) * u)
             pygame.draw.line(self.screen, cc["roof_l"], p1, p2, max(1, int(zoom)))
         b["_apex"] = (b["R_top"][0], far_t[1])
 
-    # ------------------------------------------------------------ detailing
+    # ─── detailing ────────────────────────────────────────────────────────────
+
     def _house_details(self, tile, b, zoom, chimney):
         right, left = b["right"], b["left"]
         apex = b.get("_apex")
         if chimney and apex and zoom > 0.45:
             ch_w = 3 * zoom
-            chx = apex[0] + 5 * zoom
-            chy = apex[1] - 2 * zoom
+            chx  = apex[0] + 5 * zoom
+            chy  = apex[1] - 2 * zoom
             pygame.draw.rect(self.screen, (90, 70, 64),
                              pygame.Rect(int(chx), int(chy - 9 * zoom),
                                          int(ch_w), int(9 * zoom)))
@@ -731,23 +813,21 @@ class Renderer:
 
     def _block_details(self, tile, b, zoom, tower):
         glass = (158, 196, 224)
-        rows = max(3, int(tile.building_height // (9 if tower else 12)))
-        cols = 4 if tower else 3
+        rows  = max(3, int(tile.building_height // (9 if tower else 12)))
+        cols  = 4 if tower else 3
         for face, tone in ((b["right"], 1.0), (b["left"], 0.8)):
             for r in range(rows):
                 v = 0.1 + r * (0.82 / rows)
                 for c in range(cols):
-                    u = 0.12 + c * (0.78 / cols)
+                    u   = 0.12 + c * (0.78 / cols)
                     lit = ((r * 7 + c * 3 + int(tile.seed * 100)) % 5 == 0)
                     col = (250, 240, 180) if lit else _shade(glass, tone)
-                    q = _face_quad(face, u, v, 0.78 / cols * 0.62, 0.82 / rows * 0.55)
+                    q   = _face_quad(face, u, v, 0.78 / cols * 0.62, 0.82 / rows * 0.55)
                     pygame.draw.polygon(self.screen, col, q)
-        # entrance canopy
         ent = _face_quad(b["right"], 0.34, 0.0, 0.30, 0.08)
         pygame.draw.polygon(self.screen, (60, 64, 72), ent)
 
     def _shop_details(self, tile, b, zoom):
-        # Fascia signboard band + glazed shopfront + awning.
         for face, tone in ((b["right"], 1.0), (b["left"], 0.82)):
             fascia = [
                 _face_pt(face, 0.04, 0.30), _face_pt(face, 0.96, 0.30),
@@ -759,36 +839,33 @@ class Renderer:
                 _face_pt(face, 0.94, 0.28), _face_pt(face, 0.06, 0.28),
             ]
             pygame.draw.polygon(self.screen, _shade((150, 196, 220), tone), front)
-            # awning stripes
             for i in range(4):
-                u = 0.08 + i * 0.21
+                u      = 0.08 + i * 0.21
                 stripe = [
-                    _face_pt(face, u, 0.30), _face_pt(face, u + 0.105, 0.30),
-                    _face_pt(face, u + 0.105, 0.36), _face_pt(face, u, 0.36),
+                    _face_pt(face, u,        0.30), _face_pt(face, u + 0.105, 0.30),
+                    _face_pt(face, u + 0.105, 0.36), _face_pt(face, u,       0.36),
                 ]
                 col = (200, 90, 80) if i % 2 == 0 else (235, 235, 235)
                 pygame.draw.polygon(self.screen, _shade(col, tone), stripe)
 
     def _warehouse_details(self, tile, b, zoom):
         face = b["right"]
-        # big roller door
         door = _face_quad(face, 0.20, 0.0, 0.40, 0.62)
         pygame.draw.polygon(self.screen, (70, 74, 82), door)
         for i in range(1, 5):
-            v = i * 0.12
+            v  = i * 0.12
             p1 = _face_pt(face, 0.20, v)
             p2 = _face_pt(face, 0.60, v)
             pygame.draw.line(self.screen, (52, 56, 62), p1, p2, max(1, int(zoom)))
-        # side personnel door + window
-        pd = _face_quad(face, 0.70, 0.0, 0.12, 0.34)
+        pd  = _face_quad(face, 0.70, 0.0, 0.12, 0.34)
         pygame.draw.polygon(self.screen, (60, 64, 72), pd)
         win = _face_quad(b["left"], 0.4, 0.5, 0.3, 0.18)
         pygame.draw.polygon(self.screen, (150, 190, 214), win)
 
     def _glass_details(self, tile, b, zoom):
         glass = (150, 198, 236)
-        rows = max(3, int(tile.building_height // 14))
-        cols = 3
+        rows  = max(3, int(tile.building_height // 14))
+        cols  = 3
         for face, tone in ((b["right"], 1.0), (b["left"], 0.82)):
             for r in range(rows):
                 v = 0.14 + r * (0.78 / rows)
@@ -811,24 +888,23 @@ class Renderer:
                                      int(10 * zoom), int(5 * zoom)))
         if mast:
             pygame.draw.line(self.screen, (160, 164, 170),
-                             (apex[0], apex[1] - 5 * zoom),
+                             (apex[0], apex[1] - 5  * zoom),
                              (apex[0], apex[1] - 18 * zoom), max(1, int(zoom)))
             pygame.draw.circle(self.screen, (235, 70, 70),
-                               (int(apex[0]), int(apex[1] - 18 * zoom)), max(1, int(1.4 * zoom)))
+                               (int(apex[0]), int(apex[1] - 18 * zoom)),
+                               max(1, int(1.4 * zoom)))
 
-    # ------------------------------------------------------------- wheelie bin
+    # ─── wheelie bin ──────────────────────────────────────────────────────────
+
     def _draw_wheelie_bin(self, base_near, base_right, zoom, fill):
         bx = base_near[0] + (base_right[0] - base_near[0]) * 0.35 + 4 * zoom
         by = base_near[1] + (base_right[1] - base_near[1]) * 0.35 + 5 * zoom
-        w = max(2, int(4 * zoom))
-        h = max(3, int(7 * zoom))
+        w  = max(2, int(4 * zoom))
+        h  = max(3, int(7 * zoom))
         body = pygame.Rect(int(bx - w / 2), int(by - h), w, h)
-        if fill > 85:
-            lid = (210, 60, 60)
-        elif fill > 60:
-            lid = (220, 150, 50)
-        else:
-            lid = (70, 170, 90)
+        lid  = ((210, 60, 60) if fill > 85 else
+                (220, 150, 50) if fill > 60 else
+                (70, 170, 90))
         pygame.draw.rect(self.screen, (45, 55, 50), body, border_radius=max(1, int(zoom)))
         pygame.draw.rect(self.screen, lid,
                          pygame.Rect(body.x - 1, body.y - max(1, int(1.5 * zoom)),
@@ -840,7 +916,8 @@ class Renderer:
             pygame.draw.circle(self.screen, (20, 20, 20),
                                (body.right - 1, body.bottom), max(1, int(zoom)))
 
-    # ------------------------------------------------------------- worker
+    # ─── worker ───────────────────────────────────────────────────────────────
+
     def draw_worker(self, x, y, w, zoom):
         s = max(0.7, zoom)
         pygame.draw.ellipse(self.screen, (18, 22, 30),
@@ -856,7 +933,8 @@ class Renderer:
                                      int(5 * s), int(5.5 * s)),
                          border_radius=max(1, int(s)))
         pygame.draw.line(self.screen, (240, 255, 255),
-                         (x - 2 * s, y - 4.5 * s), (x + 2 * s, y - 4.5 * s), max(1, int(s)))
+                         (x - 2 * s, y - 4.5 * s), (x + 2 * s, y - 4.5 * s),
+                         max(1, int(s)))
         pygame.draw.circle(self.screen, (235, 200, 170),
                            (int(x), int(y - 8.5 * s)), max(1, int(1.6 * s)))
         pygame.draw.circle(self.screen, (255, 220, 0),
@@ -866,64 +944,66 @@ class Renderer:
             pygame.draw.circle(self.screen, (40, 50, 45),
                                (int(x + 3 * s), int(y - 4 * s)), max(1, int(1.8 * s)))
 
-    # ------------------------------------------------------------- landfill
+    # ─── landfill ─────────────────────────────────────────────────────────────
+
     def draw_landfill(self, cx, cy, city, zoom):
-        """A big refuse mound with a tipping gate and signage, sited in a
-        corner. Deliberately earthy and messy so it reads instantly as the tip,
-        distinct from the grey depot and the colourful streets."""
         lf = getattr(city, "landfill", None)
         if not lf:
             return
         iso = self.to_iso(lf["cx"], lf["cy"])
-        x = cx + iso[0] * zoom
-        y = cy + iso[1] * zoom
-        hw = (self.tile_w / 2) * zoom
-        hh = (self.tile_h / 2) * zoom
+        x   = cx + iso[0] * zoom
+        y   = cy + iso[1] * zoom
+        hw  = (self.tile_w / 2) * zoom
+        hh  = (self.tile_h / 2) * zoom
         base_w = hw * 3.0
         base_h = hh * 3.0
 
-        # Stacked earthy layers form the heap.
         for i, (f, col) in enumerate([(1.0, (58, 52, 40)), (0.74, (78, 70, 52)),
-                                      (0.48, (98, 88, 64)), (0.24, (120, 110, 78))]):
+                                       (0.48, (98, 88, 64)), (0.24, (120, 110, 78))]):
             ry = y - i * 7 * zoom
             pygame.draw.ellipse(self.screen, col, pygame.Rect(
                 int(x - base_w * f), int(ry - base_h * f * 0.5),
                 int(base_w * 2 * f), int(base_h * f)))
 
-        # Scattered bin-bag specks (seeded so they don't shimmer each frame).
-        rng = __import__("random").Random(0xB1A5)
+        # Seeded RNG so specks don't shimmer each frame — use module-level random
+        rng = random.Random(0xB1A5)
         for _ in range(int(46 * zoom)):
             sx = x + rng.uniform(-base_w * 0.95, base_w * 0.95)
-            sy = y + rng.uniform(-base_h * 0.45, base_h * 0.35) - rng.uniform(0, 20) * zoom
-            c = rng.choice([(38, 38, 38), (120, 32, 32), (32, 90, 44),
-                            (40, 64, 120), (150, 150, 150), (150, 130, 40)])
-            pygame.draw.circle(self.screen, c, (int(sx), int(sy)), max(1, int(1.5 * zoom)))
+            sy = (y + rng.uniform(-base_h * 0.45, base_h * 0.35)
+                    - rng.uniform(0, 20) * zoom)
+            c  = rng.choice([(38, 38, 38), (120, 32, 32), (32, 90, 44),
+                              (40, 64, 120), (150, 150, 150), (150, 130, 40)])
+            pygame.draw.circle(self.screen, c, (int(sx), int(sy)),
+                               max(1, int(1.5 * zoom)))
 
-        # Tipping gate / weighbridge marker.
         g = lf.get("gate")
         if g and zoom > 0.4:
             giso = self.to_iso(g[0], g[1])
-            gx = cx + giso[0] * zoom
-            gy = cy + giso[1] * zoom
+            gx   = cx + giso[0] * zoom
+            gy   = cy + giso[1] * zoom
             pygame.draw.rect(self.screen, (210, 188, 44), pygame.Rect(
-                int(gx - 7 * zoom), int(gy - 3 * zoom), int(14 * zoom), int(3 * zoom)))
+                int(gx - 7 * zoom), int(gy - 3 * zoom),
+                int(14 * zoom), int(3 * zoom)))
             pygame.draw.rect(self.screen, (40, 40, 44), pygame.Rect(
-                int(gx - 7 * zoom), int(gy - 3 * zoom), int(14 * zoom), int(3 * zoom)),
+                int(gx - 7 * zoom), int(gy - 3 * zoom),
+                int(14 * zoom), int(3 * zoom)),
                 max(1, int(zoom)))
 
-        # Signage on a post.
         if zoom > 0.4:
-            font = pygame.font.SysFont("segoeui", max(7, int(9 * zoom)), bold=True)
+            font = _get_font("segoeui", max(7, int(9 * zoom)), bold=True)
             text = font.render("LANDFILL SITE", True, (245, 245, 245))
-            rect = text.get_rect(center=(int(x), int(y - base_h - 20 * zoom)))
-            board = pygame.Rect(rect.x - 6, rect.y - 3, rect.width + 12, rect.height + 6)
+            rect  = text.get_rect(center=(int(x), int(y - base_h - 20 * zoom)))
+            board = pygame.Rect(rect.x - 6, rect.y - 3,
+                                rect.width + 12, rect.height + 6)
             pygame.draw.rect(self.screen, (38, 40, 48), board)
             pygame.draw.rect(self.screen, (200, 160, 60), board, 1)
             pygame.draw.line(self.screen, (120, 110, 80),
-                             (x, board.bottom), (x, y - base_h * 0.5), max(1, int(2 * zoom)))
+                             (x, board.bottom), (x, y - base_h * 0.5),
+                             max(1, int(2 * zoom)))
             self.screen.blit(text, rect)
 
-    # ------------------------------------------------------------- road works
+    # ─── road works ───────────────────────────────────────────────────────────
+
     def draw_road_works(self, cx, cy, city, zoom):
         """Draw orange construction barriers on tiles blocked by road works."""
         rw = getattr(city, "road_works_tiles", None)
@@ -933,95 +1013,95 @@ class Renderer:
         hw = (self.tile_w / 2) * zoom
         hh = (self.tile_h / 2) * zoom
 
+        # Build the diamond tint stamp ONCE for all road-work tiles.
+        # At a given zoom level every stamp is the same shape, so we draw it
+        # once and blit the same surface N times.
+        stamp_w  = int(hw * 2.2)
+        stamp_h  = int(hh * 2.2)
+        tint_stamp = self._get_alpha_surf(stamp_w, stamp_h)
+        pygame.draw.polygon(tint_stamp, (255, 130, 0, 160), [
+            (int(hw * 1.1), int(hh * 0.1)),
+            (int(hw * 2.1), int(hh * 1.1)),
+            (int(hw * 1.1), int(hh * 2.1)),
+            (int(hw * 0.1), int(hh * 1.1)),
+        ])
+
+        cone_h = max(4, int(10 * zoom))
+        cone_w = max(2, int(4  * zoom))
+        offsets = [
+            ( hw * 0.35,  hh * 0.55),
+            (-hw * 0.35,  hh * 0.55),
+            ( 0.0,        hh * 1.15),
+        ]
+
+        # Label font — fetched once from cache for all tiles
+        label_font = _get_font("segoeui", max(6, int(7 * zoom)), bold=True) if zoom >= 1.2 else None
+
         for (tx, ty) in rw:
             iso = self.to_iso(tx, ty)
-            ix = cx + iso[0] * zoom
-            iy = cy + iso[1] * zoom
+            ix  = cx + iso[0] * zoom
+            iy  = cy + iso[1] * zoom
             if ix < -hw * 2 or ix > sw + hw * 2:
                 continue
             if iy < -hh * 2 or iy > sh + hh * 2:
                 continue
 
-            # Orange semi-transparent tint over the road diamond
-            tint = pygame.Surface((int(hw * 2.2), int(hh * 2.2)), pygame.SRCALPHA)
-            tint_pts = [
-                (int(hw * 1.1), int(hh * 0.1)),
-                (int(hw * 2.1), int(hh * 1.1)),
-                (int(hw * 1.1), int(hh * 2.1)),
-                (int(hw * 0.1), int(hh * 1.1)),
-            ]
-            pygame.draw.polygon(tint, (255, 130, 0, 160), tint_pts)
-            self.screen.blit(tint, (int(ix - hw * 1.1), int(iy - hh * 1.1)))
+            self.screen.blit(tint_stamp, (int(ix - hw * 1.1), int(iy - hh * 1.1)))
 
-            # Traffic cones — three small triangles scattered across the tile
-            cone_h = max(4, int(10 * zoom))
-            cone_w = max(2, int(4 * zoom))
-            offsets = [
-                (hw * 0.35,  hh * 0.55),
-                (-hw * 0.35, hh * 0.55),
-                (0.0,        hh * 1.15),
-            ]
             for ox, oy in offsets:
                 bx = int(ix + ox)
                 by = int(iy + hh + oy)
-                # Orange cone body
                 pygame.draw.polygon(self.screen, (255, 100, 0), [
-                    (bx, by - cone_h),
+                    (bx,          by - cone_h),
                     (bx - cone_w, by),
                     (bx + cone_w, by),
                 ])
-                # White reflective stripe
                 stripe_y = by - cone_h // 2
                 pygame.draw.line(self.screen, (240, 240, 240),
                                  (bx - cone_w // 2, stripe_y),
                                  (bx + cone_w // 2, stripe_y),
                                  max(1, int(zoom)))
 
-            # "ROAD WORKS" label at close zoom
-            if zoom >= 1.2:
-                font = pygame.font.SysFont("segoeui", max(6, int(7 * zoom)), bold=True)
-                label = font.render("ROAD WORKS", True, (255, 220, 0))
+            if label_font:
+                label = label_font.render("ROAD WORKS", True, (255, 220, 0))
                 lrect = label.get_rect(center=(int(ix), int(iy + hh * 0.5)))
-                bg = pygame.Surface((label.get_width() + 4, label.get_height() + 2),
-                                    pygame.SRCALPHA)
+                bg    = pygame.Surface((label.get_width() + 4, label.get_height() + 2),
+                                       pygame.SRCALPHA)
                 bg.fill((30, 30, 30, 160))
-                self.screen.blit(bg, (lrect.x - 2, lrect.y - 1))
+                self.screen.blit(bg,    (lrect.x - 2, lrect.y - 1))
                 self.screen.blit(label, lrect)
 
-    # ------------------------------------------------------------- depot
+    # ─── depot ────────────────────────────────────────────────────────────────
+
     def draw_depot(self, x, y, zoom, fleet=None):
-        """A distinctive council waste depot: a wide industrial shed with a
-        pitched roof, roller doors, a yard and signage. Deliberately grey and
-        utilitarian so it reads instantly against the colourful streets."""
         hw = (self.tile_w / 2) * zoom
         hh = (self.tile_h / 2) * zoom
-        f = 1.25                       # larger than a normal building
-        H = 30 * zoom
-        b = self._box(x, y, hw, hh, f, H)
+        f  = 1.25
+        H  = 30 * zoom
+        b  = self._box(x, y, hw, hh, f, H)
 
-        # Yard slab
-        pygame.draw.polygon(self.screen, (74, 78, 86), [
-            b["B_top"], b["B_right"], b["B_bot"], b["B_left"]])
+        pygame.draw.polygon(self.screen, (74, 78, 86),
+                            [b["B_top"], b["B_right"], b["B_bot"], b["B_left"]])
 
         wall_r = (120, 124, 130)
-        wall_l = (96, 100, 106)
+        wall_l = (96,  100, 106)
         roof_c = (150, 154, 160)
         roof_d = (110, 114, 120)
 
         pygame.draw.polygon(self.screen, wall_r, list(b["right"]))
         pygame.draw.polygon(self.screen, wall_l, list(b["left"]))
 
-        # Gable roof
         rise = 16 * zoom
-        m1 = ((b["R_top"][0] + b["R_left"][0]) / 2, (b["R_top"][1] + b["R_left"][1]) / 2 - rise)
-        m2 = ((b["R_right"][0] + b["R_bot"][0]) / 2, (b["R_right"][1] + b["R_bot"][1]) / 2 - rise)
+        m1   = ((b["R_top"][0] + b["R_left"][0])  / 2,
+                (b["R_top"][1] + b["R_left"][1])  / 2 - rise)
+        m2   = ((b["R_right"][0] + b["R_bot"][0]) / 2,
+                (b["R_right"][1] + b["R_bot"][1]) / 2 - rise)
         pygame.draw.polygon(self.screen, roof_c, [b["R_top"], b["R_right"], m2, m1])
-        pygame.draw.polygon(self.screen, roof_d, [b["R_left"], b["R_bot"], m2, m1])
-        pygame.draw.polygon(self.screen, (88, 92, 98), [b["R_top"], b["R_left"], m1])
-        pygame.draw.polygon(self.screen, (88, 92, 98), [b["R_right"], b["R_bot"], m2])
+        pygame.draw.polygon(self.screen, roof_d, [b["R_left"], b["R_bot"],  m2, m1])
+        pygame.draw.polygon(self.screen, (88, 92, 98), [b["R_top"],   b["R_left"],  m1])
+        pygame.draw.polygon(self.screen, (88, 92, 98), [b["R_right"], b["R_bot"],   m2])
 
         if zoom >= 1.0:
-            # Two roller doors on the sunlit face
             for u in (0.14, 0.56):
                 door = _face_quad(b["right"], u, 0.0, 0.30, 0.66)
                 pygame.draw.polygon(self.screen, (66, 70, 78), door)
@@ -1029,98 +1109,88 @@ class Renderer:
                     v = i * 0.13
                     pygame.draw.line(self.screen, (48, 52, 58),
                                      _face_pt(b["right"], u, v),
-                                     _face_pt(b["right"], u + 0.30, v), max(1, int(zoom)))
-            # Hazard stripe along the base
+                                     _face_pt(b["right"], u + 0.30, v),
+                                     max(1, int(zoom)))
             stripe = [
                 _face_pt(b["right"], 0.0, 0.0), _face_pt(b["right"], 1.0, 0.0),
                 _face_pt(b["right"], 1.0, 0.06), _face_pt(b["right"], 0.0, 0.06),
             ]
             pygame.draw.polygon(self.screen, (220, 196, 60), stripe)
 
-        # Sign board on a post
         if zoom > 0.4:
-            font = pygame.font.SysFont("segoeui", max(7, int(9 * zoom)), bold=True)
+            font = _get_font("segoeui", max(7, int(9 * zoom)), bold=True)
             text = font.render("COUNCIL DEPOT", True, (245, 245, 245))
-            rect = text.get_rect(center=(int(x), int(b["R_top"][1] - 30 * zoom)))
-            board = pygame.Rect(rect.x - 6, rect.y - 3, rect.width + 12, rect.height + 6)
+            rect  = text.get_rect(center=(int(x), int(b["R_top"][1] - 30 * zoom)))
+            board = pygame.Rect(rect.x - 6, rect.y - 3,
+                                rect.width + 12, rect.height + 6)
             pygame.draw.rect(self.screen, (38, 40, 48), board)
             pygame.draw.rect(self.screen, (200, 204, 210), board, 1)
             pygame.draw.line(self.screen, (120, 124, 130),
-                             (x, board.bottom), (x, b["R_top"][1] - 4 * zoom), max(1, int(2 * zoom)))
+                             (x, board.bottom), (x, b["R_top"][1] - 4 * zoom),
+                             max(1, int(2 * zoom)))
             self.screen.blit(text, rect)
 
-        # Strike picket line — workers standing outside with signs
         if fleet and getattr(fleet, "on_strike", False) and zoom > 0.4:
-            hw = (self.tile_w / 2) * zoom
-            hh = (self.tile_h / 2) * zoom
-            f  = 1.25
-            b2 = self._box(x, y, hw, hh, f, 30 * zoom)
             n_workers = min(8, max(2, fleet.workers))
             for i in range(n_workers):
-                angle  = (i / n_workers) * 3.14 + 0.3
-                wx = int(x + math.cos(angle) * hw * f * 1.4)
-                wy = int(y + hh + math.sin(angle) * hh * f * 1.4)
-                s2 = max(0.6, zoom)
-                # Body
+                angle = (i / n_workers) * 3.14 + 0.3
+                wx    = int(x + math.cos(angle) * hw * f * 1.4)
+                wy    = int(y + hh + math.sin(angle) * hh * f * 1.4)
+                s2    = max(0.6, zoom)
                 pygame.draw.rect(self.screen, (255, 180, 0),
                                  pygame.Rect(wx - int(2.5 * s2), wy - int(7 * s2),
                                              int(5 * s2), int(5 * s2)))
-                # Head
                 pygame.draw.circle(self.screen, (235, 200, 160),
                                    (wx, wy - int(8.5 * s2)), max(1, int(2 * s2)))
-                # Picket sign post
                 pygame.draw.line(self.screen, (180, 150, 100),
                                  (wx, wy - int(10 * s2)), (wx, wy - int(16 * s2)),
                                  max(1, int(s2)))
-                # Sign board
                 pygame.draw.rect(self.screen, (255, 60, 60),
                                  pygame.Rect(wx - int(4 * s2), wy - int(16 * s2),
                                              int(8 * s2), int(5 * s2)))
-            # Strike label above depot
-            font_s = pygame.font.SysFont("segoeui", max(8, int(10 * zoom)), bold=True)
-            strike_text = font_s.render("ON STRIKE", True, (255, 60, 60))
-            srect = strike_text.get_rect(
-                center=(int(x), int(y - 30 * zoom * 1.25 - 28 * zoom)))
-            bg_s = pygame.Surface((strike_text.get_width() + 8,
-                                   strike_text.get_height() + 4), pygame.SRCALPHA)
-            bg_s.fill((0, 0, 0, 160))
-            self.screen.blit(bg_s, (srect.x - 4, srect.y - 2))
-            self.screen.blit(strike_text, srect)
 
-    # ------------------------------------------------------------- truck
+            font_s      = _get_font("segoeui", max(8, int(10 * zoom)), bold=True)
+            strike_text = font_s.render("ON STRIKE", True, (255, 60, 60))
+            srect       = strike_text.get_rect(
+                center=(int(x), int(y - 30 * zoom * 1.25 - 28 * zoom)))
+            bg_s = pygame.Surface(
+                (strike_text.get_width() + 8, strike_text.get_height() + 4),
+                pygame.SRCALPHA)
+            bg_s.fill((0, 0, 0, 160))
+            self.screen.blit(bg_s,        (srect.x - 4, srect.y - 2))
+            self.screen.blit(strike_text,  srect)
+
+    # ─── truck ────────────────────────────────────────────────────────────────
+
     def draw_truck(self, x, y, truck, zoom):
-        # If icon.ico is available, use it as the truck sprite
         if self._truck_icon is not None:
-            s = zoom * 1.2
-            flip = truck.get("facing", 1)
-            # Scale the icon to appropriate size
-            icon_size = int(32 * s)
-            scaled = pygame.transform.scale(self._truck_icon, (icon_size, icon_size))
+            s       = zoom * 1.2
+            flip    = truck.get("facing", 1)
+            icon_sz = int(32 * s)
+            scaled  = pygame.transform.scale(self._truck_icon, (icon_sz, icon_sz))
             if flip < 0:
                 scaled = pygame.transform.flip(scaled, True, False)
-            rect = scaled.get_rect(center=(int(x), int(y - 5 * s)))
-            self.screen.blit(scaled, rect)
+            self.screen.blit(scaled, scaled.get_rect(center=(int(x), int(y - 5 * s))))
 
-            # Draw truck ID label below
             if zoom > 0.35:
-                font = pygame.font.SysFont("monospace", max(5, int(6 * s)), bold=True)
+                font = _get_font("monospace", max(5, int(6 * s)), bold=True)
                 text = font.render(f"L{truck['id']}", True, (255, 255, 255))
                 self.screen.blit(text, text.get_rect(center=(int(x), int(y + 6 * s))))
             return
 
-        # Fallback: draw the original truck sprite
+        # Fallback sprite
         state = truck["state"]
         if state == "depot":
-            cab_color = (80, 80, 80)
+            cab_color  = (80,  80,  80)
             body_color = (110, 110, 110)
         elif state == "to_depot":
-            cab_color = (40, 110, 60)
+            cab_color  = (40,  110, 60)
             body_color = (224, 106, 0)
         else:
-            cab_color = (40, 120, 60)
+            cab_color  = (40,  120, 60)
             body_color = (210, 190, 40)
 
-        s = zoom * 1.2
+        s    = zoom * 1.2
         flip = truck.get("facing", 1)
 
         def px(dx):
@@ -1140,67 +1210,75 @@ class Renderer:
                     (px(10), y - 10 * s), (px(2), y - 10 * s)]
         pygame.draw.polygon(self.screen, body_color, body_pts)
         pygame.draw.polygon(self.screen, (28, 28, 28), body_pts, max(1, int(s)))
+
         load_pct = truck["load"] / truck["capacity"] if truck["capacity"] else 0
         if load_pct > 0:
-            fh = 8 * s * load_pct
-            fill_color = (255, 70, 70) if load_pct > 0.8 else (255, 160, 0) if load_pct > 0.5 else (70, 220, 70)
-            fr = pygame.Rect(0, 0, int(7 * s), int(fh))
+            fh         = 8 * s * load_pct
+            fill_color = ((255, 70, 70)  if load_pct > 0.8 else
+                          (255, 160, 0)  if load_pct > 0.5 else
+                          (70, 220, 70))
+            fr   = pygame.Rect(0, 0, int(7 * s), int(fh))
             fr.x = int(min(px(2.5), px(9.5)))
             fr.y = int(y - 2 * s - fh)
             pygame.draw.rect(self.screen, fill_color, fr)
+
         wr = max(2, int(2.4 * s))
         pygame.draw.circle(self.screen, (26, 26, 26), (int(px(-6)), int(y)), wr)
         pygame.draw.circle(self.screen, (90, 90, 90), (int(px(-6)), int(y)), max(1, int(s)))
-        pygame.draw.circle(self.screen, (26, 26, 26), (int(px(7)), int(y)), wr)
-        pygame.draw.circle(self.screen, (90, 90, 90), (int(px(7)), int(y)), max(1, int(s)))
+        pygame.draw.circle(self.screen, (26, 26, 26), (int(px( 7)), int(y)), wr)
+        pygame.draw.circle(self.screen, (90, 90, 90), (int(px( 7)), int(y)), max(1, int(s)))
+
         if state == "servicing":
-            flash = math.sin(pygame.time.get_ticks() / 100) > 0
+            flash  = math.sin(pygame.time.get_ticks() / 100) > 0
             beacon = (255, 60, 60) if flash else (150, 40, 40)
-            pygame.draw.circle(self.screen, beacon, (int(px(-5)), int(y - 9 * s)), max(2, int(1.6 * s)))
+            pygame.draw.circle(self.screen, beacon,
+                               (int(px(-5)), int(y - 9 * s)), max(2, int(1.6 * s)))
+
         on_board = max(0, truck["crew"] - len(truck.get("out_workers", [])))
         for i in range(on_board):
             dot_x = x - (on_board - 1) * 3 * s + i * 6 * s
             pygame.draw.circle(self.screen, (255, 255, 255),
                                (int(dot_x), int(y - 13 * s)), max(1, int(1.8 * s)))
+
         if zoom > 0.35:
-            font = pygame.font.SysFont("monospace", max(5, int(6 * s)), bold=True)
+            font = _get_font("monospace", max(5, int(6 * s)), bold=True)
             text = font.render(f"L{truck['id']}", True, (255, 255, 255))
             self.screen.blit(text, text.get_rect(center=(int(x), int(y + 6 * s))))
 
-        # Broken-down indicator — warning triangle + pulsing smoke
         if truck.get("broken"):
-            t_ms = pygame.time.get_ticks()
-            # Warning triangle
-            tri_cx, tri_cy = int(x), int(y - 17 * s)
-            tri_r = max(4, int(6 * s))
+            t_ms   = pygame.time.get_ticks()
+            tri_cx = int(x)
+            tri_cy = int(y - 17 * s)
+            tri_r  = max(4, int(6 * s))
             pygame.draw.polygon(self.screen, (220, 200, 0), [
-                (tri_cx, tri_cy - tri_r),
+                (tri_cx,                   tri_cy - tri_r),
                 (tri_cx - int(tri_r * 0.9), tri_cy + int(tri_r * 0.5)),
                 (tri_cx + int(tri_r * 0.9), tri_cy + int(tri_r * 0.5)),
             ])
             pygame.draw.polygon(self.screen, (40, 40, 40), [
-                (tri_cx, tri_cy - tri_r),
+                (tri_cx,                   tri_cy - tri_r),
                 (tri_cx - int(tri_r * 0.9), tri_cy + int(tri_r * 0.5)),
                 (tri_cx + int(tri_r * 0.9), tri_cy + int(tri_r * 0.5)),
             ], max(1, int(s)))
-            bang = pygame.font.SysFont("segoeui", max(5, int(5 * s)), bold=True)
+            bang   = _get_font("segoeui", max(5, int(5 * s)), bold=True)
             bang_t = bang.render("!", True, (40, 40, 40))
             self.screen.blit(bang_t, bang_t.get_rect(center=(tri_cx, tri_cy)))
-            # Smoke puffs rising from engine
+
             for k in range(3):
-                phase = (t_ms / 600.0 + k * 0.33) % 1.0
+                phase   = (t_ms / 600.0 + k * 0.33) % 1.0
                 smoke_x = int(x + (k - 1) * 3 * s)
                 smoke_y = int(y - 10 * s - phase * 12 * s)
                 alpha   = int(180 * (1.0 - phase))
                 r       = max(1, int((1 + phase * 3) * s))
                 if alpha > 20:
-                    smoke_s = pygame.Surface((r * 2 + 2, r * 2 + 2), pygame.SRCALPHA)
-                    pygame.draw.circle(smoke_s, (160, 160, 160, alpha), (r + 1, r + 1), r)
+                    smoke_s = self._get_alpha_surf(r * 2 + 2, r * 2 + 2)
+                    pygame.draw.circle(smoke_s, (160, 160, 160, alpha),
+                                       (r + 1, r + 1), r)
                     self.screen.blit(smoke_s, (smoke_x - r - 1, smoke_y - r - 1))
 
-    # --------------------------------------------------------- ambient cars
+    # ─── ambient cars ─────────────────────────────────────────────────────────
+
     def draw_ambient_car(self, x, y, car, zoom):
-        """Tiny civilian car -- a coloured box with wheels, smaller than RCVs."""
         s     = zoom * 0.7
         color = car["color"]
         flip  = car.get("facing", 1)
@@ -1212,25 +1290,26 @@ class Renderer:
                             pygame.Rect(int(x - 7 * s), int(y + 1 * s),
                                         int(14 * s), int(4 * s)))
         pts = [(px(-5), y - 1 * s), (px(5), y - 1 * s),
-               (px(5), y - 5 * s), (px(-5), y - 5 * s)]
+               (px(5),  y - 5 * s), (px(-5), y - 5 * s)]
         pygame.draw.polygon(self.screen, color, pts)
-        roof_pts = [(px(-3), y - 5 * s), (px(3), y - 5 * s),
+        roof_pts = [(px(-3), y - 5 * s), (px(3),   y - 5 * s),
                     (px(2.5), y - 8 * s), (px(-2.5), y - 8 * s)]
         pygame.draw.polygon(self.screen, _shade(color, 0.75), roof_pts)
         pygame.draw.polygon(self.screen, (170, 210, 240),
                             [(px(-2.2), y - 5.1 * s), (px(2.2), y - 5.1 * s),
-                             (px(1.8), y - 7.6 * s), (px(-1.8), y - 7.6 * s)])
+                             (px(1.8),  y - 7.6 * s), (px(-1.8), y - 7.6 * s)])
         wr = max(1, int(1.8 * s))
         for wx2 in (-3.5, 3.5):
             pygame.draw.circle(self.screen, (22, 22, 22), (int(px(wx2)), int(y)), wr)
-            pygame.draw.circle(self.screen, (80, 80, 80), (int(px(wx2)), int(y)), max(1, wr - 1))
+            pygame.draw.circle(self.screen, (80, 80, 80), (int(px(wx2)), int(y)),
+                               max(1, wr - 1))
 
-    # --------------------------------------------------------------- peds
+    # ─── peds ─────────────────────────────────────────────────────────────────
+
     def draw_ped(self, x, y, ped, zoom):
-        """Tiny pedestrian walking along roads."""
-        s    = zoom * 0.55
-        bob  = math.sin(ped.get("bob", 0)) * 1.0 * s
-        col  = ped.get("vest", (255, 160, 0))
+        s   = zoom * 0.55
+        bob = math.sin(ped.get("bob", 0)) * 1.0 * s
+        col = ped.get("vest", (255, 160, 0))
 
         pygame.draw.rect(self.screen, col,
                          pygame.Rect(int(x - 1.5 * s), int(y - 6 * s + bob),
@@ -1248,21 +1327,21 @@ class Renderer:
                          (int(x + s * 0.8 - leg * s), int(y + s)),
                          max(1, int(s * 0.8)))
 
-    # --------------------------------------------------------------- birds
+    # ─── birds ────────────────────────────────────────────────────────────────
+
     def draw_birds(self, cx, cy, birds_sys, zoom):
         """Seagulls circling the landfill."""
-        import math as _math
         for b in birds_sys.birds:
-            iso = self.to_iso(b["lcx"], b["lcy"])
-            lx = cx + iso[0] * zoom
-            ly = cy + iso[1] * zoom
-            bx = lx + _math.cos(b["angle"]) * b["radius"] * self.tile_w * zoom * 0.6
-            by = ly + _math.sin(b["angle"]) * b["radius"] * self.tile_h * zoom * 0.4
-            bob_y = _math.sin(b["bob"]) * 3 * zoom
+            iso  = self.to_iso(b["lcx"], b["lcy"])
+            lx   = cx + iso[0] * zoom
+            ly   = cy + iso[1] * zoom
+            bx   = lx + math.cos(b["angle"]) * b["radius"] * self.tile_w * zoom * 0.6
+            by   = ly + math.sin(b["angle"]) * b["radius"] * self.tile_h * zoom * 0.4
+            bob_y = math.sin(b["bob"]) * 3 * zoom
             bx, by = int(bx), int(by + bob_y)
-            wing = _math.sin(b["wing"]) * 0.5 + 0.5
-            ws = max(1, int(4 * zoom))
-            wh = max(1, int(2 * zoom * (0.3 + wing * 0.7)))
+            wing = math.sin(b["wing"]) * 0.5 + 0.5
+            ws   = max(1, int(4 * zoom))
+            wh   = max(1, int(2 * zoom * (0.3 + wing * 0.7)))
             pygame.draw.ellipse(self.screen, (240, 240, 240),
                                 pygame.Rect(bx - ws // 2, by - 1, ws, max(1, int(2 * zoom))))
             pygame.draw.line(self.screen, (220, 220, 220),
@@ -1270,40 +1349,62 @@ class Renderer:
             pygame.draw.line(self.screen, (220, 220, 220),
                              (bx + ws, by - wh), (bx, by), max(1, int(zoom)))
 
-    # --------------------------------------------------------------- weather
+    # ─── weather ──────────────────────────────────────────────────────────────
+
     def draw_weather(self, weather, day_timer, day_duration):
-        """Rain streaks or snow flakes across the whole screen."""
+        """Rain streaks or snow flakes across the whole screen.
+
+        Instead of allocating 60-120 tiny SRCALPHA surfaces per frame (the
+        original approach), we maintain a single screen-sized overlay and
+        rebuild it only every 80 ms — matching the animation granularity of
+        the seeded RNG that was already baked into the original code.
+        """
         if weather not in ("rain", "snow"):
             return
-        sw, sh = self.screen.get_size()
-        import random as _rnd
-        rng = _rnd.Random(int(pygame.time.get_ticks() / 80))
-        if weather == "rain":
-            for _ in range(120):
-                rx = rng.randint(0, sw)
-                ry = rng.randint(0, sh)
-                ln = rng.randint(6, 14)
-                surf = pygame.Surface((2, ln + 2), pygame.SRCALPHA)
-                surf.fill((140, 160, 200, 55))
-                self.screen.blit(surf, (rx, ry))
-        elif weather == "snow":
-            for _ in range(60):
-                rx = rng.randint(0, sw)
-                ry = rng.randint(0, sh)
-                r  = rng.randint(1, 3)
-                surf = pygame.Surface((r * 2 + 2, r * 2 + 2), pygame.SRCALPHA)
-                pygame.draw.circle(surf, (230, 240, 255, 90), (r + 1, r + 1), r)
-                self.screen.blit(surf, (rx, ry))
 
-    # --------------------------------------------------------------- litter
+        sw, sh   = self.screen.get_size()
+        t_seed   = int(pygame.time.get_ticks() / 80)
+        cur_size = (sw, sh)
+
+        if (self._weather_seed != t_seed
+                or self._weather_size != cur_size
+                or self._weather_surf is None):
+            self._weather_seed = t_seed
+            self._weather_size = cur_size
+
+            # Allocate (or resize) the dedicated weather overlay
+            if self._weather_surf is None or self._weather_surf.get_size() != cur_size:
+                self._weather_surf = pygame.Surface(cur_size, pygame.SRCALPHA)
+
+            self._weather_surf.fill((0, 0, 0, 0))
+            rng = random.Random(t_seed)
+
+            if weather == "rain":
+                for _ in range(120):
+                    rx = rng.randint(0, sw - 1)
+                    ry = rng.randint(0, sh - 1)
+                    ln = rng.randint(6, 14)
+                    pygame.draw.line(self._weather_surf, (140, 160, 200, 55),
+                                     (rx, ry), (rx, min(sh - 1, ry + ln)), 2)
+            else:   # snow
+                for _ in range(60):
+                    rx = rng.randint(0, sw - 1)
+                    ry = rng.randint(0, sh - 1)
+                    r  = rng.randint(1, 3)
+                    pygame.draw.circle(self._weather_surf, (230, 240, 255, 90),
+                                       (rx, ry), r)
+
+        self.screen.blit(self._weather_surf, (0, 0))
+
+    # ─── litter ───────────────────────────────────────────────────────────────
+
     def _draw_litter(self, b, days_ov, zoom):
         """Scatter rubbish bags near base of overflowing buildings."""
-        import random as _rnd
-        n_bags = min(6, days_ov * 2)
-        seed   = int(b["B_bot"][0] * 13 + b["B_bot"][1] * 7) & 0xffff
-        rng    = _rnd.Random(seed)
+        n_bags     = min(6, days_ov * 2)
+        seed       = int(b["B_bot"][0] * 13 + b["B_bot"][1] * 7) & 0xffff
+        rng        = random.Random(seed)
         bag_colors = [(35, 35, 35), (120, 30, 30), (40, 80, 120), (60, 110, 55)]
-        for k in range(n_bags):
+        for _ in range(n_bags):
             ox = rng.uniform(-0.6, 0.6)
             oy = rng.uniform(0.0, 0.5)
             bx = b["B_bot"][0] + ox * (b["B_right"][0] - b["B_bot"][0]) * 0.8
@@ -1311,10 +1412,10 @@ class Renderer:
             r  = max(1, int(1.4 * zoom))
             pygame.draw.circle(self.screen, rng.choice(bag_colors), (int(bx), int(by)), r)
 
-    # ------------------------------------------------------------- area overlay
+    # ─── area overlay ─────────────────────────────────────────────────────────
+
     def draw_area_overlay(self, cx, cy, city, zoom, today):
-        """Boundary lines + a small monochrome tag per round (planning view).
-        Now shows route type (residential/commercial/mixed) with color coding."""
+        """Boundary lines + a small monochrome tag per round (planning view)."""
         line = (235, 235, 235)
         for c in range(1, AREA_COLS):
             gx = city.width * c // AREA_COLS
@@ -1323,16 +1424,16 @@ class Renderer:
             gy = city.height * r // AREA_ROWS
             self._draw_edge_line(cx, cy, 0, gy, city.width, gy, zoom, line)
 
-        font = pygame.font.SysFont("segoeui", max(9, int(11 * zoom)), bold=True)
-        small = pygame.font.SysFont("segoeui", max(8, int(9 * zoom)))
-        for area in city.areas:
-            mid_x = (area.col + 0.5) * city.width / AREA_COLS
-            mid_y = (area.row + 0.5) * city.height / AREA_ROWS
-            iso = self.to_iso(mid_x, mid_y)
-            sx = int(cx + iso[0] * zoom)
-            sy = int(cy + iso[1] * zoom)
+        font  = _get_font("segoeui", max(9, int(11 * zoom)), bold=True)
+        small = _get_font("segoeui", max(8, int(9  * zoom)))
 
-            # Route type indicator
+        for area in city.areas:
+            mid_x = (area.col + 0.5) * city.width  / AREA_COLS
+            mid_y = (area.row + 0.5) * city.height / AREA_ROWS
+            iso   = self.to_iso(mid_x, mid_y)
+            sx    = int(cx + iso[0] * zoom)
+            sy    = int(cy + iso[1] * zoom)
+
             route_type = area.route_type
             if route_type == "residential":
                 type_color = (150, 220, 150)
@@ -1344,25 +1445,34 @@ class Renderer:
                 type_color = (220, 210, 150)
                 type_label = "MIX"
 
-            name = font.render(area.name, True, (245, 245, 245))
-            day = small.render(DAY_NAMES[area.collection_day]
-                               + ("  (today)" if area.collection_day == today else ""),
-                               True, (210, 210, 210))
+            name      = font.render(area.name, True, (245, 245, 245))
+            day_str   = (DAY_NAMES[area.collection_day]
+                         + ("  (today)" if area.collection_day == today else ""))
+            day       = small.render(day_str, True, (210, 210, 210))
             type_surf = small.render(type_label, True, type_color)
-            w = max(name.get_width(), day.get_width(), type_surf.get_width()) + 14
-            h = name.get_height() + day.get_height() + type_surf.get_height() + 14
+
+            w   = max(name.get_width(), day.get_width(), type_surf.get_width()) + 14
+            h   = (name.get_height() + day.get_height()
+                   + type_surf.get_height() + 14)
             box = pygame.Rect(sx - w // 2, sy - h // 2, w, h)
             pygame.draw.rect(self.screen, (24, 24, 24), box)
-            pygame.draw.rect(self.screen,
-                             (245, 245, 245) if area.collection_day == today else (250, 250, 250),
-                             box, 2)
-            # Draw route type colored bar on left
-            pygame.draw.rect(self.screen, type_color, pygame.Rect(box.x, box.y, 4, box.height))
-            self.screen.blit(name, (box.centerx - name.get_width() // 2, box.y + 4))
-            self.screen.blit(type_surf, (box.centerx - type_surf.get_width() // 2, box.y + 6 + name.get_height()))
-            self.screen.blit(day, (box.centerx - day.get_width() // 2, box.y + 8 + name.get_height() + type_surf.get_height()))
+            pygame.draw.rect(
+                self.screen,
+                (245, 245, 245) if area.collection_day == today else (250, 250, 250),
+                box, 2)
+            pygame.draw.rect(self.screen, type_color,
+                             pygame.Rect(box.x, box.y, 4, box.height))
+            self.screen.blit(name,
+                             (box.centerx - name.get_width() // 2, box.y + 4))
+            self.screen.blit(type_surf,
+                             (box.centerx - type_surf.get_width() // 2,
+                              box.y + 6 + name.get_height()))
+            self.screen.blit(day,
+                             (box.centerx - day.get_width() // 2,
+                              box.y + 8 + name.get_height() + type_surf.get_height()))
 
-    # ------------------------------------------------------------- helpers
+    # ─── helpers ──────────────────────────────────────────────────────────────
+
     @staticmethod
     def _grow(quad, amount):
         cx = sum(p[0] for p in quad) / 4.0
