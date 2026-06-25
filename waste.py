@@ -19,6 +19,19 @@ the player a meaningful set of policy choices.
 """
 
 
+def _num(value, default=None):
+    """Parse a spreadsheet cell to float, tolerating GBP/commas/blanks."""
+    if value is None:
+        return default
+    s = str(value).replace(",", "").replace("GBP", "").strip()
+    if s == "":
+        return default
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return default
+
+
 class WasteStream:
     def __init__(self, sid, name, color, *, fill_share, gate_fee, credit,
                  satisfaction, frequency=1, can_disable=True, enabled=True,
@@ -46,19 +59,23 @@ class WasteStream:
 
 
 def _default_streams():
+    # Disposal economics reflect the real UK picture: residual waste to
+    # landfill/energy-from-waste is dominated by landfill tax (£126.15/tonne
+    # standard rate, 2025/26), so its gate fee dwarfs everything else.
+    # Recycling and garden earn a modest material credit / subscription income.
     return [
         WasteStream(
             "residual", "General (black bin)", "#4b4f57",
-            fill_share=0.60, gate_fee=0.085, credit=0.0, satisfaction=0,
+            fill_share=0.60, gate_fee=0.11, credit=0.0, satisfaction=0,
             frequency=1, can_disable=False, enabled=True,
-            blurb="Residual waste to energy-from-waste. Always collected; "
-                  "high gate fee."),
+            blurb="Residual waste to landfill / energy-from-waste. Always "
+                  "collected; dominated by landfill tax."),
         WasteStream(
             "recycling", "Dry recycling", "#3d6f8e",
-            fill_share=0.35, gate_fee=0.012, credit=0.060, satisfaction=8,
+            fill_share=0.35, gate_fee=0.012, credit=0.005, satisfaction=8,
             frequency=2, enabled=True,
-            blurb="Mixed paper, card, cans, plastics. Earns a material credit; "
-                  "residents expect it."),
+            blurb="Mixed paper, card, cans, plastics. Roughly break-even on "
+                  "material value -- recycled mainly to dodge landfill tax."),
         WasteStream(
             "food", "Food waste caddy", "#6f8e4a",
             fill_share=0.16, gate_fee=0.020, credit=0.018, satisfaction=6,
@@ -180,5 +197,26 @@ class WastePolicy:
             elif freq.startswith("week"):
                 if s.frequency != 1:
                     s.frequency = 1
+                    changed += 1
+
+            # Economic levers -- editable so players can tune disposal costs and
+            # recycling income from the spreadsheet. Clamped to sane ranges.
+            gate = _num(row.get("Gate fee (GBP/unit)"))
+            if gate is not None:
+                gate = max(0.0, min(1.0, round(gate, 4)))
+                if abs(gate - s.gate_fee) > 1e-9:
+                    s.gate_fee = gate
+                    changed += 1
+            credit = _num(row.get("Credit (GBP/unit)"))
+            if credit is not None:
+                credit = max(0.0, min(1.0, round(credit, 4)))
+                if abs(credit - s.credit) > 1e-9:
+                    s.credit = credit
+                    changed += 1
+            sat = _num(row.get("Satisfaction"))
+            if sat is not None:
+                sat = int(max(0, min(40, round(sat))))
+                if sat != s.satisfaction:
+                    s.satisfaction = sat
                     changed += 1
         return changed

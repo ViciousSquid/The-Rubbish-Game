@@ -36,11 +36,62 @@ import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape, quoteattr
 from collections import OrderedDict
 
+from procurement import VEHICLE_CATALOGUE, get_vehicle
+
 DAY_FULL = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
             "Saturday", "Sunday"]
 DAY_ABBR = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 PRODUCT = "KerbsidePlanner Council Edition"
+
+
+# ---------------------------------------------------------------------------
+#  Shared helpers (used by both ODS and XML builders + the import path)
+# ---------------------------------------------------------------------------
+
+def _truck_round_label(game, truck):
+    """Human-readable name of the round a lorry is pinned to ('Auto' = none)."""
+    pref = truck.get("preferred_area", -1)
+    if pref is None or pref < 0:
+        return "Auto"
+    area = game.city.get_area(pref)
+    return area.name if area else "Auto"
+
+
+def _round_id_from_cell(game, value):
+    """Resolve a Fleet-sheet 'Round' cell to an area id. Accepts an area name,
+    a numeric id, or 'Auto'/'-'/'' (-> -1 for automatic)."""
+    if value is None:
+        return -1
+    s = str(value).strip()
+    if s == "" or s.lower() in ("auto", "-", "none", "any"):
+        return -1
+    # Numeric id?
+    try:
+        return int(float(s))
+    except (ValueError, TypeError):
+        pass
+    low = s.lower()
+    for area in game.city.areas:
+        if area.name.strip().lower() == low:
+            return area.id
+    return -1
+
+
+def _is_lease(value):
+    return str(value or "").strip().lower().startswith("lease")
+
+
+def _last_import_lines(game):
+    """Lines describing the most recent import (for the Summary sheet). Empty
+    if nothing has been imported yet this session."""
+    report = getattr(game, "last_import_report", None)
+    if not report:
+        return []
+    stamp = getattr(game, "last_import_stamp", "")
+    out = ["", f"Last import ({stamp})" if stamp else "Last import"]
+    out.extend(f"  {line}" for line in report)
+    return out
 
 # Finance lever labels -- export and import must agree on these exact strings.
 LV_COUNCIL_TAX = "Council tax (GBP / resident / day)"
@@ -48,6 +99,11 @@ LV_BUSINESS = "Business rates (GBP / premises / day)"
 LV_WAGE = "Crew wage (GBP / hour)"
 LV_THRESHOLD = "Service threshold (% full)"
 LV_TARGET_CREW = "Target crew headcount"
+
+# Config sheet lever labels.
+LV_DAY_LENGTH = "Day length (seconds)"
+LV_EVENT_CHANCE = "Random event chance (0-1 per day)"
+LV_WIN_TARGET = "Win: consecutive clean days needed"
 
 
 # ===========================================================================
@@ -91,20 +147,24 @@ def _build_ods_data(game):
         ["", ""],
         ["How to use this file", ""],
         ["Edit the highlighted tabs, save, then re-import from the Data tab.", ""],
-        ["Rounds, Waste Streams, Finance rates, Routes and Staff round-trip.", ""],
-        ["Fleet and Orders are read-only.", ""],
+        ["Editable: Collection Rounds, Waste Streams, Finance rates, Routes,", ""],
+        ["Staff, Fleet (crew / round / scrap), Place Orders and Config.", ""],
+        ["Read-only: Catalogue, Procurement Orders and the P&L figures.", ""],
     ]
+    for line in _last_import_lines(game):
+        summary.append([line, ""])
     data["Summary"] = summary
 
     # -- Collection Rounds --------------------------------------------------
     rounds = [
-        ["Round", "Collection day", "Frequency", "Properties",
+        ["Round", "Id", "Collection day", "Frequency", "Properties",
          "Population", "Avg fill %", "Status", "Route type"]
     ]
     for area in city.areas:
         st = city.area_stats(area.id, today)
         rounds.append([
             area.name,
+            area.id,
             DAY_ABBR[area.collection_day],
             "Fortnightly" if area.frequency >= 2 else "Weekly",
             area.property_count,
@@ -167,25 +227,54 @@ def _build_ods_data(game):
     staff.append([LV_TARGET_CREW, fleet.workers])
     data["Staff"] = staff
 
-    # -- Fleet (export only) ------------------------------------------------
+    # -- Fleet (editable: Crew, Round, Scrap?) ------------------------------
     fleet_sheet = [
-        ["Lorry", "Model", "Capacity", "Crew", "Crew cap", "Tenure", "Status"]
+        ["Lorry", "Id", "Model", "Capacity", "Crew", "Crew cap",
+         "Round", "Scrap?", "Tenure", "Status"]
     ]
     for t in fleet.trucks:
         fleet_sheet.append([
             f"L{t['id']}",
+            t["id"],
             t.get("model_name", "Standard"),
             int(t["capacity"]),
             t["crew"],
             t.get("crew_cap", 3),
+            _truck_round_label(game, t),
+            "No",
             "Leased" if t.get("leased") else "Owned",
             t["state"],
         ])
     if not fleet.trucks:
-        fleet_sheet.append(["(no vehicles)", "", "", "", "", "", ""])
+        fleet_sheet.append(["(no vehicles)", "", "", "", "", "", "", "", "", ""])
     data["Fleet"] = fleet_sheet
 
-    # -- Procurement Orders (export only) -----------------------------------
+    # -- Catalogue (read-only reference) ------------------------------------
+    catalogue = [
+        ["Model id", "Model", "Capacity", "Crew cap", "Speed x", "Price (GBP)",
+         "Lease/week (GBP)", "Lease deposit (GBP)", "Running/day (GBP)",
+         "Lead (days)", "Notes"]
+    ]
+    for v in VEHICLE_CATALOGUE:
+        catalogue.append([
+            v.id, v.name, v.capacity, v.crew_cap, v.speed_factor, v.price,
+            v.lease_weekly, v.deposit(), v.running_cost, v.lead_time, v.blurb,
+        ])
+    data["Catalogue"] = catalogue
+
+    # -- Place Orders (editable: set Quantity > 0 to order) -----------------
+    place = [
+        ["Model id", "Quantity", "Tenure (Buy/Lease)", "Up-front each (GBP)",
+         "Lead (days)", "Note"]
+    ]
+    for v in VEHICLE_CATALOGUE:
+        place.append([
+            v.id, 0, "Buy", v.price, v.lead_time,
+            f"{v.name} -- lease deposit GBP{v.deposit()}",
+        ])
+    data["Place Orders"] = place
+
+    # -- Procurement Orders (read-only -- vehicles already on order) --------
     orders = [
         ["Model", "Ordered (day)", "Arrives (day)", "Days left", "Tenure"]
     ]
@@ -200,6 +289,15 @@ def _build_ods_data(game):
     if not fleet.orders:
         orders.append(["(nothing on order)", "", "", "", ""])
     data["Procurement Orders"] = orders
+
+    # -- Config (editable difficulty / pacing levers) -----------------------
+    config = [
+        ["Item", "Value"],
+        [LV_DAY_LENGTH, round(eco.day_duration, 1)],
+        [LV_EVENT_CHANCE, round(eco.event_chance, 2)],
+        [LV_WIN_TARGET, eco.win_streak_target],
+    ]
+    data["Config"] = config
 
     return data
 
@@ -367,24 +465,33 @@ def build_workbook_xml(game):
         _row([_cell("")]),
         _row([_cell("How to use this file", "label")]),
         _row([_cell("Edit the highlighted tabs in your spreadsheet app, save as "
-                    "XML Spreadsheet 2003 (*.xml),", "note")]),
-        _row([_cell("then re-import from the borough's Data tab. Rounds, Waste "
-                    "Streams, Finance rates,", "note")]),
-        _row([_cell("Routes and Staff round-trip cleanly. Fleet and "
-                    "Orders are read-only.", "note")]),
+                    "XML Spreadsheet 2003 (*.xml) or ODS,", "note")]),
+        _row([_cell("then re-import from the borough's Data tab. Editable: "
+                    "Collection Rounds, Waste Streams,", "note")]),
+        _row([_cell("Finance rates, Routes, Staff, Fleet (crew / round / "
+                    "scrap), Place Orders and Config.", "note")]),
+        _row([_cell("Read-only: Catalogue, Procurement Orders and the P&L "
+                    "figures.", "note")]),
     ]
+    imp_lines = _last_import_lines(game)
+    if imp_lines:
+        rows.append(_row([_cell("")]))
+        rows.append(_row([_cell(imp_lines[1], "label")]))
+        for line in imp_lines[2:]:
+            rows.append(_row([_cell(line, "note")]))
     sheets.append(_sheet("Summary", [150, 220], rows, freeze_header=False))
 
     # -- Collection Rounds --------------------------------------------------
     rows = [_header_row(
-        ["Round", "Collection day", "Frequency", "Properties",
+        ["Round", "Id", "Collection day", "Frequency", "Properties",
          "Population", "Avg fill %", "Status", "Route type"],
-        numeric_cols=(3, 4, 5))]
+        numeric_cols=(1, 4, 5, 6))]
     for area in city.areas:
         st = city.area_stats(area.id, today)
         band = "band" if area.id % 2 else None
         rows.append(_row([
             _cell(area.name, band),
+            _cell(area.id, band),
             _cell(DAY_ABBR[area.collection_day], band),
             _cell("Fortnightly" if area.frequency >= 2 else "Weekly", band),
             _cell(area.property_count, band),
@@ -393,7 +500,8 @@ def build_workbook_xml(game):
             _cell(st["status"] if st else "-", band),
             _cell(area.route_type, band),
         ]))
-    sheets.append(_sheet("Collection Rounds", [150, 90, 90, 80, 80, 70, 100, 80], rows))
+    sheets.append(_sheet("Collection Rounds",
+                         [150, 50, 90, 90, 80, 80, 70, 100, 80], rows))
 
     # -- Waste Streams ------------------------------------------------------
     wr = waste.to_rows()
@@ -407,7 +515,7 @@ def build_workbook_xml(game):
             _cell(r["Id"], band),
             _cell(r["Collected"], band),
             _cell(r["Frequency"], band),
-            _cell(r["Gate fee (GBP/unit)"], "money2" if band is None else "money2"),
+            _cell(r["Gate fee (GBP/unit)"], "money2"),
             _cell(r["Credit (GBP/unit)"], "money2"),
             _cell(r["Satisfaction"], band),
             _cell(r["Note"], "note"),
@@ -426,11 +534,27 @@ def build_workbook_xml(game):
     rows.append(fin(LV_WAGE, "rate", round(eco.hourly_wage_rate, 2), "money2"))
     rows.append(_row([_cell("")]))
     rows.append(_row([_cell("Profit & loss (yesterday)", "label")]))
+
+    # Track the spreadsheet row numbers of the P&L block so NET can be a live
+    # formula (Type in column 2, Value in column 3). 1-based, +1 for header.
+    ledger_start = len(rows) + 1
     for key, label in eco.LEDGER_LABELS:
         val = int(round(led.get(key, 0.0)))
         kind = "revenue" if key in eco.REVENUE_KEYS else "expense"
         rows.append(fin(label, kind, val, "money"))
-    rows.append(fin("NET", "net", int(round(led["net"])), "money"))
+    ledger_end = len(rows)
+
+    net_formula = (
+        f'=SUMIF(R{ledger_start}C2:R{ledger_end}C2,"revenue",'
+        f'R{ledger_start}C3:R{ledger_end}C3)'
+        f'-SUMIF(R{ledger_start}C2:R{ledger_end}C2,"expense",'
+        f'R{ledger_start}C3:R{ledger_end}C3)'
+    )
+    rows.append(_row([
+        _cell("NET", "label"),
+        _cell("net"),
+        _cell(int(round(led["net"])), "money", formula=net_formula),
+    ]))
     sheets.append(_sheet("Finance", [260, 90, 110], rows))
 
     # -- Routes -------------------------------------------------------------
@@ -454,25 +578,72 @@ def build_workbook_xml(game):
     rows.append(_row([_cell(LV_TARGET_CREW, "label"), _cell(fleet.workers)]))
     sheets.append(_sheet("Staff", [260, 110], rows))
 
-    # -- Fleet (export only) ------------------------------------------------
+    # -- Fleet (editable: Crew, Round, Scrap?) ------------------------------
     rows = [_header_row(
-        ["Lorry", "Model", "Capacity", "Crew", "Crew cap", "Tenure", "Status"],
-        numeric_cols=(2, 3, 4))]
-    for t in fleet.trucks:
+        ["Lorry", "Id", "Model", "Capacity", "Crew", "Crew cap",
+         "Round", "Scrap?", "Tenure", "Status"],
+        numeric_cols=(1, 3, 4, 5))]
+    for i, t in enumerate(fleet.trucks):
+        band = "band" if i % 2 else None
         rows.append(_row([
-            _cell(f"L{t['id']}"),
-            _cell(t.get("model_name", "Standard")),
-            _cell(int(t["capacity"])),
-            _cell(t["crew"]),
-            _cell(t.get("crew_cap", 3)),
-            _cell("Leased" if t.get("leased") else "Owned"),
-            _cell(t["state"]),
+            _cell(f"L{t['id']}", band),
+            _cell(t["id"], band),
+            _cell(t.get("model_name", "Standard"), band),
+            _cell(int(t["capacity"]), band),
+            _cell(t["crew"], band),
+            _cell(t.get("crew_cap", 3), band),
+            _cell(_truck_round_label(game, t), band),
+            _cell("No", band),
+            _cell("Leased" if t.get("leased") else "Owned", band),
+            _cell(t["state"], band),
         ]))
     if not fleet.trucks:
         rows.append(_row([_cell("(no vehicles)", "note")]))
-    sheets.append(_sheet("Fleet", [70, 160, 90, 60, 80, 80, 90], rows))
+    sheets.append(_sheet("Fleet",
+                         [60, 40, 150, 80, 55, 70, 110, 60, 70, 90], rows))
 
-    # -- Procurement Orders (export only) -----------------------------------
+    # -- Catalogue (read-only reference) ------------------------------------
+    rows = [_header_row(
+        ["Model id", "Model", "Capacity", "Crew cap", "Speed x", "Price (GBP)",
+         "Lease/week (GBP)", "Lease deposit (GBP)", "Running/day (GBP)",
+         "Lead (days)", "Notes"],
+        numeric_cols=(2, 3, 4, 5, 6, 7, 8, 9))]
+    for i, v in enumerate(VEHICLE_CATALOGUE):
+        band = "band" if i % 2 else None
+        rows.append(_row([
+            _cell(v.id, band),
+            _cell(v.name, band),
+            _cell(v.capacity, band),
+            _cell(v.crew_cap, band),
+            _cell(v.speed_factor, band),
+            _cell(v.price, "money"),
+            _cell(v.lease_weekly, "money"),
+            _cell(v.deposit(), "money"),
+            _cell(v.running_cost, "money"),
+            _cell(v.lead_time, band),
+            _cell(v.blurb, "note"),
+        ]))
+    sheets.append(_sheet("Catalogue",
+                         [70, 160, 80, 70, 60, 100, 110, 120, 110, 70, 300], rows))
+
+    # -- Place Orders (editable: set Quantity > 0 to order) -----------------
+    rows = [_header_row(
+        ["Model id", "Quantity", "Tenure (Buy/Lease)", "Up-front each (GBP)",
+         "Lead (days)", "Note"],
+        numeric_cols=(1, 3, 4))]
+    for i, v in enumerate(VEHICLE_CATALOGUE):
+        band = "band" if i % 2 else None
+        rows.append(_row([
+            _cell(v.id, band),
+            _cell(0, band),
+            _cell("Buy", band),
+            _cell(v.price, "money"),
+            _cell(v.lead_time, band),
+            _cell(f"{v.name} -- lease deposit GBP{v.deposit()}", "note"),
+        ]))
+    sheets.append(_sheet("Place Orders", [80, 80, 130, 130, 80, 320], rows))
+
+    # -- Procurement Orders (read-only -- vehicles already on order) --------
     rows = [_header_row(
         ["Model", "Ordered (day)", "Arrives (day)", "Days left", "Tenure"],
         numeric_cols=(1, 2, 3))]
@@ -487,6 +658,16 @@ def build_workbook_xml(game):
     if not fleet.orders:
         rows.append(_row([_cell("(nothing on order)", "note")]))
     sheets.append(_sheet("Procurement Orders", [160, 100, 100, 90, 80], rows))
+
+    # -- Config (editable difficulty / pacing levers) -----------------------
+    rows = [_header_row(["Item", "Value"], numeric_cols=(1,))]
+    rows.append(_row([_cell(LV_DAY_LENGTH, "label"),
+                      _cell(round(eco.day_duration, 1))]))
+    rows.append(_row([_cell(LV_EVENT_CHANCE, "label"),
+                      _cell(round(eco.event_chance, 2))]))
+    rows.append(_row([_cell(LV_WIN_TARGET, "label"),
+                      _cell(eco.win_streak_target)]))
+    sheets.append(_sheet("Config", [320, 110], rows))
 
     head = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -578,20 +759,30 @@ def _to_float(s, default=None):
 
 
 def apply_workbook(game, sheets):
-    """Apply the editable levers from a parsed workbook. Returns a summary."""
+    """Apply the editable levers from a parsed workbook. Returns a summary
+    string and records a detailed report on the game for the next export."""
     eco = game.economy
     city = game.city
     fleet = game.fleet
     waste = game.waste
     notes = []
+    warnings = []
 
-    # Rounds -----------------------------------------------------------------
+    # Rounds (match by stable Id, fall back to name) -------------------------
     rounds = sheets.get("Collection Rounds", [])
     by_name = {a.name.strip().lower(): a for a in city.areas}
     moved = 0
     for r in rounds:
-        area = by_name.get((r.get("Round") or "").strip().lower())
+        area = None
+        rid = _to_float(r.get("Id"))
+        if rid is not None:
+            area = city.get_area(int(rid))
+        if area is None:
+            area = by_name.get((r.get("Round") or "").strip().lower())
         if not area:
+            name = (r.get("Round") or "").strip()
+            if name:
+                warnings.append(f"round '{name}' not found")
             continue
         di = _day_index(r.get("Collection day"))
         if di is not None and di != area.collection_day:
@@ -607,7 +798,7 @@ def apply_workbook(game, sheets):
     if moved:
         notes.append(f"{moved} round change(s)")
 
-    # Waste streams ----------------------------------------------------------
+    # Waste streams (toggle, frequency, and now economics) -------------------
     streams = sheets.get("Waste Streams", [])
     if streams:
         changed = waste.apply_rows(streams)
@@ -625,11 +816,17 @@ def apply_workbook(game, sheets):
         if val is None:
             continue
         if item == LV_COUNCIL_TAX:
-            eco.council_tax_rate = max(0.0, round(val, 2)); rate_changes += 1
+            new = max(0.0, round(val, 2))
+            if abs(new - eco.council_tax_rate) > 1e-9:
+                eco.council_tax_rate = new; rate_changes += 1
         elif item == LV_BUSINESS:
-            eco.business_rates = max(0.0, round(val, 2)); rate_changes += 1
+            new = max(0.0, round(val, 2))
+            if abs(new - eco.business_rates) > 1e-9:
+                eco.business_rates = new; rate_changes += 1
         elif item == LV_WAGE:
-            eco.hourly_wage_rate = max(0.0, round(val, 2)); rate_changes += 1
+            new = max(0.0, round(val, 2))
+            if abs(new - eco.hourly_wage_rate) > 1e-9:
+                eco.hourly_wage_rate = new; rate_changes += 1
     if rate_changes:
         notes.append(f"{rate_changes} finance rate(s)")
 
@@ -638,8 +835,32 @@ def apply_workbook(game, sheets):
         if (r.get("Item") or "").strip() == LV_THRESHOLD:
             val = _to_float(r.get("Value"))
             if val is not None:
-                fleet.service_threshold = int(max(5, min(80, val)))
-                notes.append("service threshold")
+                new = int(max(5, min(80, val)))
+                if new != fleet.service_threshold:
+                    fleet.service_threshold = new
+                    notes.append("service threshold")
+
+    # Config (difficulty / pacing levers) ------------------------------------
+    for r in sheets.get("Config", []):
+        item = (r.get("Item") or "").strip()
+        val = _to_float(r.get("Value"))
+        if val is None:
+            continue
+        if item == LV_DAY_LENGTH:
+            new = max(5.0, min(600.0, round(val, 1)))
+            if abs(new - eco.day_duration) > 1e-6:
+                eco.day_duration = new
+                notes.append("day length")
+        elif item == LV_EVENT_CHANCE:
+            new = max(0.0, min(1.0, round(val, 2)))
+            if abs(new - eco.event_chance) > 1e-9:
+                eco.event_chance = new
+                notes.append("event chance")
+        elif item == LV_WIN_TARGET:
+            new = int(max(1, min(60, val)))
+            if new != eco.win_streak_target:
+                eco.win_streak_target = new
+                notes.append("win target")
 
     # Staff target (hire within budget / fire down -- never overspends) ------
     for r in sheets.get("Staff", []):
@@ -661,10 +882,123 @@ def apply_workbook(game, sheets):
                 notes.append(f"hired {hired} crew")
             if fired:
                 notes.append(f"released {fired} crew")
+            if fleet.workers < target:
+                warnings.append("staff target not fully met (budget)")
 
-    if not notes:
+    # Fleet: scrap, crew reallocation, round assignment ----------------------
+    try:
+        _apply_fleet_sheet(game, sheets.get("Fleet", []), notes, warnings)
+    except Exception as exc:                       # never abort the whole import
+        warnings.append(f"fleet sheet skipped ({exc})")
+
+    # Place Orders: order vehicles within budget -----------------------------
+    try:
+        _apply_place_orders(game, sheets.get("Place Orders", []), notes, warnings)
+    except Exception as exc:
+        warnings.append(f"orders sheet skipped ({exc})")
+
+    # Record a report for the next export's Summary sheet --------------------
+    report = list(notes) + [f"Warning: {w}" for w in warnings]
+    game.last_import_report = report
+    game.last_import_stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    if not notes and not warnings:
         return "Plan imported -- no changes to apply (values already match)."
-    return "Plan imported: " + ", ".join(notes) + "."
+    msg = "Plan imported"
+    if notes:
+        msg += ": " + ", ".join(notes)
+    if warnings:
+        n = len(warnings)
+        msg += f" ({n} warning{'s' if n != 1 else ''} -- see Summary)"
+    return msg + "."
+
+
+def _apply_fleet_sheet(game, fleet_rows, notes, warnings):
+    """Apply scrap / crew / round edits from the Fleet sheet."""
+    fleet = game.fleet
+    scrap_ids = []
+    crew_dist = {}
+    round_assign = []
+    for r in fleet_rows:
+        tid = _to_float(r.get("Id"))
+        if tid is None:
+            continue
+        tid = int(tid)
+        if fleet.get_truck(tid) is None:
+            warnings.append(f"lorry id {tid} not found")
+            continue
+        if (r.get("Scrap?") or "").strip().lower() in ("yes", "y", "true", "1", "scrap"):
+            scrap_ids.append(tid)
+            continue
+        crew = _to_float(r.get("Crew"))
+        if crew is not None:
+            crew_dist[tid] = int(max(0, crew))
+        round_assign.append((tid, r.get("Round")))
+
+    # Scrap first so the crew pool is correct before redistribution.
+    scrapped = 0
+    for tid in scrap_ids:
+        if fleet.scrap_truck(tid):
+            scrapped += 1
+            crew_dist.pop(tid, None)
+    if scrapped:
+        notes.append(f"scrapped {scrapped} lorr{'y' if scrapped == 1 else 'ies'}")
+
+    # Round assignments.
+    reassigned = 0
+    for tid, cell in round_assign:
+        t = fleet.get_truck(tid)
+        if t is None:
+            continue
+        aid = _round_id_from_cell(game, cell)
+        if t.get("preferred_area", -1) != aid:
+            fleet.assign_truck_area(tid, aid)
+            reassigned += 1
+    if reassigned:
+        notes.append(f"{reassigned} round assignment(s)")
+
+    # Crew redistribution against the now-final pool.
+    if crew_dist:
+        moved_crew = fleet.set_fleet_crew(crew_dist)
+        if moved_crew:
+            notes.append(f"reallocated crew on {moved_crew} lorry(ies)")
+
+
+def _apply_place_orders(game, rows, notes, warnings):
+    """Place vehicle orders from the Place Orders sheet, within budget."""
+    eco = game.economy
+    fleet = game.fleet
+    for r in rows:
+        vid = (r.get("Model id") or "").strip()
+        if not vid:
+            continue
+        qty = _to_float(r.get("Quantity"))
+        if qty is None or qty <= 0:
+            continue
+        qty = int(min(10, qty))
+        v = get_vehicle(vid)
+        if not v:
+            warnings.append(f"unknown vehicle id '{vid}' in Place Orders")
+            continue
+        leased = _is_lease(r.get("Tenure (Buy/Lease)") or r.get("Tenure"))
+        placed = 0
+        afford = True
+        for _ in range(qty):
+            ok, cost, _msg = fleet.order_vehicle(vid, leased)
+            if not ok:
+                break
+            if eco.budget < cost:
+                fleet.orders.pop()
+                afford = False
+                break
+            eco.budget -= cost
+            placed += 1
+        if placed:
+            notes.append(f"ordered {placed}x {v.name} "
+                         f"({'lease' if leased else 'buy'})")
+        if not afford:
+            warnings.append(f"could not afford all {qty}x {v.name} "
+                            f"(placed {placed})")
 
 
 # ===========================================================================

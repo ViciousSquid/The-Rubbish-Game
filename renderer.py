@@ -112,8 +112,11 @@ class Renderer:
                 selected = selected_tile and selected_tile["x"] == x and selected_tile["y"] == y
                 hovered = hovered_tile and hovered_tile["x"] == x and hovered_tile["y"] == y
                 self.draw_tile(ix, iy, tile, selected, zoom, city)
-                if tile.type not in ("road", "green"):
+                if tile.type not in ("road", "green", "landfill"):
                     self.draw_building(ix, iy, tile, zoom, today, hovered, selected)
+
+        # Landfill site (large refuse mound in a corner)
+        self.draw_landfill(cx, cy, city, zoom)
 
         # Depot
         depot_iso = self.to_iso(fleet.depot_x, fleet.depot_y)
@@ -172,19 +175,9 @@ class Renderer:
         hh = (self.tile_h / 2) * zoom
         points = [(x, y), (x + hw, y + hh), (x, y + 2 * hh), (x - hw, y + hh)]
 
-        # ---- ROAD (more prominent) ----
+        # ---- ROAD  ----
         if tile.type == "road":
             pygame.draw.polygon(self.screen, ROAD_COLOR, points)
-            # Curb outline
-            pygame.draw.polygon(self.screen, (55, 58, 65), points, max(2, int(1.5 * zoom)))
-            # Thicker, brighter centre line
-            if zoom >= 0.5:
-                cxp, cyp = x, y + hh
-                line_w = max(2, int(zoom * 1.2))
-                pygame.draw.line(self.screen, (175, 175, 155),
-                                 (cxp - hw * 0.45, cyp + hh * 0.45),
-                                 (cxp + hw * 0.45, cyp - hh * 0.45),
-                                 line_w)
             if is_selected:
                 pygame.draw.polygon(self.screen, (245, 245, 245), points, max(2, int(2 * zoom)))
             return
@@ -208,6 +201,22 @@ class Renderer:
                 pygame.draw.circle(self.screen, (100, 170, 85),
                                    (int(cx - canopy_r*0.3), int(cy - trunk_h - canopy_r*0.2)),
                                    int(canopy_r*0.7))
+            if is_selected:
+                pygame.draw.polygon(self.screen, (245, 245, 245), points, max(2, int(2 * zoom)))
+            return
+
+        # ---- LANDFILL ----
+        if tile.type == "landfill":
+            pygame.draw.polygon(self.screen, (74, 64, 48), points)   # churned earth
+            if zoom >= 0.7:
+                # a few scattered refuse specks so the ground reads as a tip
+                seed = ((int(x) * 73856093) ^ (int(y) * 19349663)) & 0xffff
+                for k in range(3):
+                    sx = x + ((seed >> (k * 3)) % 7 - 3) * hw * 0.18
+                    sy = y + hh + ((seed >> (k * 2)) % 5 - 2) * hh * 0.18
+                    col = [(40, 40, 40), (120, 40, 40), (40, 80, 120)][k % 3]
+                    pygame.draw.circle(self.screen, col, (int(sx), int(sy)),
+                                       max(1, int(1.6 * zoom)))
             if is_selected:
                 pygame.draw.polygon(self.screen, (245, 245, 245), points, max(2, int(2 * zoom)))
             return
@@ -649,6 +658,63 @@ class Renderer:
         if w["state"] == "back" and w.get("carry", 0) > 0:
             pygame.draw.circle(self.screen, (40, 50, 45),
                                (int(x + 3 * s), int(y - 4 * s)), max(1, int(1.8 * s)))
+
+    # ------------------------------------------------------------- landfill
+    def draw_landfill(self, cx, cy, city, zoom):
+        """A big refuse mound with a tipping gate and signage, sited in a
+        corner. Deliberately earthy and messy so it reads instantly as the tip,
+        distinct from the grey depot and the colourful streets."""
+        lf = getattr(city, "landfill", None)
+        if not lf:
+            return
+        iso = self.to_iso(lf["cx"], lf["cy"])
+        x = cx + iso[0] * zoom
+        y = cy + iso[1] * zoom
+        hw = (self.tile_w / 2) * zoom
+        hh = (self.tile_h / 2) * zoom
+        base_w = hw * 3.0
+        base_h = hh * 3.0
+
+        # Stacked earthy layers form the heap.
+        for i, (f, col) in enumerate([(1.0, (58, 52, 40)), (0.74, (78, 70, 52)),
+                                      (0.48, (98, 88, 64)), (0.24, (120, 110, 78))]):
+            ry = y - i * 7 * zoom
+            pygame.draw.ellipse(self.screen, col, pygame.Rect(
+                int(x - base_w * f), int(ry - base_h * f * 0.5),
+                int(base_w * 2 * f), int(base_h * f)))
+
+        # Scattered bin-bag specks (seeded so they don't shimmer each frame).
+        rng = __import__("random").Random(0xB1A5)
+        for _ in range(int(46 * zoom)):
+            sx = x + rng.uniform(-base_w * 0.95, base_w * 0.95)
+            sy = y + rng.uniform(-base_h * 0.45, base_h * 0.35) - rng.uniform(0, 20) * zoom
+            c = rng.choice([(38, 38, 38), (120, 32, 32), (32, 90, 44),
+                            (40, 64, 120), (150, 150, 150), (150, 130, 40)])
+            pygame.draw.circle(self.screen, c, (int(sx), int(sy)), max(1, int(1.5 * zoom)))
+
+        # Tipping gate / weighbridge marker.
+        g = lf.get("gate")
+        if g and zoom > 0.4:
+            giso = self.to_iso(g[0], g[1])
+            gx = cx + giso[0] * zoom
+            gy = cy + giso[1] * zoom
+            pygame.draw.rect(self.screen, (210, 188, 44), pygame.Rect(
+                int(gx - 7 * zoom), int(gy - 3 * zoom), int(14 * zoom), int(3 * zoom)))
+            pygame.draw.rect(self.screen, (40, 40, 44), pygame.Rect(
+                int(gx - 7 * zoom), int(gy - 3 * zoom), int(14 * zoom), int(3 * zoom)),
+                max(1, int(zoom)))
+
+        # Signage on a post.
+        if zoom > 0.4:
+            font = pygame.font.SysFont("segoeui", max(7, int(9 * zoom)), bold=True)
+            text = font.render("LANDFILL SITE", True, (245, 245, 245))
+            rect = text.get_rect(center=(int(x), int(y - base_h - 20 * zoom)))
+            board = pygame.Rect(rect.x - 6, rect.y - 3, rect.width + 12, rect.height + 6)
+            pygame.draw.rect(self.screen, (38, 40, 48), board)
+            pygame.draw.rect(self.screen, (200, 160, 60), board, 1)
+            pygame.draw.line(self.screen, (120, 110, 80),
+                             (x, board.bottom), (x, y - base_h * 0.5), max(1, int(2 * zoom)))
+            self.screen.blit(text, rect)
 
     # ------------------------------------------------------------- depot
     def draw_depot(self, x, y, zoom):

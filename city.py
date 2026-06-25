@@ -18,6 +18,8 @@ AREA_NAMES = [
     "Oakfield", "Hillcrest", "Kingsbury", "Castell Coch",
     "Greenway", "Old Town", "Llanfair", "Brookside",
     "Cathedral", "Saltmarsh", "Maple Park", "Westbrook",
+    "Green Park", "Parkside", "Greenfield", "Meadow Park",
+    "Oak Park", "Spring Green", "Parklands", "Green Hill",
 ]
 
 # ---------------------------------------------------------------------------
@@ -113,6 +115,12 @@ def _weighted_choice(weights):
     return next(iter(weights))
 
 
+def _is_green_area(area_name):
+    """Check if an area is a park/green space area by name."""
+    name_lower = area_name.lower()
+    return "park" in name_lower or "green" in name_lower or "meadow" in name_lower
+
+
 class Tile:
     def __init__(self, tile_type):
         self.type = tile_type
@@ -193,6 +201,7 @@ class CityGenerator:
         self.population = 0
         self.property_count = 0
         self.metrics = {"residential": 0, "commercial": 0, "roads": 0, "green": 0}
+        self.landfill = None         # set by _place_landfill() during generate()
 
     # ------------------------------------------------------------------ areas
     def _area_index(self, x, y):
@@ -237,20 +246,32 @@ class CityGenerator:
         self.tiles = []
         self.population = 0
         self.property_count = 0
+        self.landfill = None
         self.metrics = {"residential": 0, "commercial": 0, "roads": 0, "green": 0}
         self._build_areas()
 
         roads = RoadGenerator.generate_grid(self.width, self.height)
 
         # Randomise green space between 10% and 20%
-        green_threshold = random.uniform(0.10, 0.20)
-        building_threshold = 0.82 + (0.07 - green_threshold)  # keep total probability consistent
+        base_green_threshold = random.uniform(0.10, 0.20)
+        base_building_threshold = 0.82 + (0.07 - base_green_threshold)
 
         for y in range(self.height):
             row = []
             for x in range(self.width):
                 key = f"{x},{y}"
                 area_id, _, _ = self._area_index(x, y)
+                area = self.areas[area_id]
+                is_green = _is_green_area(area.name)
+
+                # Park/green areas: lots of green space, fewer buildings
+                if is_green:
+                    green_threshold = 0.55  # ~55% green space
+                    building_threshold = 0.92
+                else:
+                    green_threshold = base_green_threshold
+                    building_threshold = base_building_threshold
+
                 if key in roads:
                     tile = Tile("road")
                     tile.area_id = area_id
@@ -262,9 +283,9 @@ class CityGenerator:
                         tile.area_id = area_id
                         self.metrics["green"] = self.metrics.get("green", 0) + 1
                     elif roll < building_threshold:
-                        tile = self._make_building("residential", area_id)
+                        tile = self._make_building("residential", area_id, is_green)
                     else:
-                        tile = self._make_building("commercial", area_id)
+                        tile = self._make_building("commercial", area_id, is_green)
                 row.append(tile)
             self.tiles.append(row)
 
@@ -285,19 +306,123 @@ class CityGenerator:
         for area in self.areas:
             area.route_type = area.get_dominant_type(self)
 
-    def _make_building(self, kind, area_id):
+        # Carve out the borough landfill in a far corner.
+        self._place_landfill()
+
+    # --------------------------------------------------------------- landfill
+    # Depot reference (matches FleetManager.depot_x/y) so the landfill is sited
+    # away from the depot and a sensible tipping gate can be chosen.
+    DEPOT_REF = (5, 5)
+    LANDFILL_SIZE = 8
+
+    def _place_landfill(self):
+        """Site a large landfill in a random corner away from the depot. Trucks
+        haul full loads here to tip. Road tiles inside the footprint are kept as
+        haul roads so the site is always reachable."""
+        w, h, size = self.width, self.height, self.LANDFILL_SIZE
+        inset = 1
+        # Four corners; drop the one nearest the depot so hauls are a real trip.
+        corners = {
+            "NW": (inset, inset),
+            "NE": (w - inset - size, inset),
+            "SW": (inset, h - inset - size),
+            "SE": (w - inset - size, h - inset - size),
+        }
+        dx, dy = self.DEPOT_REF
+        depot_corner = ("N" if dy < h / 2 else "S") + ("W" if dx < w / 2 else "E")
+        choices = [k for k in corners if k != depot_corner] or list(corners)
+        key = random.choice(choices)
+        ox, oy = corners[key]
+
+        tiles = set()
+        for yy in range(oy, oy + size):
+            for xx in range(ox, ox + size):
+                if not self.is_inside(xx, yy):
+                    continue
+                if self.tiles[yy][xx].type == "road":
+                    continue              # keep haul roads through the site
+                self._convert_to_landfill(xx, yy)
+                tiles.add((xx, yy))
+
+        gate = self._find_landfill_gate(tiles)
+        self.landfill = {
+            "tiles": tiles,
+            "cx": ox + size // 2,
+            "cy": oy + size // 2,
+            "gate": gate,
+            "corner": key,
+        }
+
+    def _convert_to_landfill(self, x, y):
+        """Turn a tile into landfill, unwinding any property bookkeeping."""
+        t = self.tiles[y][x]
+        if t.type in ("residential", "commercial"):
+            area = self.get_area(t.area_id)
+            if area and (x, y) in area.building_tiles:
+                area.building_tiles.remove((x, y))
+                area.property_count = max(0, area.property_count - 1)
+                area.population = max(0, area.population - t.population)
+            self.population = max(0, self.population - t.population)
+            self.property_count = max(0, self.property_count - 1)
+            key = "residential" if t.type == "residential" else "commercial"
+            self.metrics[key] = max(0, self.metrics.get(key, 0) - 1)
+        elif t.type == "green":
+            self.metrics["green"] = max(0, self.metrics.get("green", 0) - 1)
+        t.type = "landfill"
+        t.population = 0
+        t.bin_fill = 0.0
+        t.fill_rate = 0.0
+        t.building_height = 0
+
+    def _find_landfill_gate(self, tiles):
+        """Nearest road tile adjacent to the site (to the depot) -- the tipping
+        gate trucks drive to. Falls back to any road tile."""
+        depot = self.DEPOT_REF
+        best, best_d = None, 1e9
+        for (x, y) in tiles:
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = x + dx, y + dy
+                t = self.get_tile(nx, ny)
+                if t and t.type == "road":
+                    d = abs(nx - depot[0]) + abs(ny - depot[1])
+                    if d < best_d:
+                        best, best_d = (nx, ny), d
+        if best is None:
+            for yy in range(self.height):
+                for xx in range(self.width):
+                    if self.tiles[yy][xx].type == "road":
+                        return (xx, yy)
+        return best
+
+    def _make_building(self, kind, area_id, is_green_area=False):
         tile = Tile(kind)
         tile.area_id = area_id
         if kind == "residential":
-            style = _weighted_choice(RES_STYLE_WEIGHTS)
+            if is_green_area:
+                # Green areas only get small houses: bungalow, terrace, semi, detached
+                green_weights = {"bungalow": 0.30, "terrace": 0.30, "semi": 0.25, "detached": 0.15}
+                style = _weighted_choice(green_weights)
+            else:
+                style = _weighted_choice(RES_STYLE_WEIGHTS)
             self.metrics["residential"] += 1
         else:
-            style = _weighted_choice(COM_STYLE_WEIGHTS)
+            if is_green_area:
+                # Green areas only get small commercial: shop, office
+                green_com_weights = {"shop": 0.60, "office": 0.40}
+                style = _weighted_choice(green_com_weights)
+            else:
+                style = _weighted_choice(COM_STYLE_WEIGHTS)
             self.metrics["commercial"] += 1
 
         data = STYLE_DATA[style]
         tile.building_style = style
-        tile.building_height = random.randint(data["h"][0], data["h"][1])
+
+        # Green areas get smaller buildings (cap height at 60% of normal max)
+        h_min, h_max = data["h"]
+        if is_green_area:
+            h_max = min(h_max, int(h_min + (h_max - h_min) * 0.5))
+        tile.building_height = random.randint(h_min, h_max)
+
         tile.population = random.randint(data["pop"][0], data["pop"][1])
         tile.fill_rate = data["fill"]
 
@@ -316,7 +441,7 @@ class CityGenerator:
     def update(self, dt, bin_rate_multiplier=1):
         for row in self.tiles:
             for tile in row:
-                if tile.type in ("road", "green"):
+                if tile.type in ("road", "green", "landfill"):
                     continue
                 tile.bin_fill += dt * tile.fill_rate * bin_rate_multiplier
                 if tile.bin_fill > 100:

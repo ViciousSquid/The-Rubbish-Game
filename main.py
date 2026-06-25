@@ -14,7 +14,7 @@ CITY_H = 60
 class WasteCityGame:
     def __init__(self):
         pygame.init()
-        pygame.display.set_caption("Waste Borough - UK Refuse Management Sim")
+        pygame.display.set_caption("The Rubbish Game")
         self.screen = pygame.display.set_mode((1280, 720), pygame.RESIZABLE)
         self.clock = pygame.time.Clock()
 
@@ -31,7 +31,7 @@ class WasteCityGame:
         self.hovered_tile = None
         self.planner_open = False
         self.planner_tab = "rounds"      # rounds | waste | fleet | finance | data
-        self.show_areas = False
+        self.show_areas = True
 
         # Transient status line (XML import/export, deliveries, etc.)
         self.toast = ""
@@ -75,19 +75,46 @@ class WasteCityGame:
         self.planner_open = True
 
     def _center_camera(self):
-        # Focus camera on the depot location
-        depot_iso = self.renderer.to_iso(self.fleet.depot_x, self.fleet.depot_y)
+        """Frame the camera on the landfill site at start (falls back to the
+        depot if no landfill exists)."""
+        lf = getattr(self.city, "landfill", None)
+        if lf:
+            target = self.renderer.to_iso(lf["cx"], lf["cy"])
+        else:
+            target = self.renderer.to_iso(self.fleet.depot_x, self.fleet.depot_y)
         sw, sh = self.screen.get_size()
-        # Center the depot in the screen (accounting for the renderer's cy offset of 120)
-        self.camera["x"] = -depot_iso[0] + (sw / 2) / self.camera["zoom"]
-        self.camera["y"] = -depot_iso[1] + (sh / 2) / self.camera["zoom"] - 120
+        zoom = self.camera["zoom"]
+        # Solve render()'s mapping so the target sits at screen centre:
+        #   screen_x = sw/2 + camera_x + iso_x*zoom
+        #   screen_y = 120  + camera_y + iso_y*zoom
+        self.camera["x"] = -target[0] * zoom
+        self.camera["y"] = sh / 2 - 120 - target[1] * zoom
+
+    def _map_iso_bounds(self):
+        corners = [
+            self.renderer.to_iso(0, 0),
+            self.renderer.to_iso(self.city.width, 0),
+            self.renderer.to_iso(0, self.city.height),
+            self.renderer.to_iso(self.city.width, self.city.height),
+        ]
+        xs = [c[0] for c in corners]
+        ys = [c[1] for c in corners]
+        return min(xs), max(xs), min(ys), max(ys)
 
     def _clamp_camera(self):
-        margin = 400
-        max_iso_x = (self.city.width - self.city.height) * (self.renderer.tile_w / 2)
-        max_iso_y = (self.city.width + self.city.height) * (self.renderer.tile_h / 2)
-        self.camera["x"] = max(-max_iso_x - margin, min(margin, self.camera["x"]))
-        self.camera["y"] = max(-max_iso_y - margin, min(margin, self.camera["y"]))
+        """Keep the map in reach: the camera may centre on any point of the map
+        (including the corners, where the landfill sits) plus a small margin of
+        overscroll, scaled with zoom."""
+        zoom = self.camera["zoom"]
+        margin = 300
+        sw, sh = self.screen.get_size()
+        min_ix, max_ix, min_iy, max_iy = self._map_iso_bounds()
+        # camera_x that centres iso_x is -iso_x*zoom; allow the full span + margin.
+        self.camera["x"] = max(-max_ix * zoom - margin,
+                               min(-min_ix * zoom + margin, self.camera["x"]))
+        cy_for = lambda iso_y: sh / 2 - 120 - iso_y * zoom
+        self.camera["y"] = max(cy_for(max_iy) - margin,
+                               min(cy_for(min_iy) + margin, self.camera["y"]))
 
     # ----------------------------------------------------------------- clicks
     def handle_click(self, screen_x, screen_y):
@@ -137,7 +164,7 @@ class WasteCityGame:
                                                self.screen.get_width(),
                                                self.screen.get_height())
         tile = self.city.get_tile(coord["x"], coord["y"])
-        if tile and tile.type not in ("road", "green"):
+        if tile and tile.type not in ("road", "green", "landfill"):
             self.hovered_tile = {"x": coord["x"], "y": coord["y"], "tile": tile}
         else:
             self.hovered_tile = None

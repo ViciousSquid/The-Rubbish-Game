@@ -85,6 +85,7 @@ class FleetManager:
             "crew": 0,
             "state": "depot",          # depot | to_stop | servicing | to_depot
             "area_id": -1,             # round this lorry is currently working
+            "preferred_area": -1,      # round pinned via the Fleet sheet (-1 = auto)
             "path": [],
             "claimed": set(),
             "bin_queue": [],
@@ -165,6 +166,53 @@ class FleetManager:
             best["crew"] -= 1
         return True
 
+    # ------------------------------------------------- spreadsheet management
+    def get_truck(self, truck_id):
+        for t in self.trucks:
+            if t["id"] == truck_id:
+                return t
+        return None
+
+    def set_fleet_crew(self, distribution):
+        """Redistribute the EXISTING crew pool across lorries to match the
+        desired per-lorry counts from the Fleet sheet. Never hires or fires
+        (that is the Staff target's job) -- it only reassigns who rides where,
+        honouring each lorry's crew_cap and the total headcount available.
+
+        `distribution` maps truck_id -> desired crew. Trucks not mentioned keep
+        their current allocation if the pool allows. Returns the number of
+        lorries whose crew changed."""
+        before = {t["id"]: t["crew"] for t in self.trucks}
+
+        # Desired (clamped to cap); default to current for unmentioned lorries.
+        desired = {}
+        for t in self.trucks:
+            want = distribution.get(t["id"], t["crew"])
+            try:
+                want = int(want)
+            except (TypeError, ValueError):
+                want = t["crew"]
+            cap = int(t.get("crew_cap", MAX_CREW))
+            desired[t["id"]] = max(0, min(cap, want))
+
+        # Hand out crew greedily against the available pool.
+        pool = self.workers
+        for t in self.trucks:
+            give = min(desired[t["id"]], pool)
+            t["crew"] = give
+            pool -= give
+        # Any leftover crew (pool > 0) stays idle but still on the books.
+
+        return sum(1 for t in self.trucks if t["crew"] != before[t["id"]])
+
+    def assign_truck_area(self, truck_id, area_id):
+        """Pin a lorry to a round (-1 = automatic). Returns True if applied."""
+        t = self.get_truck(truck_id)
+        if not t:
+            return False
+        t["preferred_area"] = int(area_id)
+        return True
+
     # ----------------------------------------------------------- bin queries
     def _today(self):
         return self.game.economy.get_day_of_week()
@@ -211,9 +259,21 @@ class FleetManager:
         return count
 
     def _pick_area(self, truck):
-        """Assign this lorry to the due round with the most outstanding work."""
+        """Assign this lorry to a round to work. If the player has pinned this
+        lorry to a round (via the Fleet sheet) and that round still has work
+        due today, honour it; otherwise pick the due round with the most
+        outstanding work."""
         today = self._today()
         week = self._week_index()
+
+        pref = truck.get("preferred_area", -1)
+        if pref is not None and pref >= 0:
+            area = self.game.city.get_area(pref)
+            if area and area.due_today(today, week) \
+                    and self._area_remaining(pref, today) > 0:
+                truck["area_id"] = pref
+                return pref
+
         best, best_remaining = -1, 0
         for area in self.game.city.areas:
             if not area.due_today(today, week):
@@ -362,6 +422,10 @@ class FleetManager:
         elif state == "servicing":
             self._service(truck, dt)
 
+        elif state == "to_landfill":
+            if self._follow_path(truck, dt):
+                self._arrive_landfill(truck)
+
         elif state == "to_depot":
             if self._follow_path(truck, dt):
                 truck["load"] = 0.0
@@ -369,10 +433,10 @@ class FleetManager:
 
     def _begin_servicing(self, truck):
         today = self._today()
-        # Tip first if we're nearly full.
+        # Tip first if we're nearly full -- haul to the landfill.
         if truck["load"] >= truck["capacity"] * 0.95:
             self._release_truck_claims(truck)
-            self._depart_to_depot(truck)
+            self._depart_to_landfill(truck)
             return
 
         bins = [b for b in truck["claimed"]
@@ -411,7 +475,9 @@ class FleetManager:
         if truck["service_t"] < truck["service_need"]:
             return
 
-        # Stop complete — empty the bins (respecting capacity).
+        # Stop complete — empty the bins into the body (respecting capacity).
+        # Disposal volume is metered and charged when the load is tipped at the
+        # landfill, not here, so gate fees follow what actually reaches the tip.
         for (bx, by) in truck["service_bins"]:
             tile = self.game.city.get_tile(bx, by)
             self._release_bin(truck, (bx, by))
@@ -425,13 +491,12 @@ class FleetManager:
             truck["load"] += amt
             if amt > 0:
                 self.collected_count += 1
-                self._pending_volume += amt
         truck["service_bins"] = []
         truck["out_workers"] = []
 
         # Decide what to do next.
         if truck["load"] >= truck["capacity"] * 0.95:
-            self._depart_to_depot(truck)
+            self._depart_to_landfill(truck)
             return
         route = self._route_to_stop(truck)
         if route is not None:
@@ -446,7 +511,11 @@ class FleetManager:
                 truck["path"] = route
                 truck["state"] = "to_stop"
                 return
-        self._depart_to_depot(truck)
+        # No work left: tip any remaining load, otherwise head home.
+        if truck["load"] > 0:
+            self._depart_to_landfill(truck)
+        else:
+            self._depart_to_depot(truck)
 
     def _depart_to_depot(self, truck):
         truck["area_id"] = -1
@@ -454,6 +523,57 @@ class FleetManager:
         truck["service_bins"] = []
         truck["path"] = self._route_to_depot(truck) or []
         truck["state"] = "to_depot"
+
+    # ------------------------------------------------------------- landfill
+    def _landfill_gate(self):
+        """Road tile trucks drive to in order to tip. Falls back to the depot
+        if the city has no landfill (older saves / safety)."""
+        lf = getattr(self.game.city, "landfill", None)
+        if lf and lf.get("gate"):
+            return lf["gate"]
+        return (self.depot_x, self.depot_y)
+
+    def _route_to_landfill(self, truck):
+        start = self._truck_tile(truck)
+        gate = self._landfill_gate()
+        return self._bfs_route(start, lambda t: t == gate)
+
+    def _depart_to_landfill(self, truck):
+        """Head to the landfill to tip. Keeps area_id so the round can resume
+        after tipping. If unreachable, dump at the depot as a fallback."""
+        truck["out_workers"] = []
+        truck["service_bins"] = []
+        route = self._route_to_landfill(truck)
+        if route is None:
+            truck["load"] = 0.0
+            self._depart_to_depot(truck)
+            return
+        truck["path"] = route
+        truck["state"] = "to_landfill"
+
+    def _arrive_landfill(self, truck):
+        """Tip the load (this is where disposal volume is metered and charged),
+        then resume the round, pick a new one, or head home."""
+        if truck["load"] > 0:
+            self._pending_volume += truck["load"]
+            truck["load"] = 0.0
+
+        today = self._today()
+        if truck["area_id"] != -1 and self._area_remaining(truck["area_id"], today) > 0:
+            route = self._route_to_stop(truck)
+            if route is not None:
+                truck["path"] = route
+                truck["state"] = "to_stop"
+                return
+        if truck["area_id"] != -1:
+            self._maybe_mark_area_collected(truck["area_id"])
+        if self._pick_area(truck) is not None:
+            route = self._route_to_stop(truck)
+            if route is not None:
+                truck["path"] = route
+                truck["state"] = "to_stop"
+                return
+        self._depart_to_depot(truck)
 
     # ------------------------------------------------------------ UI metrics
     def get_total_full_bins(self):

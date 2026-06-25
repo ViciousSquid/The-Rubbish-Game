@@ -201,7 +201,7 @@ class UIManager:
         pygame.draw.line(screen, self.c["border"], (HUD_W, 0), (HUD_W, h), 1)
 
         y = 12
-        self._text(screen, "title", "Waste Borough", self.c["text"], x, y)
+        #self._text(screen, "title", "Waste Borough", self.c["text"], x, y)
         y += 28
 
         self._text(screen, "body_b", f"Day {eco.day}", self.c["text"], x, y)
@@ -440,6 +440,16 @@ class UIManager:
             self._text(screen, "header", "Green Space", self.c["text"], rx, py + 12)
             self._text(screen, "small", "Park or garden area.",
                        self.c["muted"], rx, py + 40)
+            return
+
+        if tile.type == "landfill":
+            self._text(screen, "header", "Landfill Site", self.c["text"], rx, py + 12)
+            self._text(screen, "small", "Where full lorries tip their loads.",
+                       self.c["muted"], rx, py + 40)
+            self._text(screen, "small", "Disposal gate fees are charged here,",
+                       self.c["muted"], rx, py + 62)
+            self._text(screen, "small", "driven by landfill tax on residual waste.",
+                       self.c["muted"], rx, py + 80)
             return
 
         label = STYLE_LABELS.get(tile.building_style, tile.type.title())
@@ -930,20 +940,24 @@ class UIManager:
         ty += 56
 
         lines = [
-            "The workbook contains editable sheets:",
-            "  - Collection Rounds  (day + weekly/fortnightly + route type)",
-            "  - Waste Streams      (which streams are on)",
-            "  - Finance            (council tax / business rates)",
-            "  - Routes & Staff     (targets)",
+            "Editable sheets (round-trip on import):",
+            "  - Collection Rounds  (day + weekly/fortnightly)",
+            "  - Waste Streams      (on/off, frequency, gate fee, credit)",
+            "  - Finance            (council tax / business rates / wage)",
+            "  - Routes & Staff     (service threshold, crew target)",
+            "  - Fleet              (set crew, pin round, Scrap? = Yes)",
+            "  - Place Orders       (set Quantity to order from Catalogue)",
+            "  - Config             (day length, event chance, win target)",
             "",
-            "Fleet and orders are exported for reference. On import, only",
-            "safe levers are applied; money is never edited directly, and",
-            "crew is only hired within the available budget.",
+            "Catalogue and Procurement Orders are read-only reference. On",
+            "import only safe levers apply: money is never edited directly,",
+            "and crew/vehicles are only bought within the available budget.",
+            "A summary of each import is written to the Summary sheet.",
         ]
         for ln in lines:
             self._text(screen, "small", ln, self.c["muted"] if ln.strip() else self.c["dim"],
                        x, ty)
-            ty += 20
+            ty += 19
 
     # ----------------------------------------------------- planner: callbacks
     def _cycle_round_freq(self, area_id):

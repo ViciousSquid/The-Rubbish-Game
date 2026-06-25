@@ -27,9 +27,14 @@ class Economy:
 
     def __init__(self):
         self.budget = 500000
-        self.council_tax_rate = 1.50     # GBP / resident / day
-        self.business_rates = 4.50       # GBP / premises / day
-        self.hourly_wage_rate = 14.50    # GBP / crew / hour
+        # Revenue levers represent the WASTE SERVICE's slice of each tax, per day.
+        # A UK household's waste service costs roughly £60-£90/yr, funded from
+        # council tax; trade waste is charged per commercial premises.
+        self.council_tax_rate = 0.45     # GBP / resident / day (waste portion)
+        self.business_rates = 2.20       # GBP / premises / day (trade waste)
+        # Blended crew cost to the council: Class-2 refuse drivers ~£15-17/hr and
+        # loaders ~£12.50-13.50/hr, plus ~25-30% employer on-costs (NI, pension).
+        self.hourly_wage_rate = 16.50    # GBP / crew / hour (employer cost)
         self.truck_maintenance = 45.00   # legacy reference (vehicles carry own cost)
 
         self.day = 1
@@ -52,6 +57,10 @@ class Economy:
         self.active_event = None
         self.pending_event = None
         self._bin_rate_multiplier = 1
+
+        # Editable difficulty levers (exposed via the Config sheet in xmlio).
+        self.event_chance = 0.30           # chance of a new event each day (0-1)
+        self.win_streak_target = 7         # clean days in a row needed to win
 
         # Win condition tracking
         self.perfect_days_streak = 0       # consecutive days with 0 complaints
@@ -196,7 +205,7 @@ class Economy:
             if self.active_event["remaining_days"] <= 0:
                 self.active_event = None
 
-        if not self.active_event and random.random() < 0.30:
+        if not self.active_event and random.random() < self.event_chance:
             template = random.choice(self.events)
             self.active_event = {**template, "remaining_days": template["duration"]}
             if template["effect"] == "money":
@@ -224,7 +233,7 @@ class Economy:
         else:
             self.perfect_days_streak = 0
 
-        if self.perfect_days_streak >= 7 and not self.has_won:
+        if self.perfect_days_streak >= self.win_streak_target and not self.has_won:
             self.has_won = True
             self.win_day = self.day
             self.win_celebration_timer = 10.0
@@ -257,4 +266,5 @@ class Economy:
 
     def win_progress(self):
         """Returns progress toward win condition (0.0 to 1.0)."""
-        return min(1.0, self.perfect_days_streak / 7.0)
+        target = max(1, getattr(self, "win_streak_target", 7))
+        return min(1.0, self.perfect_days_streak / float(target))
