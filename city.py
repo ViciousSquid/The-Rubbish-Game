@@ -14,11 +14,13 @@ DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 # British-sounding ward names
 AREA_NAMES = [
-    "Northgate", "Elmwood", "Riverside", "St Catherine's",
-    "Oakfield", "Hillcrest", "Kingsbury", "Castell",
+    "Northgate", "Elmwood", "Gloomby", "St Catherine's",
+    "Lower-Damp", "Chutney-on-the-Hill", "Kingsbury", "Castell",
     "Uffolk", "Old Town", "Llanfair", "Brookside",
-    "Cathedral", "Saltmarsh", "Maple Park", "Westbrook",
+    "Monks-Piddling", "Saltmarsh", "Maple Park", "Westbrook",
+    "Hampton", "Broughton-in-the-Mud",
     "Green Park", "Parkside", "Greenfield", "Meadow Park",
+    "Sodden-under-Edge", "Bilehurst", "Dampford", "Upper Furlong",
     "Oak Park", "Spring Green", "Ystrad", "Green Hill",
 ]
 
