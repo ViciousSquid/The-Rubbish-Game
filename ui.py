@@ -780,152 +780,249 @@ class UIManager:
         fleet = self.game.fleet
 
         self._text(screen, "small",
-                   "Order refuse collection vehicles. They arrive after a lead "
-                   "time. Buy outright, or lease for a smaller deposit + weekly fee.",
+                   "Choose a procurement method, then select a vehicle model and place your order.",
                    self.c["muted"], x, y)
-        ty = y + 24
+        ty = y + 20
 
+        # --- PROCUREMENT TIER SELECTION ---
+        tier_w = (w - 24) // 3
+        tier_h = 56
+        tier_data = [
+            ("factory", "Factory Custom", "180-220 days", "-35% price", (100, 180, 120),
+             "Bespoke build. Cheapest but plan 6+ months ahead."),
+            ("dealer", "Dealer Stock", "14-18 days", "+15% premium", (120, 160, 220),
+             "Pre-built. MOT, O-License & delivery. Watch for delays."),
+            ("rental", "Spot Rental", "1-2 days", "4.5x daily cost", (220, 140, 100),
+             "Emergency hire. Arrives fast, burns budget fast."),
+        ]
+
+        # Store selected tier on the game object if not present
+        if not hasattr(self.game, '_selected_procurement_tier'):
+            self.game._selected_procurement_tier = "dealer"
+        selected_tier = self.game._selected_procurement_tier
+
+        for i, (tid, tname, ttime, tprice, tcolour, tblurb) in enumerate(tier_data):
+            tx = x + 8 + i * (tier_w + 8)
+            rect = pygame.Rect(tx, ty, tier_w, tier_h)
+            is_sel = selected_tier == tid
+
+            # Background
+            bg = tuple(min(255, c + 30) for c in tcolour) if is_sel else self.c["panel_lo"]
+            pygame.draw.rect(screen, bg, rect, border_radius=3)
+            border_col = tcolour if is_sel else self.c["border_lo"]
+            pygame.draw.rect(screen, border_col, rect, 2 if is_sel else 1, border_radius=3)
+
+            # Title
+            name_col = self.c["white"] if is_sel else self.c["text"]
+            self._text(screen, "body_b", tname, name_col, tx + 8, ty + 6)
+            self._text(screen, "tiny", ttime, self.c["muted"], tx + 8, ty + 24)
+            self._text(screen, "tiny", tprice, tcolour, tx + 8, ty + 38)
+
+            # Clickable
+            self.planner_widgets.append((rect, (lambda t=tid: setattr(self.game, '_selected_procurement_tier', t))))
+
+        ty += tier_h + 10
+
+        # --- TIER DETAIL BLURB ---
+        tier_blurbs = {
+            "factory": (
+                "Factory Custom Order: Order a bespoke RCV direct from the manufacturer. "
+                "You choose the exact capacity, fuel type, and crew configuration. "
+                "Cheapest upfront cost (-35%), but you will wait 180-220 days before it hits the road. "
+                "Best for long-term fleet expansion when you can see demand coming."
+            ),
+            "dealer": (
+                "Dealer Stock Purchase: Buy a pre-built chassis and compactor body from an authorised dealer. "
+                "The 2-week wait covers UK MOT safety plating, operator licensing (O-License), "
+                "vehicle registration, and delivery logistics. Premium price (+15%) for near-immediate delivery. "
+                "WARNING: Bureaucracy Bottleneck (O-License delay +5 days) or PDI Flaw (hydraulic fault +3 days) "
+                "can occur during the waiting period."
+            ),
+            "rental": (
+                "Spot Rental: Emergency spot-hire to cover a sudden breakdown or demand spike. "
+                "Vehicle arrives in 1-2 days, but the daily operating cost is 4.5 times normal. "
+                "This will devour your budget if kept on the books for more than a few days. "
+                "Use sparingly -- rent only while a factory or dealer order is in transit."
+            ),
+        }
+        blurb = tier_blurbs.get(selected_tier, "")
+        self._draw_wrapped_text(screen, blurb, x + 8, ty, w - 16, self.fonts["tiny"], self.c["muted"])
+        ty += 50
+
+        # --- VEHICLE CATALOGUE ---
         col_w = (w - 12) // 2
         col2_x = x + col_w + 12
         cat_y = ty
+
         for idx, v in enumerate(VEHICLE_CATALOGUE):
             cx = x if idx % 2 == 0 else col2_x
             if idx % 2 == 0:
                 row_y = cat_y
-            card = pygame.Rect(cx, row_y, col_w, 96)
+
+            # Get tier-adjusted price
+            from procurement import get_tier
+            tier = get_tier(selected_tier)
+            adj_price = v.get_price_for_tier(selected_tier) if hasattr(v, 'get_price_for_tier') else v.price
+            adj_run = v.get_running_cost_for_tier(selected_tier) if hasattr(v, 'get_running_cost_for_tier') else v.running_cost
+            lead = tier.random_lead_time() if tier else v.lead_time
+
+            card = pygame.Rect(cx, row_y, col_w, 110)
             self._panel(screen, card.x, card.y, card.w, card.h, fill=self.c["panel_lo"])
             self._text(screen, "body_b", v.name, self.c["text"], cx + 10, row_y + 8)
             self._text(screen, "tiny",
-                       f"cap {v.capacity:,}  crew {v.crew_cap}  spd x{v.speed_factor:.2f}"
-                       f"  lead {v.lead_time}d",
+                       f"cap {v.capacity:,}  crew {v.crew_cap}  spd x{v.speed_factor:.2f}",
                        self.c["muted"], cx + 10, row_y + 28)
-            self._text(screen, "tiny", f"run GBP{v.running_cost}/day",
+            self._text(screen, "tiny", f"run GBP{adj_run}/day  |  lead {lead}d",
                        self.c["dim"], cx + 10, row_y + 44)
-            # buy / lease buttons
-            buy = pygame.Rect(cx + 10, row_y + 62, (col_w - 30) // 2, 26)
-            lease = pygame.Rect(buy.right + 10, row_y + 62, (col_w - 30) // 2, 26)
-            can_buy = eco.budget >= v.price
-            can_lease = eco.budget >= v.deposit()
-            self._pbtn(screen, buy, f"Buy GBP{v.price//1000}k",
-                       (lambda vid=v.id: self._buy_vehicle(vid, False)),
-                       enabled=can_buy, fkey="small")
-            self._pbtn(screen, lease, f"Lease GBP{v.deposit()//1000 or 1}k",
-                       (lambda vid=v.id: self._buy_vehicle(vid, True)),
-                       enabled=can_lease, fkey="small")
+
+            # Price display varies by tier
+            if selected_tier == "rental":
+                price_label = f"Rent GBP{adj_price//1000 or 1}k deposit"
+                can_afford = eco.budget >= adj_price
+                btn = pygame.Rect(cx + 10, row_y + 64, col_w - 20, 28)
+                self._pbtn(screen, btn, price_label,
+                           (lambda vid=v.id: self._buy_vehicle(vid, selected_tier, False)),
+                           enabled=can_afford, fkey="small", accent=True)
+            else:
+                # Buy / Lease buttons
+                buy = pygame.Rect(cx + 10, row_y + 64, (col_w - 30) // 2, 28)
+                lease = pygame.Rect(buy.right + 10, row_y + 64, (col_w - 30) // 2, 28)
+                can_buy = eco.budget >= adj_price
+                can_lease = eco.budget >= v.deposit()
+                self._pbtn(screen, buy, f"Buy GBP{adj_price//1000}k",
+                           (lambda vid=v.id: self._buy_vehicle(vid, selected_tier, False)),
+                           enabled=can_buy, fkey="small")
+                self._pbtn(screen, lease, f"Lease GBP{v.deposit()//1000 or 1}k",
+                           (lambda vid=v.id: self._buy_vehicle(vid, selected_tier, True)),
+                           enabled=can_lease, fkey="small")
+
             if idx % 2 == 1:
-                cat_y += 104
+                cat_y += 118
 
         if len(VEHICLE_CATALOGUE) % 2 == 1:
-            cat_y += 104
+            cat_y += 118
         ty = cat_y + 4
         pygame.draw.line(screen, self.c["border_lo"], (x, ty), (x + w, ty), 1)
         ty += 10
 
-        # current fleet + crew + orders (two columns)
+        # --- CURRENT FLEET + ORDERS ---
         owned = len(fleet.trucks)
         leased_n = sum(1 for t in fleet.trucks if t.get("leased"))
+        rental_n = sum(1 for t in fleet.trucks if t.get("tier_id") == "rental")
         self._text(screen, "body_b", "Current fleet", self.c["text"], x, ty)
-        self._text(screen, "small",
-                   f"{owned} lorries ({leased_n} leased)  |  {fleet.workers} crew"
-                   f"  |  running GBP{int(fleet.daily_vehicle_cost())}/day",
-                   self.c["muted"], x, ty + 20)
+        fleet_info = f"{owned} lorries"
+        if leased_n:
+            fleet_info += f" ({leased_n} leased)"
+        if rental_n:
+            fleet_info += f"  [Rental: {rental_n}]"
+        fleet_info += f"  |  {fleet.workers} crew  |  running GBP{int(fleet.daily_vehicle_cost())}/day"
+        self._text(screen, "small", fleet_info, self.c["muted"], x, ty + 20)
 
-        # crew hire/fire
-        hire = pygame.Rect(x, ty + 42, 120, 26)
-        fire = pygame.Rect(hire.right + 10, ty + 42, 120, 26)
+        # Crew hire/fire
+        hire = pygame.Rect(x, ty + 46, 120, 26)
+        fire = pygame.Rect(hire.right + 10, ty + 46, 120, 26)
         self._pbtn(screen, hire, "Hire crew GBP2.5k",
                    self._hire, enabled=eco.budget >= 2500, fkey="small")
         self._pbtn(screen, fire, "Release crew",
                    self._fire, enabled=fleet.workers > 0, fkey="small")
 
-        # orders column (right)
-        ox = x + w - 280
+        # --- PENDING ORDERS (right column) ---
+        ox = x + w - 300
         self._text(screen, "body_b", "On order", self.c["text"], ox, ty)
         oy = ty + 20
         if not fleet.orders:
             self._text(screen, "small", "Nothing on order.", self.c["dim"], ox, oy)
         else:
-            for o in fleet.orders[:4]:
+            for o in fleet.orders[:5]:
                 rem = o.days_remaining(eco.day)
-                tag = "lease" if o.leased else "buy"
-                self._text(screen, "small",
-                           f"{o.vehicle.name} ({tag}) - {rem}d",
-                           self.c["muted"], ox, oy)
-                oy += 18
-
-    # ----------------------------------------------------------- planner: FINANCE
-    def _tab_finance(self, screen, x, y, w, h):
-        eco = self.game.economy
-        snap = eco.ledger_snapshot()
-
-        self._text(screen, "small",
-                   "Yesterday's profit & loss. Adjust the council tax lever to "
-                   "balance the books against public satisfaction.",
-                   self.c["muted"], x, y)
-        ty = y + 24
-
-        # ledger table (left)
-        lx = x
-        rx = x + 300
-        for key, label in eco.LEDGER_LABELS:
-            val = snap.get(key, 0.0)
-            is_rev = key in eco.REVENUE_KEYS
-            self._text(screen, "body", label, self.c["muted"], lx, ty)
-            sign = "+" if is_rev else "-"
-            self._text_right(screen, "mono", f"{sign}GBP{abs(val):,.0f}",
-                             self.c["text"], rx, ty)
-            ty += 20
-        pygame.draw.line(screen, self.c["border_lo"], (lx, ty + 2), (rx, ty + 2), 1)
-        ty += 8
-        net = snap.get("net", 0.0)
-        self._text(screen, "body_b", "Net / day", self.c["text"], lx, ty)
-        self._text_right(screen, "mono_b",
-                         f"{'+' if net >= 0 else '-'}GBP{abs(net):,.0f}",
-                         self.c["white"], rx, ty)
-        ty += 28
-
-        # council tax lever
-        ty2 = self._stepper(
-            screen, lx, ty, "Council tax (GBP/resident/day)",
-            f"{eco.council_tax_rate:.2f}",
-            (lambda: self._adjust_tax(-0.10)),
-            (lambda: self._adjust_tax(0.10)),
-            label_w=220)
-        self._text(screen, "tiny",
-                   "Higher tax raises revenue but dents satisfaction over time.",
-                   self.c["dim"], lx, ty2)
-
-        # 14-day net trend (right column)
-        gx = x + 360
-        gw = w - 360
-        self._text(screen, "body_b", "Net trend (last 14 days)", self.c["text"], gx, y + 24)
-        hist = eco.history[-14:]
-        if hist:
-            nets = [eco._ledger_net(d) for d in hist]
-            peak = max(1.0, max(abs(n) for n in nets))
-            base_y = y + 150
-            bw = max(6, (gw - (len(nets) - 1) * 4) // max(1, len(nets)))
-            bxx = gx
-            for n in nets:
-                bh_px = int((abs(n) / peak) * 56)
-                if n >= 0:
-                    rect = pygame.Rect(bxx, base_y - bh_px, bw, bh_px)
-                    pygame.draw.rect(screen, self.c["white"], rect)
+                tier_name = getattr(o, 'display_tier_name', 'Buy') if hasattr(o, 'display_tier_name') else 'Buy'
+                tag = f"{tier_name}"
+                if o.leased:
+                    tag += " lease"
+                line = f"{o.vehicle.name} ({tag}) - {rem}d"
+                # Check for pending procurement events
+                if hasattr(o, 'event_name') and o.event_name and not o.event_triggered:
+                    line += f"  !{o.event_name}"
+                    col = self.c["white"]
+                elif hasattr(o, 'event_triggered') and o.event_triggered:
+                    line += "  (delayed)"
+                    col = self.c["muted"]
                 else:
-                    rect = pygame.Rect(bxx, base_y, bw, bh_px)
-                    pygame.draw.rect(screen, self.c["dim"], rect)
-                bxx += bw + 4
-            pygame.draw.line(screen, self.c["border_lo"],
-                             (gx, base_y), (gx + gw - 20, base_y), 1)
-            self._text(screen, "tiny", "zero", self.c["dim"], gx, base_y + 4)
-        else:
-            self._text(screen, "small", "Trend builds after a few days.",
-                       self.c["dim"], gx, y + 50)
+                    col = self.c["muted"]
+                self._text(screen, "small", line, col, ox, oy)
+                oy += 18
+    def _tab_finance(self, screen, x, y, w, h):
+            eco = self.game.economy
+            snap = eco.ledger_snapshot()
 
-        self._text(screen, "body", "Budget", self.c["muted"], gx, y + 180)
-        self._text(screen, "big", f"GBP {int(eco.budget):,}", self.c["white"], gx, y + 196)
+            self._text(screen, "small",
+                       "Yesterday's profit & loss. Adjust the council tax lever to "
+                       "balance the books against public satisfaction.",
+                       self.c["muted"], x, y)
+            ty = y + 24
 
-    # ----------------------------------------------------------- planner: DATA
+            # ledger table (left)
+            lx = x
+            rx = x + 300
+            for key, label in eco.LEDGER_LABELS:
+                val = snap.get(key, 0.0)
+                is_rev = key in eco.REVENUE_KEYS
+                self._text(screen, "body", label, self.c["muted"], lx, ty)
+                sign = "+" if is_rev else "-"
+                self._text_right(screen, "mono", f"{sign}GBP{abs(val):,.0f}",
+                                 self.c["text"], rx, ty)
+                ty += 20
+            pygame.draw.line(screen, self.c["border_lo"], (lx, ty + 2), (rx, ty + 2), 1)
+            ty += 8
+            net = snap.get("net", 0.0)
+            self._text(screen, "body_b", "Net / day", self.c["text"], lx, ty)
+            self._text_right(screen, "mono_b",
+                             f"{'+' if net >= 0 else '-'}GBP{abs(net):,.0f}",
+                             self.c["white"], rx, ty)
+            ty += 28
+
+            # council tax lever
+            ty2 = self._stepper(
+                screen, lx, ty, "Council tax (GBP/resident/day)",
+                f"{eco.council_tax_rate:.2f}",
+                (lambda: self._adjust_tax(-0.10)),
+                (lambda: self._adjust_tax(0.10)),
+                label_w=220)
+            self._text(screen, "tiny",
+                       "Higher tax raises revenue but dents satisfaction over time.",
+                       self.c["dim"], lx, ty2)
+
+            # 14-day net trend (right column)
+            gx = x + 360
+            gw = w - 360
+            self._text(screen, "body_b", "Net trend (last 14 days)", self.c["text"], gx, y + 24)
+            hist = eco.history[-14:]
+            if hist:
+                nets = [eco._ledger_net(d) for d in hist]
+                peak = max(1.0, max(abs(n) for n in nets))
+                base_y = y + 150
+                bw = max(6, (gw - (len(nets) - 1) * 4) // max(1, len(nets)))
+                bxx = gx
+                for n in nets:
+                    bh_px = int((abs(n) / peak) * 56)
+                    if n >= 0:
+                        rect = pygame.Rect(bxx, base_y - bh_px, bw, bh_px)
+                        pygame.draw.rect(screen, self.c["white"], rect)
+                    else:
+                        rect = pygame.Rect(bxx, base_y, bw, bh_px)
+                        pygame.draw.rect(screen, self.c["dim"], rect)
+                    bxx += bw + 4
+                pygame.draw.line(screen, self.c["border_lo"],
+                                 (gx, base_y), (gx + gw - 20, base_y), 1)
+                self._text(screen, "tiny", "zero", self.c["dim"], gx, base_y + 4)
+            else:
+                self._text(screen, "small", "Trend builds after a few days.",
+                           self.c["dim"], gx, y + 50)
+
+            self._text(screen, "body", "Budget", self.c["muted"], gx, y + 180)
+            self._text(screen, "big", f"GBP {int(eco.budget):,}", self.c["white"], gx, y + 196)
+
+        # ----------------------------------------------------------- planner: DATA
     def _tab_data(self, screen, x, y, w, h):
         self._text(screen, "small",
                    "Export the borough plan to a spreadsheet (.ods or .xml) you can open "
@@ -973,9 +1070,9 @@ class UIManager:
     def _cycle_stream_freq(self, sid):
         self.game.waste.cycle_frequency(sid)
 
-    def _buy_vehicle(self, model_id, lease):
+    def _buy_vehicle(self, model_id, tier_id, lease):
         eco = self.game.economy
-        ok, cost, msg = self.game.fleet.order_vehicle(model_id, lease)
+        ok, cost, msg = self.game.fleet.order_vehicle(model_id, tier_id=tier_id, leased=lease)
         if not ok:
             self.game.set_toast(msg)
             return
@@ -1014,14 +1111,36 @@ class UIManager:
         self.game.set_toast(msg)
 
     # ----------------------------------------------------------------- update
+    
+    def _draw_wrapped_text(self, screen, text, x, y, max_width, font, colour):
+        """Simple word-wrap for multi-line descriptions."""
+        words = text.split(" ")
+        lines = []
+        current = ""
+        for word in words:
+            test = current + " " + word if current else word
+            if font.size(test)[0] <= max_width:
+                current = test
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+
+        for line in lines:
+            surf = font.render(line, True, colour)
+            screen.blit(surf, (x, y))
+            y += font.get_height() + 2
+
     def update(self, dt):
-        if self._event_visible:
-            self._event_timer_active += dt
-            if self._event_timer_active >= self._event_duration:
-                self._event_visible = False
-                self._event_timer_active = 0
-        if self._insufficient_funds_flash:
-            self._flash_timer += dt
-            if self._flash_timer >= self._flash_duration:
-                self._insufficient_funds_flash = False
-                self._flash_timer = 0
+            if self._event_visible:
+                self._event_timer_active += dt
+                if self._event_timer_active >= self._event_duration:
+                    self._event_visible = False
+                    self._event_timer_active = 0
+            if self._insufficient_funds_flash:
+                self._flash_timer += dt
+                if self._flash_timer >= self._flash_duration:
+                    self._insufficient_funds_flash = False
+                    self._flash_timer = 0

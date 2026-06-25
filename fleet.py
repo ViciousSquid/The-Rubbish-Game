@@ -1,7 +1,7 @@
 import math
 from collections import deque
 
-from procurement import get_vehicle, Order
+from procurement import get_vehicle, Order, get_tier
 
 # --- Tuning -----------------------------------------------------------------
 SERVICE_FILL_THRESHOLD = 20      # default "worth emptying" %% (now a fleet lever)
@@ -41,6 +41,9 @@ class FleetManager:
         self.orders = []             # vehicles on order awaiting delivery
         self._pending_volume = 0.0   # fill units tipped since economy last read
 
+        # Rental tracking for budget impact
+        self.rental_daily_cost = 0.0  # accumulated rental costs per day
+
     # ------------------------------------------------------------ initial fleet
     def setup_initial_fleet(self, lorries=3, crew=6):
         """Give the council a starting fleet for free (no budget hit)."""
@@ -66,10 +69,17 @@ class FleetManager:
         return (x, y) in self._road_tiles
 
     # -------------------------------------------------------------- purchasing
-    def purchase_truck(self, model_id=DEFAULT_MODEL, leased=False):
+    def purchase_truck(self, model_id=DEFAULT_MODEL, leased=False, tier_id="dealer"):
         """Spawn a lorry at the depot built from a catalogue model."""
         model = get_vehicle(model_id) or get_vehicle(DEFAULT_MODEL)
-        self.trucks.append({
+        tier = get_tier(tier_id)
+
+        # Apply tier-specific cost adjustments
+        running_cost = model.running_cost
+        if tier:
+            running_cost = model.get_running_cost_for_tier(tier_id)
+
+        truck = {
             "id": len(self.trucks) + 1,
             "x": float(self.depot_x),
             "y": float(self.depot_y),
@@ -78,9 +88,10 @@ class FleetManager:
             "capacity": float(model.capacity),
             "crew_cap": model.crew_cap,
             "speed_factor": model.speed_factor,
-            "running_cost": model.running_cost,
+            "running_cost": running_cost,
             "lease_weekly": model.lease_weekly,
             "leased": leased,
+            "tier_id": tier_id,
             "load": 0.0,
             "crew": 0,
             "state": "depot",          # depot | to_stop | servicing | to_depot
@@ -94,8 +105,9 @@ class FleetManager:
             "service_need": 0.0,
             "service_bins": [],
             "facing": 1,
-        })
-        return self.trucks[-1]
+        }
+        self.trucks.append(truck)
+        return truck
 
     def scrap_truck(self, truck_id):
         """Remove a lorry from the fleet (release any held bins first)."""
@@ -108,28 +120,59 @@ class FleetManager:
         return False
 
     # ------------------------------------------------------------ procurement
-    def order_vehicle(self, model_id, leased=False):
-        """Place an order. Returns (ok, cost, message). Does NOT charge budget;
-        the caller (UI) handles affordability and deducts the up-front cost."""
+    def order_vehicle(self, model_id, tier_id="dealer", leased=False):
+        """Place an order through a procurement tier. Returns (ok, cost, message).
+        Does NOT charge budget; the caller (UI) handles affordability."""
         model = get_vehicle(model_id)
         if not model:
             return False, 0, "Unknown vehicle"
-        cost = model.deposit() if leased else model.price
-        order = Order(model, self.game.economy.day, leased)
+
+        tier = get_tier(tier_id)
+        if not tier:
+            return False, 0, "Unknown procurement tier"
+
+        # Calculate cost based on tier
+        if leased:
+            cost = model.deposit()
+        else:
+            cost = model.get_price_for_tier(tier_id)
+
+        order = Order(model, self.game.economy.day, tier_id, leased=leased)
         self.orders.append(order)
-        tenure = "lease" if leased else "purchase"
-        return True, cost, (f"{model.name} on {tenure}, arriving day "
-                            f"{order.arrival_day}")
+
+        tier_name = tier.display_name
+        arrival = order.arrival_day
+        msg = f"{model.name} ordered via {tier_name}, arriving day {arrival}"
+
+        if order.event_name:
+            msg += f" (\u26a0 {order.event_name}: +{order.event_delay_days} days)"
+
+        if tier_id == "rental":
+            msg += f" — Emergency rental at £{order.adjusted_running_cost}/day!"
+
+        return True, cost, msg
 
     def process_deliveries(self, day):
         """Called on each new day -- spawn any vehicles that have arrived."""
         delivered = []
+        events_triggered = []
+
         for o in list(self.orders):
+            # Check for procurement events triggering during the wait
+            if o.tier_id == "dealer" and o.pending_event and not o.event_triggered:
+                event = o.trigger_event_if_due(day)
+                if event:
+                    events_triggered.append(event)
+
             if day >= o.arrival_day:
-                self.purchase_truck(o.vehicle.id, leased=o.leased)
+                truck = self.purchase_truck(o.vehicle.id, leased=o.leased, tier_id=o.tier_id)
+                # Apply rental-specific running cost
+                if o.is_rental:
+                    truck["running_cost"] = o.adjusted_running_cost
                 self.orders.remove(o)
                 delivered.append(o.vehicle.name)
-        return delivered
+
+        return delivered, events_triggered
 
     def daily_vehicle_cost(self):
         """Per-day running + lease cost across the fleet (for the ledger)."""
@@ -140,6 +183,22 @@ class FleetManager:
             else:
                 total += t["running_cost"]
         return total
+
+    def get_rental_costs(self):
+        """Return total daily rental costs for active rental trucks."""
+        total = 0.0
+        for t in self.trucks:
+            if t.get("tier_id") == "rental":
+                total += t.get("running_cost", 0)
+        return total
+
+    def get_pending_orders_summary(self):
+        """Return a list of human-readable order status strings."""
+        today = self.game.economy.day
+        summaries = []
+        for o in self.orders:
+            summaries.append(o.get_status_text(today))
+        return summaries
 
     def take_pending_volume(self):
         v = self._pending_volume

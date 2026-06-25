@@ -13,7 +13,7 @@ class Economy:
     # ----- profit & loss ledger schema ------------------------------------
     REVENUE_KEYS = {"council_tax", "business_rates", "recycling_credit",
                     "garden_charges", "grants"}
-    EXPENSE_KEYS = {"wages", "vehicles", "gate_fees"}
+    EXPENSE_KEYS = {"wages", "vehicles", "gate_fees", "rental_costs"}
     LEDGER_LABELS = [
         ("council_tax",     "Council tax receipts"),
         ("business_rates",  "Business rates"),
@@ -22,6 +22,7 @@ class Economy:
         ("grants",          "Grants & one-offs"),
         ("wages",           "Crew wages"),
         ("vehicles",        "Vehicle running / lease"),
+        ("rental_costs",    "Emergency vehicle rentals"),
         ("gate_fees",       "Disposal gate fees"),
     ]
 
@@ -67,6 +68,9 @@ class Economy:
         self.has_won = False
         self.win_day = None
         self.win_celebration_timer = 0.0
+
+        # Procurement event notifications
+        self.procurement_events = []       # List of (day, message) tuples
 
         self.events = [
             {"id": "bank_holiday", "name": "Bank Holiday",
@@ -165,6 +169,10 @@ class Economy:
         self.ledger["wages"] += wages * frac
         self.ledger["vehicles"] += vehicles * frac
 
+        # --- rental costs (emergency spot hires) -----------------------------
+        rental_costs = fleet.get_rental_costs()
+        self.ledger["rental_costs"] += rental_costs * frac
+
         # --- disposal economics (driven by actual volume tipped) -----------
         volume = fleet.take_pending_volume()
         if volume > 0:
@@ -174,7 +182,7 @@ class Economy:
             self.ledger["garden_charges"] += garden
 
         revenue = (council + business) * frac + 0.0
-        expenses = (wages + vehicles) * frac
+        expenses = (wages + vehicles + rental_costs) * frac
         self.daily_revenue += revenue
         self.daily_expenses += expenses
         self.budget += (revenue - expenses)
