@@ -13,6 +13,14 @@ MORALE_DEFAULT   = 16.50   # Starting wage → starting morale ≈ 77 %
 # a day that elapsed, so the live ledger always sums to the per-day totals.
 HOURS_PER_DAY = 8.0          # paid hours per crew member per day
 
+# ── Insolvency / fail condition ──────────────────────────────────────────────
+# A real council can't just sit at £0 — sustained insolvency forces a Section
+# 114 notice (effectively "we are bankrupt"). We model two ways to fail:
+#   1. Stay at/below £0 for INSOLVENCY_GRACE_DAYS consecutive days, or
+#   2. Blow straight through the hard overdraft floor in one go.
+OVERDRAFT_FLOOR       = -150000   # absolute hard floor; reaching it = instant bust
+INSOLVENCY_GRACE_DAYS = 5         # consecutive days at/below £0 before a Section 114
+
 
 class Economy:
     # ----- profit & loss ledger schema ------------------------------------
@@ -85,6 +93,13 @@ class Economy:
         self.has_won = False
         self.win_day = None
         self.win_celebration_timer = 0.0
+
+        # Lose condition (Section 114 / insolvency) — mirrors the win block.
+        self.has_lost = False
+        self.lost_day = None
+        self.lost_reason = ""
+        self.insolvent_days = 0          # consecutive days spent at/below £0
+        self.game_over_timer = 0.0       # counts up for the overlay fade-in
 
         # Procurement notifications
         self.procurement_events = []
@@ -260,8 +275,13 @@ class Economy:
         self.budget += (revenue - expenses)
         if volume > 0:
             self.budget += (recycle + garden - gate)
-        if self.budget < 0:
-            self.budget = 0
+        # The budget is allowed to dip into the red (emergency borrowing), but a
+        # hard overdraft floor exists. Reaching it is instant insolvency.
+        if self.budget <= OVERDRAFT_FLOOR:
+            self.budget = OVERDRAFT_FLOOR
+            self._trigger_bankruptcy(
+                "Overdraft limit breached — the bank has called in the "
+                "borough's debts.")
         return new_day
 
     def _on_new_day(self, city=None, fleet=None):
@@ -279,6 +299,18 @@ class Economy:
         self.complaints_today = 0
         self.day        += 1
         self.week_index  = (self.day - 1) // 7
+
+        # ---- insolvency watch (Section 114 fail condition) -------------------
+        # Count consecutive days finishing at/below £0. Sustained insolvency
+        # forces a Section 114 notice once the grace period is exhausted.
+        if self.budget <= 0:
+            self.insolvent_days += 1
+            if self.insolvent_days >= INSOLVENCY_GRACE_DAYS:
+                self._trigger_bankruptcy(
+                    f"Insolvent for {self.insolvent_days} consecutive days — "
+                    "the borough has issued a Section 114 notice.")
+        else:
+            self.insolvent_days = 0
 
         # ---- age / expire the active event -----------------------------------
         if self.active_event:
@@ -329,21 +361,22 @@ class Economy:
                         evt["desc"] = (f"{bd_name} has broken down and will be out of "
                                        f"action for {days} day{'s' if days != 1 else ''}.")
                 elif effect == "money":
-                    self.budget = max(0, self.budget + template["value"])
-                    self.ledger["grants"] += max(0, template["value"])
+                    self.budget += template["value"]
+                    if template["value"] > 0:
+                        self.ledger["grants"] += template["value"]
                 elif effect == "crewStrike" and fleet:
                     fleet.on_strike = True
                 elif effect == "councilInspection":
                     if self.satisfaction >= 70:
                         bonus = 22000
-                        self.budget = max(0, self.budget + bonus)
+                        self.budget += bonus
                         self.ledger["grants"] += bonus
                         evt["desc"] = (f"Inspection passed! Performance rated "
                                        f"\"{self.satisfaction_label()}\". "
                                        f"GBP {bonus:,} bonus grant awarded.")
                     else:
                         fine = 18000
-                        self.budget = max(0, self.budget - fine)
+                        self.budget -= fine
                         evt["desc"] = (f"Inspection failed! Service rated "
                                        f"\"{self.satisfaction_label()}\". "
                                        f"GBP {fine:,} penalty issued.")
@@ -554,7 +587,13 @@ class Economy:
                     continue
                 if tile.bin_fill >= 100:
                     tile.days_overflowing += 1
-                    if tile.days_overflowing > 1:
+                    # Only raise a complaint after *three* consecutive days of
+                    # overflow (> 2).  This gives a natural 2-day weekend grace
+                    # period: bins that tip over on Saturday are still forgiven
+                    # on Sunday, and trucks can clear them Monday morning.
+                    # Single-event spikes (bank holidays, heatwaves) also survive
+                    # without killing the streak.
+                    if tile.days_overflowing > 2:
                         daily_complaints += 1
                 else:
                     tile.days_overflowing = 0
@@ -575,7 +614,8 @@ class Economy:
         else:
             self.perfect_days_streak = 0
 
-        if self.perfect_days_streak >= self.win_streak_target and not self.has_won:
+        if self.perfect_days_streak >= self.win_streak_target and not self.has_won \
+                and not self.has_lost:
             self.has_won      = True
             self.win_day      = self.day
             self.win_celebration_timer = 10.0
@@ -674,3 +714,24 @@ class Economy:
     def win_progress(self):
         target = max(1, getattr(self, "win_streak_target", 7))
         return min(1.0, self.perfect_days_streak / float(target))
+
+    # ----- fail condition --------------------------------------------------
+    def _trigger_bankruptcy(self, reason):
+        """Flag the borough as insolvent. Idempotent — the first reason wins."""
+        if self.has_lost:
+            return
+        self.has_lost = True
+        self.lost_day = self.day
+        self.lost_reason = reason
+        self.game_over_timer = 0.0
+
+    def is_insolvent(self):
+        """True while the budget is in the red (warning state, not yet a fail)."""
+        return self.budget <= 0
+
+    def days_until_insolvency_fail(self):
+        """Days of grace left before a sustained-insolvency Section 114. Returns
+        None when solvent."""
+        if self.budget > 0:
+            return None
+        return max(0, INSOLVENCY_GRACE_DAYS - self.insolvent_days)

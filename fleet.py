@@ -48,7 +48,7 @@ class FleetManager:
         self.on_strike = False       # True while a crew strike event is active
 
     # ------------------------------------------------------------ initial fleet
-    def setup_initial_fleet(self, lorries=3, crew=6):
+    def setup_initial_fleet(self, lorries=4, crew=16):
         """Give the council a starting fleet for free (no budget hit)."""
         for _ in range(lorries):
             self.purchase_truck(DEFAULT_MODEL)

@@ -334,6 +334,12 @@ class UIManager:
         # Truck rename state
         self._renaming_truck_id = None
         self._rename_buffer = ""
+        # Developer options toggle (Finance tab)
+        self._dev_options_visible = False
+        # Staff tab fleet scroll state
+        self._staff_fleet_scroll = 0
+        self._staff_fleet_max_scroll = 0
+        self._staff_fleet_clip = None
         self._setup_buttons()
 
     def _setup_buttons(self):
@@ -347,6 +353,30 @@ class UIManager:
             {"rect": pygame.Rect(x,            0, inner, 34), "label": "Hire Crew", "cost": 2500, "action": "worker",   "row_offset": 80},
             {"rect": pygame.Rect(x,            0, inner, 34), "label": "MANAGE (TAB)",  "action": "planner",   "row_offset": 118},
         ]
+
+    def handle_scroll(self, button, pos):
+        """Route a mousewheel event into the planner when appropriate.
+        Returns True if the event was consumed (caller should skip camera zoom)."""
+        tab = getattr(self.game, 'planner_tab', '')
+        if tab == 'staff' and self._staff_fleet_clip is not None:
+            delta = -50 if button == 4 else 50
+            self._staff_fleet_scroll = max(
+                0, min(self._staff_fleet_max_scroll,
+                       self._staff_fleet_scroll + delta))
+            return True
+        return False
+
+    def _pbtn_in_clip(self, screen, rect, label, fn, clip_rect,
+                      enabled=True, fkey="body_b", accent=False):
+        """Like _pbtn but only registers the click widget when the rect
+        intersects the visible clip region (prevents ghost clicks on
+        scrolled-off buttons)."""
+        ui = self.ui
+        mouse = pygame.mouse.get_pos()
+        hovered = rect.collidepoint(mouse) and enabled
+        ui.button(rect, label, enabled=enabled, accent=accent, hovered=hovered)
+        if enabled and clip_rect.colliderect(rect):
+            self.planner_widgets.append((rect, fn))
 
     def handle_click(self, pos):
         for btn in self.buttons:
@@ -638,6 +668,11 @@ class UIManager:
         y += 22
         ui.label("Complaints (today)", x, y)
         ui.value(str(eco.complaints_today), right, y, c.TEXT_PRIMARY, align="right")
+        y += 22
+        karen_n = getattr(eco, 'karen_complaints_today', 0)
+        ui.label("Baseline gripes", x, y)
+        ui.value(str(karen_n), right, y,
+                 c.TEXT_DIM if karen_n == 0 else c.STATUS_WARN, align="right")
         y += 26
 
     def _draw_event_banner(self, screen, w):
@@ -1281,60 +1316,81 @@ class UIManager:
         self._pbtn(screen, fire_r, "Release crew", self._fire,
                    enabled=fleet.workers > 0, fkey="body_s")
 
-        # ── RIGHT COLUMN: Vehicle fleet cards ────────────────────────────────
-        ry = y + 26
+        # ── RIGHT COLUMN: Vehicle fleet cards (scrollable) ───────────────────
+        SB_W   = 10          # scrollbar width in pixels
+        list_w = col2_w - SB_W - 4  # card width, narrowed to leave room for bar
+        ry     = y + 26
+
         ui.section_header(col2_x, ry, "VEHICLE FLEET", col2_w)
+        veh_bd = eco.vehicle_cost_breakdown(fleet.trucks)
         ui.text("caption",
                 f"{len(fleet.trucks)} vehicle(s)  |  £{veh_daily:.0f}/day",
                 c.TEXT_MUTED, col2_x + 136, ry + 2)
         ry += 24
 
-        CARD_H = 96
-        veh_bd = eco.vehicle_cost_breakdown(fleet.trucks)
-        shown  = 0
-        for vb in veh_bd:
-            if ry + CARD_H > y + h - 4:
-                remaining = len(veh_bd) - shown
-                ui.text("caption",
-                        f"... and {remaining} more. Scrap to reveal.",
-                        c.TEXT_DIM, col2_x, ry)
-                break
+        CARD_H   = 112
+        CARD_GAP = 6
+        list_top = ry
+        list_bot = y + h - 28      # reserve 28 px for the fleet total line
+        list_h   = max(1, list_bot - list_top)
 
-            is_broken  = vb["broken"]
+        # Clip rect covers the scrollable area (cards only, not header/total)
+        clip_rect = pygame.Rect(col2_x, list_top, list_w + SB_W + 4, list_h)
+        self._staff_fleet_clip = clip_rect
+
+        content_h = len(veh_bd) * (CARD_H + CARD_GAP)
+        self._staff_fleet_max_scroll = max(0, content_h - list_h)
+        # Clamp scroll so shrinking fleet never leaves us past the end
+        self._staff_fleet_scroll = max(
+            0, min(self._staff_fleet_scroll, self._staff_fleet_max_scroll))
+        scroll = self._staff_fleet_scroll
+
+        # ── Draw cards inside clip ───────────────────────────────────────────
+        screen.set_clip(clip_rect)
+        for i, vb in enumerate(veh_bd):
+            card_top = list_top + i * (CARD_H + CARD_GAP) - scroll
+            if card_top + CARD_H <= list_top:
+                continue   # card fully above viewport — skip but keep iterating
+            if card_top >= list_bot:
+                break      # card fully below viewport — nothing more to draw
+
+            is_broken   = vb["broken"]
             is_renaming = (self._renaming_truck_id == vb["id"])
-            ui.card(col2_x, ry, col2_w, CARD_H, selected=is_broken or is_renaming)
+            ui.card(col2_x, card_top, list_w, CARD_H,
+                    selected=is_broken or is_renaming)
 
-            # Left accent stripe: colour = cost type
+            # Left accent stripe: colour by cost type
             type_stripe = {
                 "owned":  c.ACCENT_TEAL,
                 "lease":  c.ACCENT_AMBER,
                 "rental": c.STATUS_BAD,
             }.get(vb["cost_type"], c.TEXT_DIM)
             pygame.draw.rect(screen, type_stripe,
-                             pygame.Rect(col2_x, ry, 4, CARD_H),
+                             pygame.Rect(col2_x, card_top, 4, CARD_H),
                              border_radius=3)
 
             # Truck ID badge
             id_surf = ui.fonts.render("badge", f"#{vb['id']}", c.ACCENT_AMBER)
-            screen.blit(id_surf, (col2_x + 10, ry + 10))
+            screen.blit(id_surf, (col2_x + 10, card_top + 10))
 
             # Nickname (editable) or rename input field
             nickname = vb.get("nickname", f"L{vb['id']}")
             nm_col   = c.STATUS_BAD if is_broken else c.TEXT_PRIMARY
             if is_renaming:
-                inp_r = pygame.Rect(col2_x + 34, ry + 6, col2_w - 120, 22)
+                inp_r = pygame.Rect(col2_x + 34, card_top + 6, list_w - 120, 22)
                 ui.inset_panel(inp_r.x, inp_r.y, inp_r.w, inp_r.h)
                 ui.text("mono_b", self._rename_buffer + "|",
                         c.ACCENT_AMBER, inp_r.x + 6, inp_r.y + 4)
             else:
-                ui.text("body_b", nickname, nm_col, col2_x + 34, ry + 8)
+                ui.text("body_b", nickname, nm_col, col2_x + 34, card_top + 8)
 
             # Model name (muted, below nickname)
-            ui.text("caption", vb["name"], c.TEXT_DIM, col2_x + 34, ry + 26)
+            ui.text("caption", vb["name"], c.TEXT_DIM, col2_x + 34, card_top + 26)
 
             # Daily cost (top-right)
             ui.text("mono_b", f"£{vb['daily']:.0f}/day",
-                    c.TEXT_PRIMARY, col2_x + col2_w - 10, ry + 8, align="right")
+                    c.TEXT_PRIMARY, col2_x + list_w - 10, card_top + 8,
+                    align="right")
 
             # Cost-type + broken badges
             type_text = {"owned": "OWNED", "lease": "LEASED",
@@ -1343,50 +1399,99 @@ class UIManager:
                        "lease":  (c.ACCENT_AMBER, (54, 44, 16)),
                        "rental": (c.STATUS_BAD,   (56, 20, 20))}.get(
                            vb["cost_type"], (c.TEXT_MUTED, c.BG_DEEP))
-            ui.badge(col2_x + 10, ry + 40, type_text, type_tc[0], type_tc[1])
+            ui.badge(col2_x + 10, card_top + 40, type_text, type_tc[0], type_tc[1])
             if is_broken:
-                ui.badge(col2_x + 74, ry + 40, "BROKEN", c.STATUS_BAD, (72, 18, 18))
+                ui.badge(col2_x + 74, card_top + 40,
+                         "BROKEN", c.STATUS_BAD, (72, 18, 18))
 
-            # Crew / capacity
-            ui.text("caption",
-                    f"crew {vb['crew']}  |  cap {vb['capacity']:,}",
-                    c.TEXT_MUTED, col2_x + 10, ry + 62)
+            # ── Crew +/- controls ───────────────────────────────────────────
+            btn_y = card_top + 58
+            ui.label("crew", col2_x + 10, btn_y + 4)
+            minus_crew = pygame.Rect(col2_x + 46, btn_y, 22, 24)
+            crew_val_r = pygame.Rect(col2_x + 70, btn_y, 28, 24)
+            plus_crew  = pygame.Rect(col2_x + 100, btn_y, 22, 24)
+            ui.icon_button(minus_crew, "-", enabled=vb["crew"] > 0)
+            ui.inset_panel(crew_val_r.x, crew_val_r.y, crew_val_r.w, crew_val_r.h)
+            ui.text("mono_b", str(vb["crew"]), c.TEXT_PRIMARY,
+                    crew_val_r.centerx, crew_val_r.y + 5, align="center")
+            ui.icon_button(plus_crew, "+")
+            # Only register click widgets for buttons inside the visible region
+            if clip_rect.colliderect(minus_crew):
+                self.planner_widgets.append(
+                    (minus_crew,
+                     lambda tid=vb["id"]: self._adjust_truck_crew(tid, -1)))
+            if clip_rect.colliderect(plus_crew):
+                self.planner_widgets.append(
+                    (plus_crew,
+                     lambda tid=vb["id"]: self._adjust_truck_crew(tid, +1)))
+            ui.text("caption", f"cap {vb['capacity']:,}",
+                    c.TEXT_MUTED, col2_x + 132, btn_y + 6)
 
-            # Rename / OK+Cancel  and  Scrap buttons (bottom-right)
-            btn_y  = ry + 64
-            scrap_r  = pygame.Rect(col2_x + col2_w - 64, btn_y, 56, 24)
+            # ── Rename / OK+Cancel  and  Scrap ──────────────────────────────
+            scrap_r = pygame.Rect(col2_x + list_w - 64, btn_y, 56, 24)
             if is_renaming:
-                ok_r     = pygame.Rect(col2_x + col2_w - 128, btn_y, 56, 24)
-                self._pbtn(screen, ok_r, "OK",
-                           lambda: self._commit_rename(),
-                           fkey="body_s", accent=True)
-                self._pbtn(screen, scrap_r, "Cancel",
-                           lambda: self._cancel_rename(),
-                           fkey="body_s")
+                ok_r = pygame.Rect(col2_x + list_w - 128, btn_y, 56, 24)
+                self._pbtn_in_clip(screen, ok_r, "OK",
+                                   lambda: self._commit_rename(),
+                                   clip_rect, fkey="body_s", accent=True)
+                self._pbtn_in_clip(screen, scrap_r, "Cancel",
+                                   lambda: self._cancel_rename(),
+                                   clip_rect, fkey="body_s")
             else:
-                rename_r = pygame.Rect(col2_x + col2_w - 128, btn_y, 56, 24)
-                self._pbtn(screen, rename_r, "Rename",
-                           lambda tid=vb["id"], nn=nickname: self._start_rename(tid, nn),
-                           fkey="body_s")
-                self._pbtn(screen, scrap_r, "Scrap",
-                           lambda tid=vb["id"]: self._scrap_truck(tid),
-                           fkey="body_s")
+                rename_r = pygame.Rect(col2_x + list_w - 128, btn_y, 56, 24)
+                self._pbtn_in_clip(screen, rename_r, "Rename",
+                                   lambda tid=vb["id"], nn=nickname:
+                                       self._start_rename(tid, nn),
+                                   clip_rect, fkey="body_s")
+                self._pbtn_in_clip(screen, scrap_r, "Scrap",
+                                   lambda tid=vb["id"]: self._scrap_truck(tid),
+                                   clip_rect, fkey="body_s")
 
-            ry   += CARD_H + 6
-            shown += 1
+            # ── Route-pinning row ────────────────────────────────────────────
+            truck_obj = fleet.get_truck(vb["id"])
+            pref      = truck_obj.get("preferred_area", -1) if truck_obj else -1
+            if pref >= 0:
+                area_obj  = self.game.city.get_area(pref)
+                route_lbl = area_obj.name if area_obj else f"Round {pref}"
+            else:
+                route_lbl = "Auto"
+            ui.label("Route", col2_x + 10, card_top + 86)
+            route_btn_r = pygame.Rect(col2_x + 52, card_top + 84,
+                                      list_w - 62, 22)
+            self._pbtn_in_clip(screen, route_btn_r, route_lbl,
+                               lambda tid=vb["id"]: self._cycle_truck_area(tid),
+                               clip_rect, fkey="body_s", accent=(pref >= 0))
+
+        screen.set_clip(None)
 
         if not fleet.trucks:
-            ui.text("body_s", "No vehicles in fleet.", c.TEXT_DIM, col2_x, ry)
+            ui.text("body_s", "No vehicles in fleet.",
+                    c.TEXT_DIM, col2_x, list_top + 8)
 
-        # Fleet cost totals at bottom of right column (if room)
-        if ry < y + h - 28:
-            pygame.draw.line(screen, c.BORDER_SUBTLE,
-                             (col2_x, ry), (col2_x + col2_w, ry))
-            ry += 8
-            all_veh = sum(v["daily"] for v in veh_bd)
-            ui.label("Fleet daily total", col2_x, ry)
-            ui.text("mono_b", f"£{all_veh:.0f}/day",
-                    c.TEXT_PRIMARY, col2_x + col2_w, ry, align="right")
+        # ── Scrollbar (drawn outside clip, always visible) ───────────────────
+        sb_x  = col2_x + list_w + 4
+        track = pygame.Rect(sb_x, list_top, SB_W, list_h)
+        pygame.draw.rect(screen, c.BG_DEEP, track, border_radius=SB_W // 2)
+        pygame.draw.rect(screen, c.BORDER_SUBTLE, track, 1,
+                         border_radius=SB_W // 2)
+        if content_h > list_h:
+            thumb_ratio = list_h / max(1, content_h)
+            thumb_h     = max(24, int(list_h * thumb_ratio))
+            max_s       = max(1, self._staff_fleet_max_scroll)
+            thumb_y     = list_top + int(
+                scroll / max_s * max(0, list_h - thumb_h))
+            thumb = pygame.Rect(sb_x + 1, thumb_y, SB_W - 2, thumb_h)
+            pygame.draw.rect(screen, c.ACCENT_TEAL, thumb,
+                             border_radius=(SB_W - 2) // 2)
+
+        # ── Fleet daily total: pinned below the scroll region ────────────────
+        total_y = y + h - 20
+        pygame.draw.line(screen, c.BORDER_SUBTLE,
+                         (col2_x, total_y - 6), (col2_x + col2_w, total_y - 6))
+        all_veh = sum(v["daily"] for v in veh_bd)
+        ui.label("Fleet daily total", col2_x, total_y)
+        ui.text("mono_b", f"£{all_veh:.0f}/day",
+                c.TEXT_PRIMARY, col2_x + col2_w, total_y, align="right")
 
     def _tab_finance(self, screen, x, y, w, h):
         ui = self.ui
@@ -1415,6 +1520,10 @@ class UIManager:
         ty2 = self._stepper(screen, lx, ty, "Council tax (£/resident/day)", f"{eco.council_tax_rate:.2f}",
                            (lambda: self._adjust_tax(-0.10)), (lambda: self._adjust_tax(0.10)), label_w=240)
         ui.text("caption", "Higher tax raises revenue but dents satisfaction.", c.TEXT_DIM, lx, ty2)
+        ty = ty2 + 14
+        self._stepper(screen, lx, ty, "Business rates (£/commercial/day)", f"£{eco.business_rates:.2f}",
+                      (lambda: self._adjust_business_rates(-0.10)), (lambda: self._adjust_business_rates(0.10)),
+                      label_w=240)
         gx = x + 360
         gw = w - 360
         ui.text("h3", "Net trend (14 days)", c.TEXT_PRIMARY, gx, y + 26)
@@ -1444,6 +1553,39 @@ class UIManager:
             ui.text("body_s", "Trend builds after a few days.", c.TEXT_DIM, gx, y + 60)
         ui.label("Budget", gx, y + 200)
         ui.text("display", f"£{int(eco.budget):,}", c.TEXT_PRIMARY, gx, y + 218)
+        # Developer options (hidden behind a toggle)
+        cfg_y = y + 278
+        if cfg_y < y + h - 22:
+            dev_on = self._dev_options_visible
+            dev_lbl = "▾ Developer options" if dev_on else "▸ Developer options"
+            dev_col = c.ACCENT_AMBER if dev_on else c.TEXT_DIM
+            dev_btn = pygame.Rect(gx, cfg_y, 200, 22)
+            pygame.draw.rect(screen, c.BG_CARD if dev_on else c.BG_PANEL,
+                             dev_btn, border_radius=4)
+            pygame.draw.rect(screen, c.BORDER_SUBTLE, dev_btn, 1, border_radius=4)
+            ui.text("body_s", dev_lbl, dev_col, gx + 8, cfg_y + 3)
+            self.planner_widgets.append(
+                (dev_btn, lambda: setattr(self, '_dev_options_visible',
+                                          not self._dev_options_visible)))
+            if dev_on:
+                cfg_y += 28
+                cfg_y = self._stepper(screen, gx, cfg_y, "Event chance",
+                                      f"{int(eco.event_chance * 100)}%",
+                                      lambda: self._adjust_event_chance(-0.05),
+                                      lambda: self._adjust_event_chance(0.05),
+                                      label_w=150, val_w=54)
+                cfg_y = self._stepper(screen, gx, cfg_y, "Win streak (days)",
+                                      str(eco.win_streak_target),
+                                      lambda: self._adjust_win_target(-1),
+                                      lambda: self._adjust_win_target(1),
+                                      label_w=150, val_w=54)
+                cfg_y = self._stepper(screen, gx, cfg_y, "Day length (sec)",
+                                      str(eco.day_duration),
+                                      lambda: self._adjust_day_duration(-5),
+                                      lambda: self._adjust_day_duration(5),
+                                      label_w=150, val_w=54)
+                ui.text("caption", "Lower day length = faster game pace.",
+                        c.TEXT_DIM, gx, cfg_y)
 
     def _tab_data(self, screen, x, y, w, h):
         ui = self.ui
@@ -1533,6 +1675,62 @@ class UIManager:
     def _adjust_tax(self, delta):
         eco = self.game.economy
         eco.council_tax_rate = max(0.0, round(eco.council_tax_rate + delta, 2))
+
+    def _adjust_business_rates(self, delta):
+        eco = self.game.economy
+        eco.business_rates = round(max(0.0, min(20.0, eco.business_rates + delta)), 2)
+
+    def _adjust_event_chance(self, delta):
+        eco = self.game.economy
+        eco.event_chance = round(max(0.0, min(1.0, eco.event_chance + delta)), 2)
+
+    def _adjust_win_target(self, delta):
+        eco = self.game.economy
+        eco.win_streak_target = max(1, min(30, eco.win_streak_target + delta))
+
+    def _adjust_day_duration(self, delta):
+        eco = self.game.economy
+        eco.day_duration = max(10, min(300, eco.day_duration + delta))
+
+    def _cycle_truck_area(self, truck_id):
+        """Cycle a lorry's pinned round: Auto → Round 0 → … → last → Auto."""
+        fleet     = self.game.fleet
+        city      = self.game.city
+        truck     = fleet.get_truck(truck_id)
+        if not truck:
+            return
+        num_areas = len(city.areas)
+        cur       = truck.get("preferred_area", -1)
+        if cur < 0:
+            nxt = 0
+        elif cur >= num_areas - 1:
+            nxt = -1          # wrap back to Auto
+        else:
+            nxt = cur + 1
+        fleet.assign_truck_area(truck_id, nxt)
+        if nxt < 0:
+            self.game.set_toast(f"Lorry #{truck_id}: automatic round selection.")
+        else:
+            area = city.get_area(nxt)
+            name = area.name if area else f"Round {nxt}"
+            self.game.set_toast(f"Lorry #{truck_id} pinned to {name}.")
+
+    def _adjust_truck_crew(self, truck_id, delta):
+        """Move a crew member to/from a specific lorry within the existing pool."""
+        fleet = self.game.fleet
+        truck = fleet.get_truck(truck_id)
+        if not truck:
+            return
+        cap  = int(truck.get("crew_cap", 4))
+        cur  = int(truck.get("crew", 0))
+        idle = fleet.workers - sum(t.get("crew", 0) for t in fleet.trucks)
+        if delta > 0 and (cur >= cap or idle <= 0):
+            return          # truck full or no idle crew
+        if delta < 0 and cur <= 0:
+            return          # already empty
+        dist = {t["id"]: t.get("crew", 0) for t in fleet.trucks}
+        dist[truck_id] = cur + delta
+        fleet.set_fleet_crew(dist)
 
     def _export_xml(self):
         ok, msg = xmlio.prompt_export(self.game)

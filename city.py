@@ -46,17 +46,22 @@ COM_STYLE_WEIGHTS = {
 }
 
 # height band, resident band, fill rate (%/second at 1x)
+# Fill rates are tuned so that the *worst-case* building (tower) reaches
+# ~97 % full after a full 7-day collection cycle at the default waste-stream
+# multiplier (~1.58×).  That leaves a small buffer for weather/event spikes
+# without overflowing in a normal week.  Prior values were ~25 % higher and
+# caused unavoidable weekend overflow on weekly rounds.
 STYLE_DATA = {
-    "bungalow": {"h": (12, 17),   "pop": (1, 2),   "fill": 0.090},
-    "terrace":  {"h": (22, 27),   "pop": (2, 4),   "fill": 0.120},
-    "semi":     {"h": (24, 31),   "pop": (2, 5),   "fill": 0.130},
-    "detached": {"h": (28, 37),   "pop": (3, 6),   "fill": 0.140},
-    "flats":    {"h": (46, 64),   "pop": (8, 16),  "fill": 0.180},
-    "tower":    {"h": (92, 132),  "pop": (20, 40), "fill": 0.225},
-    "shop":      {"h": (24, 30),  "pop": (0, 0),   "fill": 0.155},
-    "office":    {"h": (50, 72),  "pop": (0, 0),   "fill": 0.140},
-    "warehouse": {"h": (30, 40),  "pop": (0, 0),   "fill": 0.120},
-    "highrise":  {"h": (108, 150),"pop": (0, 0),   "fill": 0.215},
+    "bungalow": {"h": (12, 17),   "pop": (1, 2),   "fill": 0.068},
+    "terrace":  {"h": (22, 27),   "pop": (2, 4),   "fill": 0.090},
+    "semi":     {"h": (24, 31),   "pop": (2, 5),   "fill": 0.097},
+    "detached": {"h": (28, 37),   "pop": (3, 6),   "fill": 0.105},
+    "flats":    {"h": (46, 64),   "pop": (8, 16),  "fill": 0.135},
+    "tower":    {"h": (92, 132),  "pop": (20, 40), "fill": 0.170},
+    "shop":      {"h": (24, 30),  "pop": (0, 0),   "fill": 0.115},
+    "office":    {"h": (50, 72),  "pop": (0, 0),   "fill": 0.105},
+    "warehouse": {"h": (30, 40),  "pop": (0, 0),   "fill": 0.090},
+    "highrise":  {"h": (108, 150),"pop": (0, 0),   "fill": 0.160},
 }
 
 # Palettes per style. Tones are deliberately British: red/buff brick, slate,
@@ -255,8 +260,8 @@ class CityGenerator:
 
         roads = RoadGenerator.generate_grid(self.width, self.height)
 
-        # Randomise green space between 10% and 20%
-        base_green_threshold = random.uniform(0.10, 0.20)
+        # Randomise green space between 5% and 15%
+        base_green_threshold = random.uniform(0.05, 0.15)
         base_building_threshold = 0.82 + (0.07 - base_green_threshold)
 
         for y in range(self.height):

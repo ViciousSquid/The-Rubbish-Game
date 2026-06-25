@@ -121,6 +121,10 @@ class WasteCityGame:
 
     # ----------------------------------------------------------------- clicks
     def handle_click(self, screen_x, screen_y):
+        # No board interaction once the game is over.
+        if self.economy.has_lost:
+            return
+
         # Planner is modal — it takes all clicks until closed.
         if self.planner_open:
             self.ui.handle_planner_click((screen_x, screen_y))
@@ -149,6 +153,14 @@ class WasteCityGame:
 
     # ----------------------------------------------------------------- update
     def update(self, dt):
+        # Once the borough is insolvent the simulation halts — only the
+        # game-over overlay remains, awaiting a restart.
+        if self.economy.has_lost:
+            self.economy.game_over_timer += dt
+            self.planner_open = False
+            self.ui.update(dt)
+            return
+
         # Simulation dt is scaled by game speed; UI/camera use real dt
         sim_dt = dt * self.speed
 
@@ -233,8 +245,15 @@ class WasteCityGame:
                     self.ui._setup_buttons()
 
                 elif event.type == pygame.KEYDOWN:
+                    # Game over: only restart (R) or quit (Esc/Q) are accepted.
+                    if self.economy.has_lost:
+                        if event.key == pygame.K_r:
+                            self._clear_and_regenerate()
+                        elif event.key in (pygame.K_ESCAPE, pygame.K_q):
+                            pygame.quit()
+                            sys.exit()
                     # If a truck rename is in progress, all keys go to the UI.
-                    if self.ui._renaming_truck_id is not None:
+                    elif self.ui._renaming_truck_id is not None:
                         self.ui.handle_key(event)
                     else:
                         tab_keys = {pygame.K_1: "rounds", pygame.K_2: "waste",
@@ -257,9 +276,13 @@ class WasteCityGame:
                         self.dragging = True
                         self.drag_moved = False
                     elif event.button == 4:
-                        self.camera["zoom"] = min(4, self.camera["zoom"] * 1.1)
+                        if not (self.planner_open and
+                                self.ui.handle_scroll(4, event.pos)):
+                            self.camera["zoom"] = min(4, self.camera["zoom"] * 1.1)
                     elif event.button == 5:
-                        self.camera["zoom"] = max(0.3, self.camera["zoom"] * 0.9)
+                        if not (self.planner_open and
+                                self.ui.handle_scroll(5, event.pos)):
+                            self.camera["zoom"] = max(0.3, self.camera["zoom"] * 0.9)
 
                 elif event.type == pygame.MOUSEBUTTONUP:
                     if event.button == 1 and self.dragging and not self.drag_moved:
