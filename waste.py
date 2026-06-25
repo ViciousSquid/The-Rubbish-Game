@@ -1,0 +1,184 @@
+"""
+waste.py
+========
+
+Borough-wide *waste stream* policy -- the "what waste is collected" lever.
+
+A real council runs several parallel collections (residual/black bin, dry
+recycling, food caddy, garden brown bin). Rather than splitting every tile into
+four separate bins (which would mean rewriting the whole fleet/collection loop),
+the streams are modelled as a single borough policy that modulates three things:
+
+    * how fast the kerbside bin fills      (more streams = more to present/move)
+    * the economics of disposal            (landfill gate fees vs recycling
+                                            credits vs chargeable garden waste)
+    * baseline public satisfaction         (residents like a full service)
+
+That keeps the existing per-tile `bin_fill` and the fleet untouched while giving
+the player a meaningful set of policy choices.
+"""
+
+
+class WasteStream:
+    def __init__(self, sid, name, color, *, fill_share, gate_fee, credit,
+                 satisfaction, frequency=1, can_disable=True, enabled=True,
+                 blurb=""):
+        self.id = sid
+        self.name = name
+        self.color = color
+        # Relative contribution to how fast the kerbside bin fills when on.
+        self.fill_share = fill_share
+        # GBP per "unit" of this stream sent for disposal (a cost).
+        self.gate_fee = gate_fee
+        # GBP per unit recovered/charged (income: recycling credit, garden sub).
+        self.credit = credit
+        # Contribution to the satisfaction ceiling when offered.
+        self.satisfaction = satisfaction
+        # 1 = weekly, 2 = fortnightly.
+        self.frequency = frequency
+        self.can_disable = can_disable
+        self.enabled = enabled if can_disable else True
+        self.blurb = blurb
+
+    @property
+    def freq_label(self):
+        return "Weekly" if self.frequency <= 1 else "Fortnightly"
+
+
+def _default_streams():
+    return [
+        WasteStream(
+            "residual", "General (black bin)", "#4b4f57",
+            fill_share=0.60, gate_fee=0.085, credit=0.0, satisfaction=0,
+            frequency=1, can_disable=False, enabled=True,
+            blurb="Residual waste to energy-from-waste. Always collected; "
+                  "high gate fee."),
+        WasteStream(
+            "recycling", "Dry recycling", "#3d6f8e",
+            fill_share=0.35, gate_fee=0.012, credit=0.060, satisfaction=8,
+            frequency=2, enabled=True,
+            blurb="Mixed paper, card, cans, plastics. Earns a material credit; "
+                  "residents expect it."),
+        WasteStream(
+            "food", "Food waste caddy", "#6f8e4a",
+            fill_share=0.16, gate_fee=0.020, credit=0.018, satisfaction=6,
+            frequency=1, enabled=False,
+            blurb="Weekly food caddies. Fills fast, modest AD credit, big "
+                  "satisfaction lift."),
+        WasteStream(
+            "garden", "Garden waste", "#8a6f3a",
+            fill_share=0.20, gate_fee=0.010, credit=0.045, satisfaction=4,
+            frequency=2, enabled=False,
+            blurb="Chargeable brown-bin subscription. Net income, but more "
+                  "tonnage to shift."),
+    ]
+
+
+class WastePolicy:
+    def __init__(self):
+        self.streams = _default_streams()
+
+    # ---------------------------------------------------------------- access
+    def get(self, sid):
+        for s in self.streams:
+            if s.id == sid:
+                return s
+        return None
+
+    def enabled_streams(self):
+        return [s for s in self.streams if s.enabled]
+
+    def toggle(self, sid):
+        s = self.get(sid)
+        if s and s.can_disable:
+            s.enabled = not s.enabled
+        return s
+
+    def cycle_frequency(self, sid):
+        s = self.get(sid)
+        if s:
+            s.frequency = 1 if s.frequency >= 2 else 2
+        return s
+
+    # ------------------------------------------------------------- modelling
+    def fill_multiplier(self):
+        """How fast the single kerbside bin fills given the streams on offer.
+        More separate collections = more material presented at the kerb."""
+        total = sum(s.fill_share for s in self.enabled_streams())
+        # Normalise so 'residual only' ~= 1.0 (the legacy baseline).
+        return max(0.4, total / 0.60)
+
+    def satisfaction_ceiling(self):
+        """Baseline satisfaction residents settle toward for the service on
+        offer (40 floor up to ~100 with the full set)."""
+        return min(100.0, 70.0 + sum(s.satisfaction for s in self.enabled_streams()))
+
+    def split_volume(self, volume):
+        """Apportion a chunk of collected volume across the enabled streams by
+        fill share, returning {stream_id: units}."""
+        streams = self.enabled_streams()
+        total = sum(s.fill_share for s in streams) or 1.0
+        return {s.id: volume * s.fill_share / total for s in streams}
+
+    def disposal_economics(self, volume):
+        """Return ledger lines for disposing `volume` units of mixed kerbside
+        collection under the current policy.
+
+        Returns (gate_fees, recycling_credit, garden_charges) in GBP.
+        gate_fees is a positive cost; the other two are positive income."""
+        gate = 0.0
+        recycle = 0.0
+        garden = 0.0
+        for sid, units in self.split_volume(volume).items():
+            s = self.get(sid)
+            gate += units * s.gate_fee
+            if sid == "garden":
+                garden += units * s.credit
+            else:
+                recycle += units * s.credit
+        return gate, recycle, garden
+
+    # ----------------------------------------------------------------- XML io
+    def to_rows(self):
+        rows = []
+        for s in self.streams:
+            rows.append({
+                "Stream": s.name,
+                "Id": s.id,
+                "Collected": "Yes" if s.enabled else "No",
+                "Frequency": s.freq_label,
+                "Gate fee (GBP/unit)": round(s.gate_fee, 4),
+                "Credit (GBP/unit)": round(s.credit, 4),
+                "Satisfaction": s.satisfaction,
+                "Note": s.blurb,
+            })
+        return rows
+
+    def apply_rows(self, rows):
+        """Apply imported stream settings. Returns a count of streams changed."""
+        changed = 0
+        for row in rows:
+            sid = (row.get("Id") or "").strip()
+            s = self.get(sid)
+            if not s:
+                continue
+            collected = (row.get("Collected") or "").strip().lower()
+            if collected in ("yes", "y", "true", "1"):
+                want = True
+            elif collected in ("no", "n", "false", "0"):
+                want = False
+            else:
+                want = s.enabled
+            if s.can_disable and want != s.enabled:
+                s.enabled = want
+                changed += 1
+            freq = (row.get("Frequency") or "").strip().lower()
+            if freq.startswith("fort"):
+                if s.frequency != 2:
+                    s.frequency = 2
+                    changed += 1
+            elif freq.startswith("week"):
+                if s.frequency != 1:
+                    s.frequency = 1
+                    changed += 1
+        return changed

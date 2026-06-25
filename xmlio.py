@@ -1,0 +1,567 @@
+"""
+xmlio.py
+========
+
+Import / export of the borough's management plan as an *office spreadsheet*.
+
+The on-disk format is SpreadsheetML 2003 -- the classic
+``<?mso-application progid="Excel.Sheet"?>`` XML that Excel and LibreOffice
+both open natively. It is dressed up to look like a real council planning
+workbook produced by a fictional product, "KerbsidePlanner Council Edition",
+complete with a styled title block, bold headers, currency formatting and one
+worksheet per concern:
+
+    Summary             borough header + read-me
+    Collection Rounds   per-round day + weekly/fortnightly frequency   (editable)
+    Waste Streams       which streams are collected + how often         (editable)
+    Finance             tax/rate levers + a profit & loss snapshot      (rates editable)
+    Routes              routing levers (service threshold)              (editable)
+    Staff               crew headcount + a target to hire toward        (target editable)
+    Fleet               current vehicles                                (export only)
+    Procurement Orders  vehicles on order                               (export only)
+
+Import is deliberately non-destructive about money: it applies the levers you
+can safely round-trip and only ever *hires* crew within budget, so loading a
+plan can never silently bankrupt the council. Buy and scrap vehicles from the
+Fleet tab.
+"""
+
+import os
+import datetime
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape, quoteattr
+
+DAY_FULL = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+            "Saturday", "Sunday"]
+DAY_ABBR = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+PRODUCT = "KerbsidePlanner Council Edition"
+
+# Finance lever labels -- export and import must agree on these exact strings.
+LV_COUNCIL_TAX = "Council tax (GBP / resident / day)"
+LV_BUSINESS = "Business rates (GBP / premises / day)"
+LV_WAGE = "Crew wage (GBP / hour)"
+LV_THRESHOLD = "Service threshold (% full)"
+LV_TARGET_CREW = "Target crew headcount"
+
+
+# ===========================================================================
+#  Writing  (string builder for full control of the ss: prefixes + the PI)
+# ===========================================================================
+def _day_index(name):
+    if name is None:
+        return None
+    n = str(name).strip().lower()[:3]
+    for i, a in enumerate(DAY_ABBR):
+        if a.lower() == n:
+            return i
+    return None
+
+
+def _cell(value, style=None, formula=None):
+    """One <Cell>. Numbers export as Number, everything else as String."""
+    attrs = ""
+    if style:
+        attrs += f' ss:StyleID={quoteattr(style)}'
+    if formula:
+        attrs += f' ss:Formula={quoteattr(formula)}'
+    if isinstance(value, bool):
+        value = "Yes" if value else "No"
+    if isinstance(value, (int, float)):
+        return (f'<Cell{attrs}><Data ss:Type="Number">'
+                f'{value}</Data></Cell>')
+    text = escape("" if value is None else str(value))
+    return f'<Cell{attrs}><Data ss:Type="String">{text}</Data></Cell>'
+
+
+def _row(cells, height=None):
+    attrs = f' ss:Height="{height}"' if height else ""
+    return f"<Row{attrs}>{''.join(cells)}</Row>"
+
+
+def _sheet(name, columns, rows, freeze_header=True):
+    cols = "".join(f'<Column ss:Width="{w}"/>' for w in columns)
+    body = "".join(rows)
+    opts = (
+        '<WorksheetOptions xmlns="urn:schemas-microsoft-com:office:excel">'
+        '<PageSetup><Layout x:Orientation="Landscape"/></PageSetup>'
+        '<FitToPage/>'
+    )
+    if freeze_header:
+        opts += ('<FreezePanes/><FrozenNoSplit/>'
+                 '<SplitHorizontal>1</SplitHorizontal>'
+                 '<TopRowBottomPane>1</TopRowBottomPane>'
+                 '<ActivePane>2</ActivePane>')
+    opts += '</WorksheetOptions>'
+    return (f'<Worksheet ss:Name={quoteattr(name)}><Table>'
+            f'{cols}{body}</Table>{opts}</Worksheet>')
+
+
+_STYLES = """
+ <Styles>
+  <Style ss:ID="Default" ss:Name="Normal">
+   <Alignment ss:Vertical="Bottom"/><Borders/>
+   <Font ss:FontName="Calibri" x:Family="Swiss" ss:Size="11" ss:Color="#1F2430"/>
+   <Interior/><NumberFormat/><Protection/>
+  </Style>
+  <Style ss:ID="title">
+   <Font ss:FontName="Calibri Light" ss:Size="20" ss:Bold="1" ss:Color="#243B53"/>
+  </Style>
+  <Style ss:ID="subtitle">
+   <Font ss:FontName="Calibri" ss:Size="11" ss:Italic="1" ss:Color="#62748A"/>
+  </Style>
+  <Style ss:ID="hdr">
+   <Alignment ss:Horizontal="Left" ss:Vertical="Center"/>
+   <Font ss:FontName="Calibri" ss:Size="11" ss:Bold="1" ss:Color="#FFFFFF"/>
+   <Interior ss:Color="#334E68" ss:Pattern="Solid"/>
+   <Borders>
+    <Border ss:Position="Bottom" ss:LineStyle="Continuous" ss:Weight="1" ss:Color="#1F2933"/>
+   </Borders>
+  </Style>
+  <Style ss:ID="hdrnum" ss:Parent="hdr">
+   <Alignment ss:Horizontal="Right" ss:Vertical="Center"/>
+  </Style>
+  <Style ss:ID="label">
+   <Font ss:FontName="Calibri" ss:Size="11" ss:Bold="1" ss:Color="#334E68"/>
+  </Style>
+  <Style ss:ID="money">
+   <NumberFormat ss:Format="&quot;GBP&quot;\\ #,##0"/>
+  </Style>
+  <Style ss:ID="money2">
+   <NumberFormat ss:Format="&quot;GBP&quot;\\ #,##0.00"/>
+  </Style>
+  <Style ss:ID="pct">
+   <NumberFormat ss:Format="0&quot;%&quot;"/>
+  </Style>
+  <Style ss:ID="note">
+   <Alignment ss:WrapText="1" ss:Vertical="Top"/>
+   <Font ss:FontName="Calibri" ss:Size="10" ss:Italic="1" ss:Color="#62748A"/>
+  </Style>
+  <Style ss:ID="band">
+   <Interior ss:Color="#F0F4F8" ss:Pattern="Solid"/>
+  </Style>
+ </Styles>
+"""
+
+
+def _header_row(titles, numeric_cols=()):
+    cells = []
+    for i, t in enumerate(titles):
+        cells.append(_cell(t, "hdrnum" if i in numeric_cols else "hdr"))
+    return _row(cells, height=20)
+
+
+def build_workbook_xml(game):
+    eco = game.economy
+    city = game.city
+    fleet = game.fleet
+    waste = game.waste
+    today = eco.get_day_of_week()
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    sheets = []
+
+    # -- Summary ------------------------------------------------------------
+    led = eco.ledger_snapshot()
+    rows = [
+        _row([_cell("Borough Waste Services", "title")], height=30),
+        _row([_cell("Management Plan", "title")], height=28),
+        _row([_cell(f"Generated by {PRODUCT}  *  {stamp}", "subtitle")]),
+        _row([_cell("")]),
+        _row([_cell("Borough at a glance", "label")]),
+        _row([_cell("Simulation day"), _cell(eco.day)]),
+        _row([_cell("Weekday"), _cell(DAY_FULL[today])]),
+        _row([_cell("Week number"), _cell(eco.week_index + 1)]),
+        _row([_cell("Population"), _cell(city.population)]),
+        _row([_cell("Properties"), _cell(city.property_count)]),
+        _row([_cell("Budget"), _cell(int(eco.budget), "money")]),
+        _row([_cell("Public satisfaction"), _cell(round(eco.satisfaction, 1))]),
+        _row([_cell("Net yesterday"), _cell(int(led["net"]), "money")]),
+        _row([_cell("")]),
+        _row([_cell("How to use this file", "label")]),
+        _row([_cell("Edit the highlighted tabs in your spreadsheet app, save as "
+                    "XML Spreadsheet 2003 (*.xml),", "note")]),
+        _row([_cell("then re-import from the borough's Data tab. Rounds, Waste "
+                    "Streams, Finance rates,", "note")]),
+        _row([_cell("Routes and the Staff target round-trip cleanly. Fleet and "
+                    "Orders are read-only.", "note")]),
+    ]
+    sheets.append(_sheet("Summary", [150, 220], rows, freeze_header=False))
+
+    # -- Collection Rounds --------------------------------------------------
+    rows = [_header_row(
+        ["Round", "Collection day", "Frequency", "Properties",
+         "Population", "Avg fill %", "Status"],
+        numeric_cols=(3, 4, 5))]
+    for area in city.areas:
+        st = city.area_stats(area.id, today)
+        band = "band" if area.id % 2 else None
+        rows.append(_row([
+            _cell(area.name, band),
+            _cell(DAY_ABBR[area.collection_day], band),
+            _cell("Fortnightly" if area.frequency >= 2 else "Weekly", band),
+            _cell(area.property_count, band),
+            _cell(area.population, band),
+            _cell(int(st["avg"]) if st else 0, band),
+            _cell(st["status"] if st else "-", band),
+        ]))
+    sheets.append(_sheet("Collection Rounds", [150, 90, 90, 80, 80, 70, 100], rows))
+
+    # -- Waste Streams ------------------------------------------------------
+    wr = waste.to_rows()
+    rows = [_header_row(
+        ["Stream", "Id", "Collected", "Frequency", "Gate fee (GBP/unit)",
+         "Credit (GBP/unit)", "Satisfaction", "Note"], numeric_cols=(4, 5, 6))]
+    for i, r in enumerate(wr):
+        band = "band" if i % 2 else None
+        rows.append(_row([
+            _cell(r["Stream"], band),
+            _cell(r["Id"], band),
+            _cell(r["Collected"], band),
+            _cell(r["Frequency"], band),
+            _cell(r["Gate fee (GBP/unit)"], "money2" if band is None else "money2"),
+            _cell(r["Credit (GBP/unit)"], "money2"),
+            _cell(r["Satisfaction"], band),
+            _cell(r["Note"], "note"),
+        ]))
+    sheets.append(_sheet("Waste Streams", [150, 80, 80, 100, 110, 110, 90, 320], rows))
+
+    # -- Finance ------------------------------------------------------------
+    rows = [_header_row(["Item", "Type", "Value"], numeric_cols=(2,))]
+
+    def fin(item, typ, value, style=None):
+        return _row([_cell(item, "label" if typ == "rate" else None),
+                     _cell(typ), _cell(value, style)])
+
+    rows.append(fin(LV_COUNCIL_TAX, "rate", round(eco.council_tax_rate, 2), "money2"))
+    rows.append(fin(LV_BUSINESS, "rate", round(eco.business_rates, 2), "money2"))
+    rows.append(fin(LV_WAGE, "rate", round(eco.hourly_wage_rate, 2), "money2"))
+    rows.append(_row([_cell("")]))
+    rows.append(_row([_cell("Profit & loss (yesterday)", "label")]))
+    for key, label in eco.LEDGER_LABELS:
+        val = int(round(led.get(key, 0.0)))
+        kind = "revenue" if key in eco.REVENUE_KEYS else "expense"
+        rows.append(fin(label, kind, val, "money"))
+    rows.append(fin("NET", "net", int(round(led["net"])), "money"))
+    sheets.append(_sheet("Finance", [260, 90, 110], rows))
+
+    # -- Routes -------------------------------------------------------------
+    rows = [_header_row(["Item", "Value"], numeric_cols=(1,))]
+    rows.append(_row([_cell(LV_THRESHOLD, "label"),
+                      _cell(int(fleet.service_threshold))]))
+    rows.append(_row([_cell("Bins due today"), _cell(fleet.get_today_demand())]))
+    rows.append(_row([_cell("Estimated daily capacity (bins)"),
+                      _cell(fleet.estimated_daily_capacity())]))
+    rows.append(_row([_cell("Active lorries"), _cell(fleet.active_lorries())]))
+    rows.append(_row([_cell("Collections (lifetime)"), _cell(fleet.collected_count)]))
+    sheets.append(_sheet("Routes", [260, 110], rows))
+
+    # -- Staff --------------------------------------------------------------
+    lorries = max(1, len(fleet.trucks))
+    rows = [_header_row(["Item", "Value"], numeric_cols=(1,))]
+    rows.append(_row([_cell("Total crew"), _cell(fleet.workers)]))
+    rows.append(_row([_cell("Lorries"), _cell(len(fleet.trucks))]))
+    rows.append(_row([_cell("Crew per lorry (avg)"),
+                      _cell(round(fleet.workers / lorries, 2))]))
+    rows.append(_row([_cell(LV_TARGET_CREW, "label"), _cell(fleet.workers)]))
+    sheets.append(_sheet("Staff", [260, 110], rows))
+
+    # -- Fleet (export only) ------------------------------------------------
+    rows = [_header_row(
+        ["Lorry", "Model", "Capacity", "Crew", "Crew cap", "Tenure", "Status"],
+        numeric_cols=(2, 3, 4))]
+    for t in fleet.trucks:
+        rows.append(_row([
+            _cell(f"L{t['id']}"),
+            _cell(t.get("model_name", "Standard")),
+            _cell(int(t["capacity"])),
+            _cell(t["crew"]),
+            _cell(t.get("crew_cap", 3)),
+            _cell("Leased" if t.get("leased") else "Owned"),
+            _cell(t["state"]),
+        ]))
+    if not fleet.trucks:
+        rows.append(_row([_cell("(no vehicles)", "note")]))
+    sheets.append(_sheet("Fleet", [70, 160, 90, 60, 80, 80, 90], rows))
+
+    # -- Procurement Orders (export only) -----------------------------------
+    rows = [_header_row(
+        ["Model", "Ordered (day)", "Arrives (day)", "Days left", "Tenure"],
+        numeric_cols=(1, 2, 3))]
+    for o in fleet.orders:
+        rows.append(_row([
+            _cell(o.vehicle.name),
+            _cell(o.order_day),
+            _cell(o.arrival_day),
+            _cell(o.days_remaining(eco.day)),
+            _cell("Leased" if o.leased else "Owned"),
+        ]))
+    if not fleet.orders:
+        rows.append(_row([_cell("(nothing on order)", "note")]))
+    sheets.append(_sheet("Procurement Orders", [160, 100, 100, 90, 80], rows))
+
+    head = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<?mso-application progid="Excel.Sheet"?>\n'
+        '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"\n'
+        ' xmlns:o="urn:schemas-microsoft-com:office:office"\n'
+        ' xmlns:x="urn:schemas-microsoft-com:office:excel"\n'
+        ' xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"\n'
+        ' xmlns:html="http://www.w3.org/TR/REC-html40">\n'
+        ' <DocumentProperties xmlns="urn:schemas-microsoft-com:office:office">\n'
+        f'  <Title>Borough Waste Services - Management Plan</Title>\n'
+        f'  <Author>{escape(PRODUCT)}</Author>\n'
+        f'  <Company>Borough Waste Services</Company>\n'
+        f'  <Created>{datetime.datetime.now().isoformat()}</Created>\n'
+        ' </DocumentProperties>\n'
+        ' <ExcelWorkbook xmlns="urn:schemas-microsoft-com:office:excel">\n'
+        '  <WindowHeight>9000</WindowHeight><WindowWidth>16000</WindowWidth>\n'
+        ' </ExcelWorkbook>\n'
+    )
+    return head + _STYLES + "".join(sheets) + "\n</Workbook>\n"
+
+
+# ===========================================================================
+#  Reading
+# ===========================================================================
+def _localname(tag):
+    return tag.split("}", 1)[-1]
+
+
+def _parse(xml_text):
+    """Parse SpreadsheetML into {sheet_name: [ {header: value}, ... ]}."""
+    if isinstance(xml_text, bytes):
+        xml_text = xml_text.decode("utf-8", "replace")
+    root = ET.fromstring(xml_text)
+    SS = "{urn:schemas-microsoft-com:office:spreadsheet}"
+    sheets = {}
+    for ws in root.iter():
+        if _localname(ws.tag) != "Worksheet":
+            continue
+        name = ws.get(SS + "Name") or ws.get("Name") or "Sheet"
+        table = None
+        for child in ws:
+            if _localname(child.tag) == "Table":
+                table = child
+                break
+        if table is None:
+            continue
+        grid = []
+        for row in table:
+            if _localname(row.tag) != "Row":
+                continue
+            cells = []
+            col = 0
+            for cell in row:
+                if _localname(cell.tag) != "Cell":
+                    continue
+                idx = cell.get(SS + "Index")
+                if idx:
+                    col = int(idx) - 1
+                while len(cells) < col:
+                    cells.append("")
+                value = ""
+                for data in cell:
+                    if _localname(data.tag) == "Data":
+                        value = data.text or ""
+                        break
+                cells.append(value)
+                col += 1
+            grid.append(cells)
+        if not grid:
+            sheets[name] = []
+            continue
+        headers = [h.strip() for h in grid[0]]
+        rowdicts = []
+        for cells in grid[1:]:
+            d = {}
+            for i, h in enumerate(headers):
+                d[h] = cells[i] if i < len(cells) else ""
+            rowdicts.append(d)
+        sheets[name] = rowdicts
+    return sheets
+
+
+def _to_float(s, default=None):
+    try:
+        return float(str(s).replace(",", "").replace("GBP", "").strip())
+    except (ValueError, AttributeError):
+        return default
+
+
+def apply_workbook(game, sheets):
+    """Apply the editable levers from a parsed workbook. Returns a summary."""
+    eco = game.economy
+    city = game.city
+    fleet = game.fleet
+    waste = game.waste
+    notes = []
+
+    # Rounds -----------------------------------------------------------------
+    rounds = sheets.get("Collection Rounds", [])
+    by_name = {a.name.strip().lower(): a for a in city.areas}
+    moved = 0
+    for r in rounds:
+        area = by_name.get((r.get("Round") or "").strip().lower())
+        if not area:
+            continue
+        di = _day_index(r.get("Collection day"))
+        if di is not None and di != area.collection_day:
+            city.set_area_day(area.id, di)
+            moved += 1
+        freq = (r.get("Frequency") or "").strip().lower()
+        if freq.startswith("fort") and area.frequency != 2:
+            area.frequency = 2
+            moved += 1
+        elif freq.startswith("week") and area.frequency != 1:
+            area.frequency = 1
+            moved += 1
+    if moved:
+        notes.append(f"{moved} round change(s)")
+
+    # Waste streams ----------------------------------------------------------
+    streams = sheets.get("Waste Streams", [])
+    if streams:
+        changed = waste.apply_rows(streams)
+        if changed:
+            notes.append(f"{changed} waste-stream change(s)")
+
+    # Finance rates ----------------------------------------------------------
+    fin = sheets.get("Finance", [])
+    rate_changes = 0
+    for r in fin:
+        if (r.get("Type") or "").strip().lower() != "rate":
+            continue
+        item = (r.get("Item") or "").strip()
+        val = _to_float(r.get("Value"))
+        if val is None:
+            continue
+        if item == LV_COUNCIL_TAX:
+            eco.council_tax_rate = max(0.0, round(val, 2)); rate_changes += 1
+        elif item == LV_BUSINESS:
+            eco.business_rates = max(0.0, round(val, 2)); rate_changes += 1
+        elif item == LV_WAGE:
+            eco.hourly_wage_rate = max(0.0, round(val, 2)); rate_changes += 1
+    if rate_changes:
+        notes.append(f"{rate_changes} finance rate(s)")
+
+    # Routes -----------------------------------------------------------------
+    for r in sheets.get("Routes", []):
+        if (r.get("Item") or "").strip() == LV_THRESHOLD:
+            val = _to_float(r.get("Value"))
+            if val is not None:
+                fleet.service_threshold = int(max(5, min(80, val)))
+                notes.append("service threshold")
+
+    # Staff target (hire within budget / fire down -- never overspends) ------
+    for r in sheets.get("Staff", []):
+        if (r.get("Item") or "").strip() == LV_TARGET_CREW:
+            val = _to_float(r.get("Value"))
+            if val is None:
+                continue
+            target = int(max(0, min(60, val)))
+            hired = fired = 0
+            while fleet.workers < target and eco.budget >= 2500:
+                eco.budget -= 2500
+                fleet.hire_worker()
+                hired += 1
+            while fleet.workers > target:
+                if not fleet.fire_worker():
+                    break
+                fired += 1
+            if hired:
+                notes.append(f"hired {hired} crew")
+            if fired:
+                notes.append(f"released {fired} crew")
+
+    if not notes:
+        return "Plan imported -- no changes to apply (values already match)."
+    return "Plan imported: " + ", ".join(notes) + "."
+
+
+# ===========================================================================
+#  Paths + file dialogs
+# ===========================================================================
+def default_export_path():
+    base = os.path.join(os.path.expanduser("~"), "BoroughWaste_Plan.xml")
+    return base
+
+
+def export_to_path(game, path):
+    xml = build_workbook_xml(game)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(xml)
+    return path
+
+
+def import_from_path(game, path):
+    with open(path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    sheets = _parse(text)
+    return apply_workbook(game, sheets)
+
+
+def _file_dialog(save, default_name="BoroughWaste_Plan.xml"):
+    """Open a native open/save dialog via tkinter. Returns a path or None.
+    Returns the sentinel 'NO_TK' if tkinter is unavailable."""
+    try:
+        import tkinter
+        from tkinter import filedialog
+    except Exception:
+        return "NO_TK"
+    try:
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        opts = dict(defaultextension=".xml",
+                    filetypes=[("XML Spreadsheet 2003", "*.xml"),
+                               ("All files", "*.*")],
+                    title="Save borough plan" if save else "Import borough plan")
+        if save:
+            opts["initialfile"] = default_name
+            path = filedialog.asksaveasfilename(**opts)
+        else:
+            path = filedialog.askopenfilename(**opts)
+        root.destroy()
+        return path or None
+    except Exception:
+        return "NO_TK"
+
+
+def prompt_export(game):
+    """Returns (ok, message)."""
+    path = _file_dialog(save=True)
+    if path == "NO_TK":
+        path = default_export_path()
+        try:
+            export_to_path(game, path)
+            return True, f"Saved to {path} (no file dialog available)."
+        except Exception as exc:
+            return False, f"Export failed: {exc}"
+    if not path:
+        return False, "Export cancelled."
+    try:
+        export_to_path(game, path)
+        return True, f"Exported plan to {os.path.basename(path)}."
+    except Exception as exc:
+        return False, f"Export failed: {exc}"
+
+
+def prompt_import(game):
+    """Returns (ok, message)."""
+    path = _file_dialog(save=False)
+    if path == "NO_TK":
+        path = default_export_path()
+        if not os.path.exists(path):
+            return False, "No file dialog and no default plan to import."
+    if not path:
+        return False, "Import cancelled."
+    if not os.path.exists(path):
+        return False, "File not found."
+    try:
+        msg = import_from_path(game, path)
+        return True, msg
+    except ET.ParseError as exc:
+        return False, f"Could not parse XML: {exc}"
+    except Exception as exc:
+        return False, f"Import failed: {exc}"
