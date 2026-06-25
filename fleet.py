@@ -44,6 +44,9 @@ class FleetManager:
         # Rental tracking for budget impact
         self.rental_daily_cost = 0.0  # accumulated rental costs per day
 
+        # Event state
+        self.on_strike = False       # True while a crew strike event is active
+
     # ------------------------------------------------------------ initial fleet
     def setup_initial_fleet(self, lorries=3, crew=6):
         """Give the council a starting fleet for free (no budget hit)."""
@@ -66,7 +69,13 @@ class FleetManager:
         self._roads_built_for = self.game.city
 
     def _is_road(self, x, y):
-        return (x, y) in self._road_tiles
+        if (x, y) in self._road_tiles:
+            # Road works block this tile for vehicles
+            rw = getattr(self.game.city, "road_works_tiles", None)
+            if rw and (x, y) in rw:
+                return False
+            return True
+        return False
 
     # -------------------------------------------------------------- purchasing
     def purchase_truck(self, model_id=DEFAULT_MODEL, leased=False, tier_id="dealer"):
@@ -457,6 +466,8 @@ class FleetManager:
 
     # ----------------------------------------------------------------- update
     def update(self, dt):
+        if self.on_strike:
+            return   # crews refuse to work — no trucks move
         self._ensure_road_graph()
         for truck in self.trucks:
             self._update_truck(truck, dt)
@@ -464,6 +475,8 @@ class FleetManager:
     def _update_truck(self, truck, dt):
         if truck["crew"] < 1:
             return  # no crew, no service
+        if truck.get("broken"):
+            return  # broken down — awaiting repair
 
         state = truck["state"]
 

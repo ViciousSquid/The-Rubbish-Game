@@ -6,6 +6,7 @@ from economy import Economy
 from ui import UIManager
 from fleet import FleetManager
 from waste import WastePolicy
+from ambient import AmbientState
 
 CITY_W = 60
 CITY_H = 60
@@ -46,6 +47,7 @@ class WasteCityGame:
         self.economy = Economy()
         self.ui = UIManager(self)
         self.renderer = Renderer(self.screen, self.camera)
+        self.ambient = AmbientState()
 
         self._center_camera()
 
@@ -63,6 +65,7 @@ class WasteCityGame:
         self.city = CityGenerator(CITY_W, CITY_H)
         self.city.generate()
         self.fleet.setup_initial_fleet()
+        self.ambient = AmbientState()
         self.clear_selection()
         self._center_camera()
 
@@ -190,6 +193,8 @@ class WasteCityGame:
             self.ui.show_event(self.economy.pending_event)
             self.economy.pending_event = None
 
+        self.ambient.update(sim_dt, self.city, self.fleet)
+
         if self.toast_timer > 0:
             self.toast_timer -= dt
             if self.toast_timer <= 0:
@@ -209,7 +214,7 @@ class WasteCityGame:
 
         self.renderer.render(self.city, self.fleet, self.selected_tile,
                              self.economy.get_day_of_week(), self.show_areas,
-                             self.hovered_tile)
+                             self.hovered_tile, self.economy, self.ambient)
         self.ui.draw(self.screen)
         pygame.display.flip()
 

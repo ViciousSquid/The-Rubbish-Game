@@ -203,6 +203,7 @@ class CityGenerator:
         self.property_count = 0
         self.metrics = {"residential": 0, "commercial": 0, "roads": 0, "green": 0}
         self.landfill = None         # set by _place_landfill() during generate()
+        self.road_works_tiles = set()   # (x, y) tiles blocked by road works event
 
     # ------------------------------------------------------------------ areas
     def _area_index(self, x, y):
@@ -248,6 +249,7 @@ class CityGenerator:
         self.population = 0
         self.property_count = 0
         self.landfill = None
+        self.road_works_tiles = set()
         self.metrics = {"residential": 0, "commercial": 0, "roads": 0, "green": 0}
         self._build_areas()
 

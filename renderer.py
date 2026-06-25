@@ -93,7 +93,8 @@ class Renderer:
         self._cache_key = None
 
     # ----------------------------------------------------------------- render
-    def render(self, city, fleet, selected_tile=None, today=0, show_areas=False, hovered_tile=None):
+    def render(self, city, fleet, selected_tile=None, today=0, show_areas=False,
+               hovered_tile=None, economy=None, ambient=None):
         cx = self.screen.get_width() // 2 + self.camera["x"]
         cy = 120 + self.camera["y"]
         zoom = self.camera["zoom"]
@@ -140,9 +141,26 @@ class Renderer:
         # Landfill site (large refuse mound in a corner)
         self.draw_landfill(cx, cy, city, zoom)
 
+        # Road works barriers (drawn before trucks so trucks appear on top)
+        self.draw_road_works(cx, cy, city, zoom)
+
+        # Ambient pedestrians
+        if ambient:
+            for ped in ambient.peds.peds:
+                piso = self.to_iso(ped["x"], ped["y"])
+                self.draw_ped(cx + piso[0] * zoom, cy + piso[1] * zoom, ped, zoom)
+
         # Depot
         depot_iso = self.to_iso(fleet.depot_x, fleet.depot_y)
-        self.draw_depot(cx + depot_iso[0] * zoom, cy + depot_iso[1] * zoom, zoom)
+        self.draw_depot(cx + depot_iso[0] * zoom, cy + depot_iso[1] * zoom,
+                        zoom, fleet)
+
+        # Ambient civilian cars
+        if ambient:
+            for car in ambient.traffic.cars:
+                ciso = self.to_iso(car["x"], car["y"])
+                self.draw_ambient_car(cx + ciso[0] * zoom, cy + ciso[1] * zoom,
+                                      car, zoom)
 
         # Lorries + loaders
         for truck in fleet.trucks:
@@ -152,8 +170,16 @@ class Renderer:
                 wiso = self.to_iso(w["x"], w["y"])
                 self.draw_worker(cx + wiso[0] * zoom, cy + wiso[1] * zoom, w, zoom)
 
+        # Seagulls near landfill
+        if ambient:
+            self.draw_birds(cx, cy, ambient.birds, zoom)
+
         if show_areas:
             self.draw_area_overlay(cx, cy, city, zoom, today)
+
+        # Weather overlay (rain / snow)
+        if economy:
+            self.draw_weather(economy.weather, economy.day_timer, economy.day_duration)
 
     # --------------------------------------------------------------- static cache
     def _needs_static_cache_update(self, city, zoom):
@@ -502,6 +528,27 @@ class Renderer:
                                (int(b["R_top"][0]), int(b["R_top"][1] - 6 * zoom)),
                                max(2, int(3 * zoom)))
 
+        # Heatmap overflow tint: intensity grows with days_overflowing
+        days_ov = getattr(tile, "days_overflowing", 0)
+        if days_ov > 0 and not static_only:
+            alpha = min(170, 28 + days_ov * 35)
+            tint_surf = pygame.Surface(
+                (int(hw * 2.6), int(hh * 2.6 + H)), pygame.SRCALPHA)
+            tint_pts = [
+                (int(hw * 1.3), int(hh * 1.3)),
+                (int(hw * 2.3), int(hh * 0.3)),
+                (int(hw * 2.3), int(hh * 0.3 - H)),
+                (int(hw * 1.3), int(hh * 1.3 - H)),
+                (int(hw * 0.3), int(hh * 1.3 - H)),
+                (int(hw * 0.3), int(hh * 1.3)),
+            ]
+            pygame.draw.polygon(tint_surf, (210, 30, 30, alpha), tint_pts)
+            self.screen.blit(tint_surf, (int(x - hw * 1.3), int(y - hh * 1.3)))
+
+        # Litter bags accumulate outside overflowing buildings
+        if days_ov > 0 and not static_only and zoom >= 0.9:
+            self._draw_litter(b, days_ov, zoom)
+
     def _draw_building_dynamic(self, x, y, tile, zoom, today, is_hovered=False, is_selected=False):
         """Draw only the dynamic parts of a building (selection, hover, bins, overflow).
         Called when the static cache is active."""
@@ -580,6 +627,27 @@ class Renderer:
             pygame.draw.circle(self.screen, (235, 70, 70),
                                (int(b["R_top"][0]), int(b["R_top"][1] - 6 * zoom)),
                                max(2, int(3 * zoom)))
+
+        # Heatmap overflow tint: intensity grows with days_overflowing
+        days_ov = getattr(tile, "days_overflowing", 0)
+        if days_ov > 0:
+            alpha = min(170, 28 + days_ov * 35)
+            tint_surf = pygame.Surface(
+                (int(hw * 2.6), int(hh * 2.6 + H)), pygame.SRCALPHA)
+            tint_pts = [
+                (int(hw * 1.3), int(hh * 1.3)),
+                (int(hw * 2.3), int(hh * 0.3)),
+                (int(hw * 2.3), int(hh * 0.3 - H)),
+                (int(hw * 1.3), int(hh * 1.3 - H)),
+                (int(hw * 0.3), int(hh * 1.3 - H)),
+                (int(hw * 0.3), int(hh * 1.3)),
+            ]
+            pygame.draw.polygon(tint_surf, (210, 30, 30, alpha), tint_pts)
+            self.screen.blit(tint_surf, (int(x - hw * 1.3), int(y - hh * 1.3)))
+
+        # Litter bags accumulate outside overflowing buildings
+        if days_ov > 0 and zoom >= 0.9:
+            self._draw_litter(b, days_ov, zoom)
 
     # --------------------------------------------------------------- roofs
     def _roof_hip(self, b, cc, zoom):
@@ -855,8 +923,73 @@ class Renderer:
                              (x, board.bottom), (x, y - base_h * 0.5), max(1, int(2 * zoom)))
             self.screen.blit(text, rect)
 
+    # ------------------------------------------------------------- road works
+    def draw_road_works(self, cx, cy, city, zoom):
+        """Draw orange construction barriers on tiles blocked by road works."""
+        rw = getattr(city, "road_works_tiles", None)
+        if not rw:
+            return
+        sw, sh = self.screen.get_size()
+        hw = (self.tile_w / 2) * zoom
+        hh = (self.tile_h / 2) * zoom
+
+        for (tx, ty) in rw:
+            iso = self.to_iso(tx, ty)
+            ix = cx + iso[0] * zoom
+            iy = cy + iso[1] * zoom
+            if ix < -hw * 2 or ix > sw + hw * 2:
+                continue
+            if iy < -hh * 2 or iy > sh + hh * 2:
+                continue
+
+            # Orange semi-transparent tint over the road diamond
+            tint = pygame.Surface((int(hw * 2.2), int(hh * 2.2)), pygame.SRCALPHA)
+            tint_pts = [
+                (int(hw * 1.1), int(hh * 0.1)),
+                (int(hw * 2.1), int(hh * 1.1)),
+                (int(hw * 1.1), int(hh * 2.1)),
+                (int(hw * 0.1), int(hh * 1.1)),
+            ]
+            pygame.draw.polygon(tint, (255, 130, 0, 160), tint_pts)
+            self.screen.blit(tint, (int(ix - hw * 1.1), int(iy - hh * 1.1)))
+
+            # Traffic cones — three small triangles scattered across the tile
+            cone_h = max(4, int(10 * zoom))
+            cone_w = max(2, int(4 * zoom))
+            offsets = [
+                (hw * 0.35,  hh * 0.55),
+                (-hw * 0.35, hh * 0.55),
+                (0.0,        hh * 1.15),
+            ]
+            for ox, oy in offsets:
+                bx = int(ix + ox)
+                by = int(iy + hh + oy)
+                # Orange cone body
+                pygame.draw.polygon(self.screen, (255, 100, 0), [
+                    (bx, by - cone_h),
+                    (bx - cone_w, by),
+                    (bx + cone_w, by),
+                ])
+                # White reflective stripe
+                stripe_y = by - cone_h // 2
+                pygame.draw.line(self.screen, (240, 240, 240),
+                                 (bx - cone_w // 2, stripe_y),
+                                 (bx + cone_w // 2, stripe_y),
+                                 max(1, int(zoom)))
+
+            # "ROAD WORKS" label at close zoom
+            if zoom >= 1.2:
+                font = pygame.font.SysFont("segoeui", max(6, int(7 * zoom)), bold=True)
+                label = font.render("ROAD WORKS", True, (255, 220, 0))
+                lrect = label.get_rect(center=(int(ix), int(iy + hh * 0.5)))
+                bg = pygame.Surface((label.get_width() + 4, label.get_height() + 2),
+                                    pygame.SRCALPHA)
+                bg.fill((30, 30, 30, 160))
+                self.screen.blit(bg, (lrect.x - 2, lrect.y - 1))
+                self.screen.blit(label, lrect)
+
     # ------------------------------------------------------------- depot
-    def draw_depot(self, x, y, zoom):
+    def draw_depot(self, x, y, zoom, fleet=None):
         """A distinctive council waste depot: a wide industrial shed with a
         pitched roof, roller doors, a yard and signage. Deliberately grey and
         utilitarian so it reads instantly against the colourful streets."""
@@ -915,6 +1048,44 @@ class Renderer:
             pygame.draw.line(self.screen, (120, 124, 130),
                              (x, board.bottom), (x, b["R_top"][1] - 4 * zoom), max(1, int(2 * zoom)))
             self.screen.blit(text, rect)
+
+        # Strike picket line — workers standing outside with signs
+        if fleet and getattr(fleet, "on_strike", False) and zoom > 0.4:
+            hw = (self.tile_w / 2) * zoom
+            hh = (self.tile_h / 2) * zoom
+            f  = 1.25
+            b2 = self._box(x, y, hw, hh, f, 30 * zoom)
+            n_workers = min(8, max(2, fleet.workers))
+            for i in range(n_workers):
+                angle  = (i / n_workers) * 3.14 + 0.3
+                wx = int(x + math.cos(angle) * hw * f * 1.4)
+                wy = int(y + hh + math.sin(angle) * hh * f * 1.4)
+                s2 = max(0.6, zoom)
+                # Body
+                pygame.draw.rect(self.screen, (255, 180, 0),
+                                 pygame.Rect(wx - int(2.5 * s2), wy - int(7 * s2),
+                                             int(5 * s2), int(5 * s2)))
+                # Head
+                pygame.draw.circle(self.screen, (235, 200, 160),
+                                   (wx, wy - int(8.5 * s2)), max(1, int(2 * s2)))
+                # Picket sign post
+                pygame.draw.line(self.screen, (180, 150, 100),
+                                 (wx, wy - int(10 * s2)), (wx, wy - int(16 * s2)),
+                                 max(1, int(s2)))
+                # Sign board
+                pygame.draw.rect(self.screen, (255, 60, 60),
+                                 pygame.Rect(wx - int(4 * s2), wy - int(16 * s2),
+                                             int(8 * s2), int(5 * s2)))
+            # Strike label above depot
+            font_s = pygame.font.SysFont("segoeui", max(8, int(10 * zoom)), bold=True)
+            strike_text = font_s.render("ON STRIKE", True, (255, 60, 60))
+            srect = strike_text.get_rect(
+                center=(int(x), int(y - 30 * zoom * 1.25 - 28 * zoom)))
+            bg_s = pygame.Surface((strike_text.get_width() + 8,
+                                   strike_text.get_height() + 4), pygame.SRCALPHA)
+            bg_s.fill((0, 0, 0, 160))
+            self.screen.blit(bg_s, (srect.x - 4, srect.y - 2))
+            self.screen.blit(strike_text, srect)
 
     # ------------------------------------------------------------- truck
     def draw_truck(self, x, y, truck, zoom):
@@ -995,6 +1166,150 @@ class Renderer:
             font = pygame.font.SysFont("monospace", max(5, int(6 * s)), bold=True)
             text = font.render(f"L{truck['id']}", True, (255, 255, 255))
             self.screen.blit(text, text.get_rect(center=(int(x), int(y + 6 * s))))
+
+        # Broken-down indicator — warning triangle + pulsing smoke
+        if truck.get("broken"):
+            t_ms = pygame.time.get_ticks()
+            # Warning triangle
+            tri_cx, tri_cy = int(x), int(y - 17 * s)
+            tri_r = max(4, int(6 * s))
+            pygame.draw.polygon(self.screen, (220, 200, 0), [
+                (tri_cx, tri_cy - tri_r),
+                (tri_cx - int(tri_r * 0.9), tri_cy + int(tri_r * 0.5)),
+                (tri_cx + int(tri_r * 0.9), tri_cy + int(tri_r * 0.5)),
+            ])
+            pygame.draw.polygon(self.screen, (40, 40, 40), [
+                (tri_cx, tri_cy - tri_r),
+                (tri_cx - int(tri_r * 0.9), tri_cy + int(tri_r * 0.5)),
+                (tri_cx + int(tri_r * 0.9), tri_cy + int(tri_r * 0.5)),
+            ], max(1, int(s)))
+            bang = pygame.font.SysFont("segoeui", max(5, int(5 * s)), bold=True)
+            bang_t = bang.render("!", True, (40, 40, 40))
+            self.screen.blit(bang_t, bang_t.get_rect(center=(tri_cx, tri_cy)))
+            # Smoke puffs rising from engine
+            for k in range(3):
+                phase = (t_ms / 600.0 + k * 0.33) % 1.0
+                smoke_x = int(x + (k - 1) * 3 * s)
+                smoke_y = int(y - 10 * s - phase * 12 * s)
+                alpha   = int(180 * (1.0 - phase))
+                r       = max(1, int((1 + phase * 3) * s))
+                if alpha > 20:
+                    smoke_s = pygame.Surface((r * 2 + 2, r * 2 + 2), pygame.SRCALPHA)
+                    pygame.draw.circle(smoke_s, (160, 160, 160, alpha), (r + 1, r + 1), r)
+                    self.screen.blit(smoke_s, (smoke_x - r - 1, smoke_y - r - 1))
+
+    # --------------------------------------------------------- ambient cars
+    def draw_ambient_car(self, x, y, car, zoom):
+        """Tiny civilian car -- a coloured box with wheels, smaller than RCVs."""
+        s     = zoom * 0.7
+        color = car["color"]
+        flip  = car.get("facing", 1)
+
+        def px(dx):
+            return x + dx * s * flip
+
+        pygame.draw.ellipse(self.screen, (16, 20, 28),
+                            pygame.Rect(int(x - 7 * s), int(y + 1 * s),
+                                        int(14 * s), int(4 * s)))
+        pts = [(px(-5), y - 1 * s), (px(5), y - 1 * s),
+               (px(5), y - 5 * s), (px(-5), y - 5 * s)]
+        pygame.draw.polygon(self.screen, color, pts)
+        roof_pts = [(px(-3), y - 5 * s), (px(3), y - 5 * s),
+                    (px(2.5), y - 8 * s), (px(-2.5), y - 8 * s)]
+        pygame.draw.polygon(self.screen, _shade(color, 0.75), roof_pts)
+        pygame.draw.polygon(self.screen, (170, 210, 240),
+                            [(px(-2.2), y - 5.1 * s), (px(2.2), y - 5.1 * s),
+                             (px(1.8), y - 7.6 * s), (px(-1.8), y - 7.6 * s)])
+        wr = max(1, int(1.8 * s))
+        for wx2 in (-3.5, 3.5):
+            pygame.draw.circle(self.screen, (22, 22, 22), (int(px(wx2)), int(y)), wr)
+            pygame.draw.circle(self.screen, (80, 80, 80), (int(px(wx2)), int(y)), max(1, wr - 1))
+
+    # --------------------------------------------------------------- peds
+    def draw_ped(self, x, y, ped, zoom):
+        """Tiny pedestrian walking along roads."""
+        s    = zoom * 0.55
+        bob  = math.sin(ped.get("bob", 0)) * 1.0 * s
+        col  = ped.get("vest", (255, 160, 0))
+
+        pygame.draw.rect(self.screen, col,
+                         pygame.Rect(int(x - 1.5 * s), int(y - 6 * s + bob),
+                                     int(3 * s), int(4 * s)),
+                         border_radius=max(1, int(s)))
+        pygame.draw.circle(self.screen, (230, 195, 160),
+                           (int(x), int(y - 7.5 * s + bob)), max(1, int(1.4 * s)))
+        leg = math.sin(ped.get("bob", 0) * 2)
+        pygame.draw.line(self.screen, (60, 60, 80),
+                         (int(x - s * 0.8), int(y - 2 * s)),
+                         (int(x - s * 0.8 + leg * s), int(y + s)),
+                         max(1, int(s * 0.8)))
+        pygame.draw.line(self.screen, (60, 60, 80),
+                         (int(x + s * 0.8), int(y - 2 * s)),
+                         (int(x + s * 0.8 - leg * s), int(y + s)),
+                         max(1, int(s * 0.8)))
+
+    # --------------------------------------------------------------- birds
+    def draw_birds(self, cx, cy, birds_sys, zoom):
+        """Seagulls circling the landfill."""
+        import math as _math
+        for b in birds_sys.birds:
+            iso = self.to_iso(b["lcx"], b["lcy"])
+            lx = cx + iso[0] * zoom
+            ly = cy + iso[1] * zoom
+            bx = lx + _math.cos(b["angle"]) * b["radius"] * self.tile_w * zoom * 0.6
+            by = ly + _math.sin(b["angle"]) * b["radius"] * self.tile_h * zoom * 0.4
+            bob_y = _math.sin(b["bob"]) * 3 * zoom
+            bx, by = int(bx), int(by + bob_y)
+            wing = _math.sin(b["wing"]) * 0.5 + 0.5
+            ws = max(1, int(4 * zoom))
+            wh = max(1, int(2 * zoom * (0.3 + wing * 0.7)))
+            pygame.draw.ellipse(self.screen, (240, 240, 240),
+                                pygame.Rect(bx - ws // 2, by - 1, ws, max(1, int(2 * zoom))))
+            pygame.draw.line(self.screen, (220, 220, 220),
+                             (bx - ws, by - wh), (bx, by), max(1, int(zoom)))
+            pygame.draw.line(self.screen, (220, 220, 220),
+                             (bx + ws, by - wh), (bx, by), max(1, int(zoom)))
+
+    # --------------------------------------------------------------- weather
+    def draw_weather(self, weather, day_timer, day_duration):
+        """Rain streaks or snow flakes across the whole screen."""
+        if weather not in ("rain", "snow"):
+            return
+        sw, sh = self.screen.get_size()
+        import random as _rnd
+        rng = _rnd.Random(int(pygame.time.get_ticks() / 80))
+        if weather == "rain":
+            for _ in range(120):
+                rx = rng.randint(0, sw)
+                ry = rng.randint(0, sh)
+                ln = rng.randint(6, 14)
+                surf = pygame.Surface((2, ln + 2), pygame.SRCALPHA)
+                surf.fill((140, 160, 200, 55))
+                self.screen.blit(surf, (rx, ry))
+        elif weather == "snow":
+            for _ in range(60):
+                rx = rng.randint(0, sw)
+                ry = rng.randint(0, sh)
+                r  = rng.randint(1, 3)
+                surf = pygame.Surface((r * 2 + 2, r * 2 + 2), pygame.SRCALPHA)
+                pygame.draw.circle(surf, (230, 240, 255, 90), (r + 1, r + 1), r)
+                self.screen.blit(surf, (rx, ry))
+
+    # --------------------------------------------------------------- litter
+    def _draw_litter(self, b, days_ov, zoom):
+        """Scatter rubbish bags near base of overflowing buildings."""
+        import random as _rnd
+        n_bags = min(6, days_ov * 2)
+        seed   = int(b["B_bot"][0] * 13 + b["B_bot"][1] * 7) & 0xffff
+        rng    = _rnd.Random(seed)
+        bag_colors = [(35, 35, 35), (120, 30, 30), (40, 80, 120), (60, 110, 55)]
+        for k in range(n_bags):
+            ox = rng.uniform(-0.6, 0.6)
+            oy = rng.uniform(0.0, 0.5)
+            bx = b["B_bot"][0] + ox * (b["B_right"][0] - b["B_bot"][0]) * 0.8
+            by = b["B_bot"][1] + oy * zoom * 4
+            r  = max(1, int(1.4 * zoom))
+            pygame.draw.circle(self.screen, rng.choice(bag_colors), (int(bx), int(by)), r)
 
     # ------------------------------------------------------------- area overlay
     def draw_area_overlay(self, cx, cy, city, zoom, today):
