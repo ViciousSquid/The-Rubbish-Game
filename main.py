@@ -181,7 +181,7 @@ class WasteCityGame:
             # Deliver any vehicles that have arrived.
             delivered = self.fleet.process_deliveries(self.economy.day)
             if delivered:
-                self.set_toast("Delivered: " + ", ".join(delivered))
+                self.set_toast("Delivered: " + ", ".join(str(d) for d in delivered))
             # Once-per-day service-quality snapshot (one scan, not per frame).
             overflows = self.fleet.get_unscheduled_overflows()
             self.economy.register_day_quality(

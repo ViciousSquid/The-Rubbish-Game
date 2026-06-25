@@ -413,7 +413,6 @@ class UIManager:
     def draw(self, screen):
         self.ui = UIPrimitives(screen, self.fonts)
         w, h = screen.get_size()
-        self._draw_procurement_bar(screen, w)
         self._draw_hud(screen, w, h)
         self._draw_event_banner(screen, w)
         self._draw_crisis_banner(screen, w, h)
@@ -421,9 +420,8 @@ class UIManager:
         self._draw_inspect_panel(screen, w, h)
         if self.game.planner_open:
             self._draw_planner(screen, w, h)
+        self._draw_procurement_bar(screen, w)
         self._draw_toast(screen, w, h)
-        if self._tooltip_text and self._tooltip_timer > 0.3:
-            self.ui.tooltip(self._tooltip_pos[0], self._tooltip_pos[1], self._tooltip_text)
 
     def _draw_toast(self, screen, w, h):
         if not getattr(self.game, "toast", "") or self.game.toast_timer <= 0:

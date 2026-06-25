@@ -88,6 +88,10 @@ class Renderer:
         except Exception:
             self._truck_icon = None
 
+        # Static cache for batch rendering
+        self._static_cache = None
+        self._cache_key = None
+
     # ----------------------------------------------------------------- render
     def render(self, city, fleet, selected_tile=None, today=0, show_areas=False, hovered_tile=None):
         cx = self.screen.get_width() // 2 + self.camera["x"]
@@ -95,8 +99,14 @@ class Renderer:
         zoom = self.camera["zoom"]
         sw, sh = self.screen.get_size()
 
-        self._draw_ground_plane(cx, cy, city, zoom)
-        self._draw_city_boundary(cx, cy, city, zoom)
+        # Build or reuse the static cache
+        if self._static_cache is None or self._needs_static_cache_update(city, zoom):
+            self._static_cache = self._render_static(city, zoom)
+
+        use_cache = self._static_cache is not None
+        if use_cache:
+            cache = self._static_cache
+            self.screen.blit(cache["surface"], (int(cx - cache["offset_x"]), int(cy - cache["offset_y"])))
 
         for y in range(city.height):
             for x in range(city.width):
@@ -111,9 +121,21 @@ class Renderer:
                 tile = city.get_tile(x, y)
                 selected = selected_tile and selected_tile["x"] == x and selected_tile["y"] == y
                 hovered = hovered_tile and hovered_tile["x"] == x and hovered_tile["y"] == y
-                self.draw_tile(ix, iy, tile, selected, zoom, city)
-                if tile.type not in ("road", "green", "landfill"):
-                    self.draw_building(ix, iy, tile, zoom, today, hovered, selected)
+
+                if not use_cache:
+                    self.draw_tile(ix, iy, tile, selected, zoom, city)
+                    if tile.type not in ("road", "green", "landfill"):
+                        self.draw_building(ix, iy, tile, zoom, today, hovered, selected)
+                else:
+                    if tile.type not in ("road", "green", "landfill"):
+                        self._draw_building_dynamic(ix, iy, tile, zoom, today, hovered, selected)
+
+                # Selection outline for non-building tiles
+                if selected and tile.type in ("road", "green", "landfill"):
+                    hw = (self.tile_w / 2) * zoom
+                    hh = (self.tile_h / 2) * zoom
+                    points = [(ix, iy), (ix + hw, iy + hh), (ix, iy + 2 * hh), (ix - hw, iy + hh)]
+                    pygame.draw.polygon(self.screen, (245, 245, 245), points, max(2, int(2 * zoom)))
 
         # Landfill site (large refuse mound in a corner)
         self.draw_landfill(cx, cy, city, zoom)
@@ -133,13 +155,67 @@ class Renderer:
         if show_areas:
             self.draw_area_overlay(cx, cy, city, zoom, today)
 
+    # --------------------------------------------------------------- static cache
+    def _needs_static_cache_update(self, city, zoom):
+        key = (id(city), round(zoom, 2))
+        if self._cache_key != key:
+            self._cache_key = key
+            return True
+        return False
+
+    def _render_static(self, city, zoom):
+        """Render all static city geometry (ground tiles + buildings) to an off-screen
+        surface. Returns None if the cache would be too large."""
+        corners = [
+            self.to_iso(0, 0),
+            self.to_iso(city.width, 0),
+            self.to_iso(0, city.height),
+            self.to_iso(city.width, city.height),
+        ]
+        min_ix = min(c[0] for c in corners)
+        max_ix = max(c[0] for c in corners)
+        min_iy = min(c[1] for c in corners)
+        max_iy = max(c[1] for c in corners)
+
+        pad = 200
+        cache_w = int((max_ix - min_ix) * zoom) + pad * 2
+        cache_h = int((max_iy - min_iy) * zoom) + pad * 2 + int(160 * zoom)
+
+        # Don't cache if the surface would be enormous (e.g. at very high zoom)
+        MAX_CACHE_PIXELS = 25_000_000
+        if cache_w * cache_h > MAX_CACHE_PIXELS:
+            return None
+
+        offset_x = int(-min_ix * zoom) + pad
+        offset_y = int(-min_iy * zoom) + pad
+
+        surface = pygame.Surface((cache_w, cache_h), pygame.SRCALPHA)
+        surface.fill((0, 0, 0, 0))
+
+        old_screen = self.screen
+        self.screen = surface
+        try:
+            for y in range(city.height):
+                for x in range(city.width):
+                    iso = self.to_iso(x, y)
+                    ix = offset_x + iso[0] * zoom
+                    iy = offset_y + iso[1] * zoom
+                    tile = city.get_tile(x, y)
+                    self.draw_tile(ix, iy, tile, False, zoom, city, static_only=True)
+                    if tile.type not in ("road", "green", "landfill"):
+                        self.draw_building(ix, iy, tile, zoom, 0, False, False, static_only=True)
+        finally:
+            self.screen = old_screen
+
+        return {"surface": surface, "offset_x": offset_x, "offset_y": offset_y}
+
     # --------------------------------------------------------------- ground
     def _draw_ground_plane(self, cx, cy, city, zoom):
         corners = [
             self.to_iso(0, 0),
             self.to_iso(city.width, 0),
-            self.to_iso(city.width, city.height),
             self.to_iso(0, city.height),
+            self.to_iso(city.width, city.height),
         ]
         points = [(cx + c[0] * zoom, cy + c[1] * zoom) for c in corners]
         pygame.draw.polygon(self.screen, (33, 38, 52), points)
@@ -170,7 +246,7 @@ class Renderer:
         return {"x": round(tile_x), "y": round(tile_y)}
 
     # ------------------------------------------------------------- tile floor
-    def draw_tile(self, x, y, tile, is_selected, zoom, city=None):
+    def draw_tile(self, x, y, tile, is_selected, zoom, city=None, static_only=False):
         hw = (self.tile_w / 2) * zoom
         hh = (self.tile_h / 2) * zoom
         points = [(x, y), (x + hw, y + hh), (x, y + 2 * hh), (x - hw, y + hh)]
@@ -178,37 +254,21 @@ class Renderer:
         # ---- ROAD  ----
         if tile.type == "road":
             pygame.draw.polygon(self.screen, ROAD_COLOR, points)
-            if is_selected:
+            if is_selected and not static_only:
                 pygame.draw.polygon(self.screen, (245, 245, 245), points, max(2, int(2 * zoom)))
             return
 
         # ---- GREEN SPACE ----
         if tile.type == "green":
             pygame.draw.polygon(self.screen, GREEN_ZONE, points)
-            if zoom >= 0.8:
-                cx = x
-                cy = y + hh
-                trunk_h = max(3, int(6 * zoom))
-                trunk_w = max(2, int(3 * zoom))
-                canopy_r = max(3, int(7 * zoom))
-                # Trunk
-                pygame.draw.rect(self.screen, (120, 90, 60),
-                                 pygame.Rect(int(cx - trunk_w/2), int(cy - trunk_h),
-                                             trunk_w, trunk_h))
-                # Canopy
-                pygame.draw.circle(self.screen, (70, 130, 60),
-                                   (int(cx), int(cy - trunk_h)), canopy_r)
-                pygame.draw.circle(self.screen, (100, 170, 85),
-                                   (int(cx - canopy_r*0.3), int(cy - trunk_h - canopy_r*0.2)),
-                                   int(canopy_r*0.7))
-            if is_selected:
+            if is_selected and not static_only:
                 pygame.draw.polygon(self.screen, (245, 245, 245), points, max(2, int(2 * zoom)))
             return
 
         # ---- LANDFILL ----
         if tile.type == "landfill":
             pygame.draw.polygon(self.screen, (74, 64, 48), points)   # churned earth
-            if zoom >= 0.7:
+            if zoom >= 0.7 and not static_only:
                 # a few scattered refuse specks so the ground reads as a tip
                 seed = ((int(x) * 73856093) ^ (int(y) * 19349663)) & 0xffff
                 for k in range(3):
@@ -217,7 +277,7 @@ class Renderer:
                     col = [(40, 40, 40), (120, 40, 40), (40, 80, 120)][k % 3]
                     pygame.draw.circle(self.screen, col, (int(sx), int(sy)),
                                        max(1, int(1.6 * zoom)))
-            if is_selected:
+            if is_selected and not static_only:
                 pygame.draw.polygon(self.screen, (245, 245, 245), points, max(2, int(2 * zoom)))
             return
 
@@ -230,7 +290,7 @@ class Renderer:
         pygame.draw.polygon(self.screen, base, points)
 
         # Zone indicator dot
-        if zoom >= 0.8:
+        if zoom >= 0.8 and not static_only:
             if tile.type == "commercial":
                 indicator = (120, 145, 110)
             else:
@@ -242,7 +302,7 @@ class Renderer:
         detail = zoom >= 1.15
 
         # ---- SELECTION TINT ----
-        if is_selected:
+        if is_selected and not static_only:
             tint_color = None
             if tile.type == "residential":
                 tint_color = (120, 255, 120, 110)   # transparent green
@@ -261,7 +321,7 @@ class Renderer:
                 self.screen.blit(tint_surf, (int(x - hw * 0.2), int(y - hh * 0.2)))
 
             pygame.draw.polygon(self.screen, (245, 245, 245), points, max(2, int(2 * zoom)))
-        elif detail:
+        elif detail and not static_only:
             pygame.draw.polygon(self.screen, (40, 46, 40), points, max(1, int(zoom)))
 
     # ------------------------------------------------------------- buildings
@@ -299,7 +359,7 @@ class Renderer:
             "right": right_face, "left": left_face,
         }
 
-    def draw_building(self, x, y, tile, zoom, today, is_hovered=False, is_selected=False):
+    def draw_building(self, x, y, tile, zoom, today, is_hovered=False, is_selected=False, static_only=False):
         if tile.type in ("road", "green"):
             return
 
@@ -328,7 +388,7 @@ class Renderer:
             ])
 
         # ---- SELECTION TINT & WIREFRAME ----
-        if is_selected:
+        if is_selected and not static_only:
             if tile.type == "residential":
                 sel_color = (120, 255, 120, 120)   # brighter green
                 wire_color = (80, 220, 80)
@@ -367,7 +427,7 @@ class Renderer:
                 pygame.draw.line(self.screen, wire_color, p1, p2, max(2, int(2 * zoom)))
 
         # ---- HOVER TINT ----
-        elif is_hovered:
+        elif is_hovered and not static_only:
             if tile.type == "residential":
                 hover_color = (120, 255, 120, 70)   # subtle green
             elif tile.type == "commercial":
@@ -425,7 +485,7 @@ class Renderer:
                 self._rooftop_kit(b, zoom, mast=True)
 
         # Zone type indicator on building (small icon for commercial)
-        if tile.type == "commercial" and zoom >= 1.3:
+        if tile.type == "commercial" and zoom >= 1.3 and not static_only:
             # Small "£" indicator for commercial buildings
             font = pygame.font.SysFont("segoeui", max(6, int(8 * zoom)), bold=True)
             text = font.render("£", True, (255, 220, 100))
@@ -433,10 +493,89 @@ class Renderer:
             self.screen.blit(text, text_rect)
 
         # Kerbside wheelie bin if due today (close-up only)
-        if detail and tile.collection_due == today and tile.bin_fill > 20:
+        if detail and not static_only and tile.collection_due == today and tile.bin_fill > 20:
             self._draw_wheelie_bin(b["B_bot"], b["B_right"], zoom, tile.bin_fill)
 
         # Overflow alarm — cheap and gameplay-critical
+        if tile.bin_fill > 85 and not static_only:
+            pygame.draw.circle(self.screen, (235, 70, 70),
+                               (int(b["R_top"][0]), int(b["R_top"][1] - 6 * zoom)),
+                               max(2, int(3 * zoom)))
+
+    def _draw_building_dynamic(self, x, y, tile, zoom, today, is_hovered=False, is_selected=False):
+        """Draw only the dynamic parts of a building (selection, hover, bins, overflow).
+        Called when the static cache is active."""
+        if tile.type in ("road", "green"):
+            return
+
+        hw = (self.tile_w / 2) * zoom
+        hh = (self.tile_h / 2) * zoom
+        style = tile.building_style
+        f = STYLE_FOOTPRINT.get(style, 0.82)
+        H = tile.building_height * zoom
+        b = self._box(x, y, hw, hh, f, H)
+
+        if is_selected:
+            if tile.type == "residential":
+                sel_color = (120, 255, 120, 120)
+                wire_color = (80, 220, 80)
+            elif tile.type == "commercial":
+                sel_color = (120, 200, 255, 120)
+                wire_color = (80, 170, 255)
+            else:
+                sel_color = None
+                wire_color = (255, 255, 255)
+
+            if sel_color:
+                sel_surf = pygame.Surface((int(hw * 2.6), int(hh * 2.6 + H)), pygame.SRCALPHA)
+                sel_pts = [
+                    (int(hw * 1.3), int(hh * 1.3)),
+                    (int(hw * 2.3), int(hh * 0.3)),
+                    (int(hw * 2.3), int(hh * 0.3 - H)),
+                    (int(hw * 1.3), int(hh * 1.3 - H)),
+                    (int(hw * 0.3), int(hh * 1.3 - H)),
+                    (int(hw * 0.3), int(hh * 1.3)),
+                ]
+                pygame.draw.polygon(sel_surf, sel_color, sel_pts)
+                self.screen.blit(sel_surf, (int(x - hw * 1.3), int(y - hh * 1.3)))
+
+            outline_pts = [
+                (x - hw * f, y + hh * f),
+                (x, y + 2 * hh * f),
+                (x + hw * f, y + hh * f),
+                (x + hw * f, y + hh * f - H),
+                (x, y - H),
+                (x - hw * f, y + hh * f - H),
+            ]
+            for i in range(len(outline_pts)):
+                p1 = outline_pts[i]
+                p2 = outline_pts[(i + 1) % len(outline_pts)]
+                pygame.draw.line(self.screen, wire_color, p1, p2, max(2, int(2 * zoom)))
+
+        elif is_hovered:
+            if tile.type == "residential":
+                hover_color = (120, 255, 120, 70)
+            elif tile.type == "commercial":
+                hover_color = (120, 200, 255, 70)
+            else:
+                hover_color = None
+
+            if hover_color:
+                hover_surf = pygame.Surface((int(hw * 2.6), int(hh * 2.6 + H)), pygame.SRCALPHA)
+                hover_pts = [
+                    (int(hw * 1.3), int(hh * 1.3)),
+                    (int(hw * 2.3), int(hh * 0.3)),
+                    (int(hw * 2.3), int(hh * 0.3 - H)),
+                    (int(hw * 1.3), int(hh * 1.3 - H)),
+                    (int(hw * 0.3), int(hh * 1.3 - H)),
+                    (int(hw * 0.3), int(hh * 1.3)),
+                ]
+                pygame.draw.polygon(hover_surf, hover_color, hover_pts)
+                self.screen.blit(hover_surf, (int(x - hw * 1.3), int(y - hh * 1.3)))
+
+        if zoom >= 1.55 and tile.collection_due == today and tile.bin_fill > 20:
+            self._draw_wheelie_bin(b["B_bot"], b["B_right"], zoom, tile.bin_fill)
+
         if tile.bin_fill > 85:
             pygame.draw.circle(self.screen, (235, 70, 70),
                                (int(b["R_top"][0]), int(b["R_top"][1] - 6 * zoom)),

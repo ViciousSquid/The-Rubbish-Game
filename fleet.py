@@ -585,17 +585,46 @@ class FleetManager:
 
     # ------------------------------------------------------------- landfill
     def _landfill_gate(self):
-        """Road tile trucks drive to in order to tip. Falls back to the depot
-        if the city has no landfill (older saves / safety)."""
+        """Return the centre of the landfill site so trucks drive right in."""
         lf = getattr(self.game.city, "landfill", None)
-        if lf and lf.get("gate"):
-            return lf["gate"]
+        if lf:
+            return (lf["cx"], lf["cy"])
         return (self.depot_x, self.depot_y)
+
+    def _bfs_route_landfill(self, start, goal):
+        """BFS that can traverse both road and landfill tiles."""
+        if start == goal:
+            return []
+        seen = {start}
+        prev = {}
+        q = deque([start])
+        while q:
+            cur = q.popleft()
+            cx, cy = cur
+            for ox, oy in ADJ:
+                nb = (cx + ox, cy + oy)
+                if nb in seen:
+                    continue
+                tile = self.game.city.get_tile(nb[0], nb[1])
+                if tile is None or tile.type not in ("road", "landfill"):
+                    continue
+                seen.add(nb)
+                prev[nb] = cur
+                if nb == goal:
+                    path = [nb]
+                    p = cur
+                    while p != start:
+                        path.append(p)
+                        p = prev[p]
+                    path.reverse()
+                    return path
+                q.append(nb)
+        return None
 
     def _route_to_landfill(self, truck):
         start = self._truck_tile(truck)
-        gate = self._landfill_gate()
-        return self._bfs_route(start, lambda t: t == gate)
+        target = self._landfill_gate()
+        return self._bfs_route_landfill(start, target)
 
     def _depart_to_landfill(self, truck):
         """Head to the landfill to tip. Keeps area_id so the round can resume
