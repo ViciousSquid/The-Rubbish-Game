@@ -146,6 +146,9 @@ class WasteCityGame:
 
     # ----------------------------------------------------------------- update
     def update(self, dt):
+        # Simulation dt is scaled by game speed; UI/camera use real dt
+        sim_dt = dt * self.speed
+
         # Camera movement from held keys
         if not self.planner_open:
             keys = pygame.key.get_pressed()
@@ -170,9 +173,9 @@ class WasteCityGame:
             self.hovered_tile = None
 
         bin_mult = self.economy.get_bin_rate_multiplier() * self.waste.fill_multiplier()
-        self.city.update(dt, bin_mult)
-        self.fleet.update(dt)
-        new_day = self.economy.update(dt, self.city, self.fleet, self.waste)
+        self.city.update(sim_dt, bin_mult)
+        self.fleet.update(sim_dt)
+        new_day = self.economy.update(sim_dt, self.city, self.fleet, self.waste)
 
         if new_day:
             # Deliver any vehicles that have arrived.

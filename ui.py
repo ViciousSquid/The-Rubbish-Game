@@ -1,10 +1,11 @@
 import pygame
+import math
 from city import AREA_COLS, AREA_ROWS
 import xmlio
 from procurement import VEHICLE_CATALOGUE
 
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-HUD_W = 252
+HUD_W = 280
 
 PLANNER_TABS = [
     ("rounds",  "Rounds"),
@@ -28,10 +29,282 @@ ROUTE_TYPE_LABELS = {
 }
 
 ROUTE_TYPE_COLORS = {
-    "residential": (150, 220, 150),
-    "commercial": (150, 190, 220),
-    "mixed": (220, 210, 150),
+    "residential": (120, 200, 120),
+    "commercial": (100, 170, 220),
+    "mixed": (220, 200, 120),
 }
+
+
+class ColorSystem:
+    """A cohesive, accessible color palette inspired by modern dark-mode games."""
+    BG_DEEP = (14, 16, 22)
+    BG_PANEL = (24, 28, 36)
+    BG_CARD = (32, 38, 48)
+    BG_HOVER = (42, 50, 64)
+    BG_ACTIVE = (52, 62, 80)
+    BORDER_SUBTLE = (48, 56, 72)
+    BORDER = (72, 84, 108)
+    BORDER_BRIGHT = (120, 140, 170)
+    TEXT_PRIMARY = (245, 248, 252)
+    TEXT_SECONDARY = (180, 190, 210)
+    TEXT_MUTED = (175, 185, 205)
+    TEXT_DIM = (135, 145, 165)
+    ACCENT_AMBER = (255, 190, 80)
+    ACCENT_AMBER_DIM = (200, 150, 60)
+    ACCENT_TEAL = (80, 200, 190)
+    ACCENT_CORAL = (255, 120, 100)
+    ACCENT_CORAL_DIM = (200, 90, 80)
+    ACCENT_SAGE = (140, 200, 130)
+    STATUS_GOOD = (120, 210, 130)
+    STATUS_WARN = (255, 180, 80)
+    STATUS_BAD = (255, 100, 100)
+
+
+class FontSystem:
+    """Centralized font management with better sizing and fallbacks."""
+    def __init__(self):
+        self._fonts = {}
+        self._load_fonts()
+    def _load_fonts(self):
+        font_names = ["segoeui", "arial", "helvetica", "liberationsans", "dejavusans"]
+        base_font = None
+        for name in font_names:
+            try:
+                base_font = name
+                pygame.font.SysFont(name, 12)
+                break
+            except:
+                continue
+        if base_font is None:
+            base_font = "freesans"
+        mono_names = ["consolas", "couriernew", "liberationmono", "dejavusansmono"]
+        mono_font = None
+        for name in mono_names:
+            try:
+                mono_font = name
+                pygame.font.SysFont(name, 12)
+                break
+            except:
+                continue
+        if mono_font is None:
+            mono_font = base_font
+        specs = {
+            "display": (base_font, 28, True),
+            "display_sub": (base_font, 18, True),
+            "h1": (base_font, 20, True),
+            "h2": (base_font, 16, True),
+            "h3": (base_font, 14, True),
+            "body": (base_font, 14, False),
+            "body_b": (base_font, 14, True),
+            "body_s": (base_font, 12, False),
+            "body_xs": (base_font, 11, False),
+            "mono": (mono_font, 13, False),
+            "mono_b": (mono_font, 13, True),
+            "mono_s": (mono_font, 11, False),
+            "label": (base_font, 11, True),
+            "caption": (base_font, 10, False),
+            "badge": (base_font, 10, True),
+        }
+        for key, (name, size, bold) in specs.items():
+            self._fonts[key] = pygame.font.SysFont(name, size, bold=bold)
+    def get(self, key):
+        return self._fonts.get(key, self._fonts["body"])
+    def render(self, key, text, color):
+        return self._fonts[key].render(text, True, color)
+    def size(self, key, text):
+        return self._fonts[key].size(text)
+
+
+class UIPrimitives:
+    """Low-level drawing primitives for consistent UI styling."""
+    def __init__(self, screen, fonts):
+        self.screen = screen
+        self.fonts = fonts
+        self.c = ColorSystem
+    def panel(self, x, y, w, h, fill=None, border=True, border_radius=4):
+        color = fill or self.c.BG_PANEL
+        rect = pygame.Rect(x, y, w, h)
+        pygame.draw.rect(self.screen, color, rect, border_radius=border_radius)
+        if border:
+            pygame.draw.rect(self.screen, self.c.BORDER_SUBTLE, rect, 1, border_radius=border_radius)
+        return rect
+    def card(self, x, y, w, h, hover=False, selected=False):
+        if selected:
+            fill = self.c.BG_ACTIVE
+            border_color = self.c.ACCENT_AMBER
+            border_width = 2
+        elif hover:
+            fill = self.c.BG_HOVER
+            border_color = self.c.BORDER
+            border_width = 1
+        else:
+            fill = self.c.BG_CARD
+            border_color = self.c.BORDER_SUBTLE
+            border_width = 1
+        rect = pygame.Rect(x, y, w, h)
+        pygame.draw.rect(self.screen, fill, rect, border_radius=6)
+        pygame.draw.rect(self.screen, border_color, rect, border_width, border_radius=6)
+        return rect
+    def inset_panel(self, x, y, w, h):
+        rect = pygame.Rect(x, y, w, h)
+        pygame.draw.rect(self.screen, self.c.BG_DEEP, rect, border_radius=3)
+        pygame.draw.rect(self.screen, self.c.BORDER_SUBTLE, rect, 1, border_radius=3)
+        inner = rect.inflate(-2, -2)
+        pygame.draw.rect(self.screen, (30, 35, 45), inner, border_radius=2)
+        return rect
+    def text(self, key, text, color, x, y, align="left"):
+        surf = self.fonts.render(key, text, color)
+        if align == "left":
+            self.screen.blit(surf, (x, y))
+        elif align == "right":
+            self.screen.blit(surf, (x - surf.get_width(), y))
+        elif align == "center":
+            self.screen.blit(surf, (x - surf.get_width() // 2, y))
+        return surf.get_width()
+    def label(self, text, x, y, color=None):
+        return self.text("label", text, color or self.c.TEXT_MUTED, x, y)
+    def value(self, text, x, y, color=None, align="left"):
+        return self.text("body_b", text, color or self.c.TEXT_PRIMARY, x, y, align)
+    def button(self, rect, label, enabled=True, accent=False, hovered=False, pressed=False, icon=None):
+        if not enabled:
+            fill = self.c.BG_PANEL
+            border = self.c.BORDER_SUBTLE
+            text_color = self.c.TEXT_DIM
+        elif pressed:
+            fill = self.c.BG_ACTIVE
+            border = self.c.ACCENT_AMBER
+            text_color = self.c.ACCENT_AMBER
+        elif accent:
+            fill = self.c.ACCENT_AMBER_DIM if hovered else (220, 165, 70)
+            border = self.c.ACCENT_AMBER
+            text_color = self.c.BG_DEEP
+        elif hovered:
+            fill = self.c.BG_HOVER
+            border = self.c.BORDER_BRIGHT
+            text_color = self.c.TEXT_PRIMARY
+        else:
+            fill = self.c.BG_CARD
+            border = self.c.BORDER
+            text_color = self.c.TEXT_SECONDARY
+        pygame.draw.rect(self.screen, fill, rect, border_radius=5)
+        pygame.draw.rect(self.screen, border, rect, 1, border_radius=5)
+        if enabled and not pressed:
+            highlight = pygame.Rect(rect.x + 1, rect.y + 1, rect.w - 2, rect.h // 3)
+            hl_surf = pygame.Surface((highlight.w, highlight.h), pygame.SRCALPHA)
+            hl_surf.fill((255, 255, 255, 15))
+            self.screen.blit(hl_surf, highlight)
+        surf = self.fonts.render("body_b", label, text_color)
+        text_x = rect.centerx - surf.get_width() // 2
+        text_y = rect.centery - surf.get_height() // 2
+        self.screen.blit(surf, (text_x, text_y))
+        return rect
+    def icon_button(self, rect, icon_text, tooltip="", enabled=True, hovered=False, pressed=False):
+        if not enabled:
+            fill = self.c.BG_PANEL
+            text_color = self.c.TEXT_DIM
+        elif pressed:
+            fill = self.c.BG_ACTIVE
+            text_color = self.c.ACCENT_AMBER
+        elif hovered:
+            fill = self.c.BG_HOVER
+            text_color = self.c.TEXT_PRIMARY
+        else:
+            fill = self.c.BG_CARD
+            text_color = self.c.TEXT_SECONDARY
+        pygame.draw.rect(self.screen, fill, rect, border_radius=4)
+        pygame.draw.rect(self.screen, self.c.BORDER_SUBTLE, rect, 1, border_radius=4)
+        surf = self.fonts.render("body_b", icon_text, text_color)
+        self.screen.blit(surf, surf.get_rect(center=rect.center))
+        return rect
+    def progress_bar(self, x, y, w, h, value, max_value, color=None, bg_color=None, show_text=True):
+        color = color or self.c.ACCENT_AMBER
+        bg = bg_color or self.c.BG_DEEP
+        rect = pygame.Rect(x, y, w, h)
+        pygame.draw.rect(self.screen, bg, rect, border_radius=h // 2)
+        if max_value > 0:
+            pct = min(1.0, max(0.0, value / max_value))
+            fill_w = int(w * pct)
+            if fill_w > 0:
+                fill_rect = pygame.Rect(x, y, fill_w, h)
+                pygame.draw.rect(self.screen, color, fill_rect, border_radius=h // 2)
+                shine = pygame.Surface((fill_w, h // 2), pygame.SRCALPHA)
+                shine.fill((255, 255, 255, 30))
+                self.screen.blit(shine, (x, y))
+        pygame.draw.rect(self.screen, self.c.BORDER_SUBTLE, rect, 1, border_radius=h // 2)
+        if show_text:
+            pct_text = f"{int(pct * 100)}%"
+            surf = self.fonts.render("mono_s", pct_text, self.c.TEXT_PRIMARY)
+            self.screen.blit(surf, (x + w + 6, y))
+    def stat_bar(self, x, y, w, value, max_value, low_color=None, mid_color=None, high_color=None):
+        if max_value <= 0:
+            return
+        pct = value / max_value
+        if pct < 0.3:
+            color = low_color or self.c.STATUS_BAD
+        elif pct < 0.7:
+            color = mid_color or self.c.STATUS_WARN
+        else:
+            color = high_color or self.c.STATUS_GOOD
+        self.progress_bar(x, y, w, 6, value, max_value, color, show_text=False)
+    def badge(self, x, y, text, color=None, bg_color=None):
+        color = color or self.c.TEXT_PRIMARY
+        bg = bg_color or self.c.BG_ACTIVE
+        surf = self.fonts.render("badge", text, color)
+        pad_x, pad_y = 8, 3
+        bw, bh = surf.get_width() + pad_x * 2, surf.get_height() + pad_y * 2
+        rect = pygame.Rect(x, y, bw, bh)
+        pygame.draw.rect(self.screen, bg, rect, border_radius=bh // 2)
+        self.screen.blit(surf, (x + pad_x, y + pad_y))
+        return rect
+    def status_pill(self, x, y, status_text, status_type="neutral"):
+        colors = {
+            "good": (self.c.STATUS_GOOD, (30, 60, 35)),
+            "warn": (self.c.STATUS_WARN, (60, 50, 30)),
+            "bad": (self.c.STATUS_BAD, (60, 35, 35)),
+            "neutral": (self.c.TEXT_MUTED, self.c.BG_ACTIVE),
+            "info": (self.c.ACCENT_TEAL, (30, 50, 55)),
+        }
+        text_color, bg_color = colors.get(status_type, colors["neutral"])
+        return self.badge(x, y, status_text, text_color, bg_color)
+    def h_line(self, x, y, w, color=None):
+        color = color or self.c.BORDER_SUBTLE
+        pygame.draw.line(self.screen, color, (x, y), (x + w, y), 1)
+    def section_header(self, x, y, label, w=None):
+        self.text("h3", label, self.c.TEXT_MUTED, x, y)
+        if w:
+            label_w = self.fonts.size("h3", label)[0]
+            self.h_line(x + label_w + 10, y + 8, w - label_w - 10)
+    def tooltip(self, x, y, text, max_width=240):
+        words = text.split(" ")
+        lines = []
+        current = ""
+        for word in words:
+            test = current + " " + word if current else word
+            if self.fonts.size("body_s", test)[0] <= max_width:
+                current = test
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+        if not lines:
+            return
+        line_h = self.fonts.get("body_s").get_height() + 2
+        th = len(lines) * line_h + 8
+        tw = max(self.fonts.size("body_s", line)[0] for line in lines) + 16
+        rect = pygame.Rect(x, y, tw, th)
+        if rect.right > self.screen.get_width():
+            rect.x = self.screen.get_width() - tw - 10
+        if rect.bottom > self.screen.get_height():
+            rect.y = self.screen.get_height() - th - 10
+        shadow = pygame.Rect(rect.x + 2, rect.y + 2, rect.w, rect.h)
+        pygame.draw.rect(self.screen, (0, 0, 0, 100), shadow, border_radius=4)
+        pygame.draw.rect(self.screen, self.c.BG_CARD, rect, border_radius=4)
+        pygame.draw.rect(self.screen, self.c.BORDER, rect, 1, border_radius=4)
+        for i, line in enumerate(lines):
+            surf = self.fonts.render("body_s", line, self.c.TEXT_SECONDARY)
+            self.screen.blit(surf, (rect.x + 8, rect.y + 4 + i * line_h))
 
 
 class UIManager:
@@ -44,59 +317,34 @@ class UIManager:
         self._insufficient_funds_flash = False
         self._flash_timer = 0
         self._flash_duration = 2.2
-
-        self.fonts = {
-            "title": pygame.font.SysFont("segoeui", 17, bold=True),
-            "header": pygame.font.SysFont("segoeui", 12, bold=True),
-            "body": pygame.font.SysFont("segoeui", 13),
-            "body_b": pygame.font.SysFont("segoeui", 13, bold=True),
-            "small": pygame.font.SysFont("segoeui", 12),
-            "tiny": pygame.font.SysFont("segoeui", 11),
-            "big": pygame.font.SysFont("segoeui", 22, bold=True),
-            "mono": pygame.font.SysFont("consolas", 12),
-            "mono_b": pygame.font.SysFont("consolas", 12, bold=True),
-            "win": pygame.font.SysFont("segoeui", 28, bold=True),
-            "win_sub": pygame.font.SysFont("segoeui", 16, bold=True),
-        }
-
-        # Monochrome palette only. No hues, no transparency.
-        self.c = {
-            "bg": (18, 18, 18),
-            "panel": (32, 32, 32),
-            "panel_hi": (48, 48, 48),
-            "panel_lo": (24, 24, 24),
-            "border": (96, 96, 96),
-            "border_lo": (64, 64, 64),
-            "text": (240, 240, 240),
-            "muted": (170, 170, 170),
-            "dim": (120, 120, 120),
-            "white": (245, 245, 245),
-            "black": (16, 16, 16),
-            "gold": (255, 215, 0),
-            "green": (100, 220, 100),
-        }
-
+        self.fonts = FontSystem()
+        self.ui = None
+        self._hovered_button = None
+        self._pressed_button = None
+        self._tooltip_text = None
+        self._tooltip_pos = None
+        self._tooltip_timer = 0
+        self._button_presses = {}
+        self._pulse_values = {}
         self.buttons = []
-        self.planner_cells = []      # clickable (rect, area_id, day) in planner
-        self.planner_widgets = []    # clickable (rect, callback) in planner tabs
+        self.planner_cells = []
+        self.planner_widgets = []
         self._planner_close = None
         self._setup_buttons()
 
-    # ----------------------------------------------------------- button setup
     def _setup_buttons(self):
         x = 14
         inner = HUD_W - 28
         half = (inner - 8) // 2
-        y = 326
+        y = 340
         self.buttons = [
-            {"rect": pygame.Rect(x, y, half, 30), "label": "Pause", "action": "pause"},
-            {"rect": pygame.Rect(x + half + 8, y, half, 30), "label": "1x", "action": "speed"},
-            {"rect": pygame.Rect(x, y + 38, inner, 30), "label": "Procure Vehicle", "action": "fleet_tab"},
-            {"rect": pygame.Rect(x, y + 74, inner, 30), "label": "Hire Crew", "cost": 2500, "action": "worker"},
-            {"rect": pygame.Rect(x, y + 110, inner, 30), "label": "Collection Planner", "action": "planner"},
+            {"rect": pygame.Rect(x, y, half, 34), "label": "Pause", "action": "pause"},
+            {"rect": pygame.Rect(x + half + 8, y, half, 34), "label": "1x", "action": "speed"},
+            {"rect": pygame.Rect(x, y + 42, inner, 34), "label": "Procure Vehicle", "action": "fleet_tab"},
+            {"rect": pygame.Rect(x, y + 80, inner, 34), "label": "Hire Crew", "cost": 2500, "action": "worker"},
+            {"rect": pygame.Rect(x, y + 118, inner, 34), "label": "Collection Planner", "action": "planner"},
         ]
 
-    # --------------------------------------------------------------- clicking
     def handle_click(self, pos):
         for btn in self.buttons:
             if btn["rect"].collidepoint(pos):
@@ -108,17 +356,15 @@ class UIManager:
         if self._planner_close and self._planner_close.collidepoint(pos):
             self.game.planner_open = False
             return True
-        # Tab buttons and in-tab controls register here.
         for rect, fn in self.planner_widgets:
             if rect.collidepoint(pos):
                 fn()
                 return True
-        # Day-grid cells (Rounds tab) reschedule a round.
         for rect, area_id, day in self.planner_cells:
             if rect.collidepoint(pos):
                 self.game.city.set_area_day(area_id, day)
                 return True
-        return True   # swallow all clicks while planner is open
+        return True
 
     def _do_action(self, action):
         eco = self.game.economy
@@ -146,26 +392,28 @@ class UIManager:
         self._insufficient_funds_flash = True
         self._flash_timer = 0
 
-    # ----------------------------------------------------------- draw helpers
-    def _panel(self, screen, x, y, w, h, fill=None, border=True):
-        pygame.draw.rect(screen, fill or self.c["panel"], pygame.Rect(x, y, w, h))
-        if border:
-            pygame.draw.rect(screen, self.c["border"], pygame.Rect(x, y, w, h), 1)
+    def _draw_button(self, screen, btn, ui):
+        rect = btn["rect"]
+        mouse = pygame.mouse.get_pos()
+        hovered = rect.collidepoint(mouse)
+        affordable = self.game.economy.budget >= btn["cost"] if "cost" in btn else True
+        label = btn["label"]
+        if "cost" in btn:
+            label = f"{btn['label']}  £{btn['cost']:,}"
+        if btn["action"] == "pause":
+            label = "Pause" if self.game.running else "Resume"
+        elif btn["action"] == "speed":
+            label = f"{self.game.speed}x Speed"
+        elif btn["action"] == "planner":
+            label = "Close Planner" if self.game.planner_open else "Collection Planner"
+        enabled = affordable
+        accent = btn["action"] in ("fleet_tab", "worker")
+        ui.button(rect, label, enabled=enabled, accent=accent, hovered=hovered)
 
-    def _text(self, screen, key, s, color, x, y):
-        screen.blit(self.fonts[key].render(s, True, color), (x, y))
-
-    def _text_right(self, screen, key, s, color, right_x, y):
-        surf = self.fonts[key].render(s, True, color)
-        screen.blit(surf, (right_x - surf.get_width(), y))
-
-    def _text_center(self, screen, key, s, color, cx, y):
-        surf = self.fonts[key].render(s, True, color)
-        screen.blit(surf, (cx - surf.get_width() // 2, y))
-
-    # ----------------------------------------------------------------- draw
     def draw(self, screen):
+        self.ui = UIPrimitives(screen, self.fonts)
         w, h = screen.get_size()
+        self._draw_procurement_bar(screen, w)
         self._draw_hud(screen, w, h)
         self._draw_event_banner(screen, w)
         self._draw_crisis_banner(screen, w, h)
@@ -174,385 +422,353 @@ class UIManager:
         if self.game.planner_open:
             self._draw_planner(screen, w, h)
         self._draw_toast(screen, w, h)
+        if self._tooltip_text and self._tooltip_timer > 0.3:
+            self.ui.tooltip(self._tooltip_pos[0], self._tooltip_pos[1], self._tooltip_text)
 
     def _draw_toast(self, screen, w, h):
         if not getattr(self.game, "toast", "") or self.game.toast_timer <= 0:
             return
         msg = self.game.toast
+        ui = self.ui
         pad = 16
-        surf = self.fonts["body_b"].render(msg, True, self.c["white"])
+        surf = ui.fonts.render("body_b", msg, ui.c.TEXT_PRIMARY)
         bw = surf.get_width() + pad * 2
-        bh = 34
+        bh = 40
         bx = HUD_W + (w - HUD_W - bw) // 2
-        by = h - 70
-        pygame.draw.rect(screen, self.c["panel_hi"], pygame.Rect(bx, by, bw, bh))
-        pygame.draw.rect(screen, self.c["white"], pygame.Rect(bx, by, bw, bh), 1)
-        pygame.draw.rect(screen, self.c["white"], pygame.Rect(bx, by, 4, bh))
+        by = h - 80
+        pygame.draw.rect(screen, (0, 0, 0, 60), pygame.Rect(bx + 2, by + 2, bw, bh), border_radius=6)
+        pygame.draw.rect(screen, ui.c.BG_CARD, pygame.Rect(bx, by, bw, bh), border_radius=6)
+        pygame.draw.rect(screen, ui.c.ACCENT_AMBER, pygame.Rect(bx, by, 4, bh), border_radius=6)
+        pygame.draw.rect(screen, ui.c.BORDER, pygame.Rect(bx, by, bw, bh), 1, border_radius=6)
         screen.blit(surf, (bx + pad, by + (bh - surf.get_height()) // 2))
+
+
+    def _draw_procurement_bar(self, screen, w):
+        """Show a notification bar at the top for pending vehicle orders."""
+        fleet = self.game.fleet
+        if not fleet.orders:
+            return
+        eco = self.game.economy
+        ui = self.ui
+        c = ui.c
+        today = eco.day
+
+        # Build lines for each pending order
+        lines = []
+        for o in fleet.orders:
+            rem = o.days_remaining(today)
+            if rem > 0:
+                name = o.vehicle.name
+                tier = getattr(o, 'display_tier_name', o.tier_id)
+                lines.append(f"{name} ({tier}) arriving in {rem} day{'s' if rem != 1 else ''}")
+
+        if not lines:
+            return
+
+        msg = "  |  ".join(lines)
+        pad = 16
+        surf = ui.fonts.render("body_b", msg, c.TEXT_PRIMARY)
+        bw = min(surf.get_width() + pad * 2, w - 40)
+        bh = 36
+        bx = (w - bw) // 2
+        by = 10
+
+        # Background
+        pygame.draw.rect(screen, (0, 0, 0, 80), pygame.Rect(bx + 2, by + 2, bw, bh), border_radius=6)
+        pygame.draw.rect(screen, c.BG_CARD, pygame.Rect(bx, by, bw, bh), border_radius=6)
+        pygame.draw.rect(screen, c.ACCENT_TEAL, pygame.Rect(bx, by, 4, bh), border_radius=6)
+        pygame.draw.rect(screen, c.BORDER, pygame.Rect(bx, by, bw, bh), 1, border_radius=6)
+
+        # Truncate text if too wide
+        text_x = bx + pad
+        text_y = by + (bh - surf.get_height()) // 2
+        if surf.get_width() > bw - pad * 2:
+            # Simple truncation with ellipsis
+            ellipsis = ui.fonts.render("body_b", "...", c.TEXT_PRIMARY)
+            max_w = bw - pad * 2 - ellipsis.get_width()
+            clip_surf = pygame.Surface((max_w, surf.get_height()), pygame.SRCALPHA)
+            clip_surf.blit(surf, (0, 0))
+            screen.blit(clip_surf, (text_x, text_y))
+            screen.blit(ellipsis, (text_x + max_w, text_y))
+        else:
+            screen.blit(surf, (text_x, text_y))
 
     def _draw_hud(self, screen, w, h):
         eco = self.game.economy
         fleet = self.game.fleet
         city = self.game.city
+        ui = self.ui
+        c = ui.c
         x = 14
         right = HUD_W - 14
-
-        pygame.draw.rect(screen, (14, 14, 14), pygame.Rect(0, 0, HUD_W, h))
-        pygame.draw.line(screen, self.c["border"], (HUD_W, 0), (HUD_W, h), 1)
-
-        y = 12
-        #self._text(screen, "title", "Waste Borough", self.c["text"], x, y)
-        y += 28
-
-        self._text(screen, "body_b", f"Day {eco.day}", self.c["text"], x, y)
-        self._text(screen, "body", eco.get_day_of_week_name(), self.c["muted"], x + 64, y)
+        pygame.draw.rect(screen, c.BG_DEEP, pygame.Rect(0, 0, HUD_W, h))
+        pygame.draw.line(screen, c.BORDER_SUBTLE, (HUD_W, 0), (HUD_W, h), 1)
+        y = 16
+        ui.text("display_sub", "Waste Borough", c.ACCENT_AMBER, x, y)
+        y += 32
+        ui.text("h2", f"Day {eco.day}", c.TEXT_PRIMARY, x, y)
+        ui.text("body", eco.get_day_of_week_name(), c.TEXT_MUTED, x + 80, y + 4)
         trend = eco.budget_trend
         if trend != 0:
-            sign = "+" if trend >= 0 else "-"
-            self._text_right(screen, "small", f"{sign}GBP{abs(int(trend)):,}",
-                             self.c["text"] if trend >= 0 else self.c["muted"], right, y + 1)
-        y += 22
-
+            sign = "+" if trend >= 0 else ""
+            trend_color = c.STATUS_GOOD if trend >= 0 else c.STATUS_BAD
+            ui.text("body_s", f"{sign}£{int(trend):,}", trend_color, right, y + 4, align="right")
+        y += 28
         bar_w = HUD_W - 28
-        pygame.draw.rect(screen, (50, 50, 50), pygame.Rect(x, y, bar_w, 4))
         p = eco.get_day_progress()
-        pygame.draw.rect(screen, self.c["white"], pygame.Rect(x, y, int(bar_w * p), 4))
+        ui.progress_bar(x, y, bar_w, 5, int(p * 100), 100, color=c.ACCENT_AMBER, show_text=False)
         y += 14
-
-        # Budget card
         crisis = eco.is_budget_crisis()
-        self._panel(screen, x, y, HUD_W - 28, 44,
-                    fill=self.c["panel_lo"] if crisis else self.c["panel_hi"])
-        self._text(screen, "tiny", "BUDGET", self.c["muted"], x + 10, y + 6)
-        self._text(screen, "big", f"GBP {int(eco.budget):,}",
-                   self.c["white"] if not crisis else self.c["muted"], x + 10, y + 18)
-        y += 52
-
-        # Satisfaction card
-        self._panel(screen, x, y, HUD_W - 28, 38, fill=self.c["panel"])
-        self._text(screen, "tiny", "PUBLIC SATISFACTION", self.c["muted"], x + 10, y + 5)
-        self._text_right(screen, "small",
-                         f"{int(eco.satisfaction)}%  {eco.satisfaction_label()}",
-                         self.c["text"], right - 2, y + 4)
-        sb_w = HUD_W - 48
-        pygame.draw.rect(screen, (50, 50, 50), pygame.Rect(x + 10, y + 24, sb_w, 6))
-        pygame.draw.rect(screen, self.c["white"],
-                         pygame.Rect(x + 10, y + 24, int(sb_w * eco.satisfaction / 100), 6))
-        y += 48
-
-        # Win progress (if not yet won)
+        card_h = 56
+        ui.card(x, y, HUD_W - 28, card_h, hover=False, selected=crisis)
+        ui.label("BUDGET", x + 12, y + 8)
+        budget_color = c.STATUS_BAD if crisis else c.TEXT_PRIMARY
+        ui.text("display", f"£{int(eco.budget):,}", budget_color, x + 12, y + 24)
+        if crisis:
+            ui.status_pill(right - 80, y + 8, "CRISIS", "bad")
+        y += card_h + 10
+        ui.card(x, y, HUD_W - 28, 50)
+        ui.label("PUBLIC SATISFACTION", x + 12, y + 6)
+        sat_color = c.STATUS_GOOD if eco.satisfaction >= 70 else c.STATUS_WARN if eco.satisfaction >= 40 else c.STATUS_BAD
+        ui.text("h2", f"{int(eco.satisfaction)}%", sat_color, right - 12, y + 4, align="right")
+        ui.text("body_s", eco.satisfaction_label(), c.TEXT_MUTED, right - 12, y + 26, align="right")
+        ui.stat_bar(x + 12, y + 44, HUD_W - 52, eco.satisfaction, 100)
+        y += 58
         if not eco.has_won:
-            self._panel(screen, x, y, HUD_W - 28, 32, fill=self.c["panel_lo"])
-            self._text(screen, "tiny", "PERFECT SERVICE STREAK", self.c["muted"], x + 10, y + 4)
+            ui.card(x, y, HUD_W - 28, 44, selected=False)
+            ui.label("PERFECT SERVICE STREAK", x + 12, y + 6)
             streak = eco.perfect_days_streak
             wp = eco.win_progress()
-            self._text_right(screen, "small", f"{streak}/7 days", self.c["green"], right - 2, y + 4)
-            pygame.draw.rect(screen, (50, 50, 50), pygame.Rect(x + 10, y + 20, sb_w, 4))
-            pygame.draw.rect(screen, self.c["green"],
-                             pygame.Rect(x + 10, y + 20, int(sb_w * wp), 4))
-            y += 38
+            ui.text("body_b", f"{streak}/7", c.STATUS_GOOD, right - 12, y + 6, align="right")
+            ui.progress_bar(x + 12, y + 28, HUD_W - 52, 4, streak, 7, color=c.STATUS_GOOD, show_text=False)
+            y += 52
         else:
-            # Show "CHAMPION" badge
-            self._panel(screen, x, y, HUD_W - 28, 32, fill=self.c["panel_lo"])
-            self._text(screen, "tiny", "STATUS", self.c["muted"], x + 10, y + 4)
-            self._text_right(screen, "small", "CHAMPION", self.c["gold"], right - 2, y + 4)
-            pygame.draw.rect(screen, self.c["gold"], pygame.Rect(x + 10, y + 20, sb_w, 4))
-            y += 38
-
+            ui.card(x, y, HUD_W - 28, 44, selected=True)
+            ui.label("STATUS", x + 12, y + 6)
+            ui.text("h2", "CHAMPION", c.ACCENT_AMBER, right - 12, y + 6, align="right")
+            ui.progress_bar(x + 12, y + 28, HUD_W - 52, 4, 7, 7, color=c.ACCENT_AMBER, show_text=False)
+            y += 52
+        ui.card(x, y, HUD_W - 28, 100)
         stats = [
-            ("Population", f"{city.population:,}"),
-            ("Properties", f"{city.property_count:,}"),
-            ("Lorries", str(len(fleet.trucks))),
-            ("Crew", str(fleet.workers)),
+            ("Population", f"{city.population:,}", c.TEXT_SECONDARY),
+            ("Properties", f"{city.property_count:,}", c.TEXT_SECONDARY),
+            ("Lorries", str(len(fleet.trucks)), c.ACCENT_TEAL),
+            ("Crew", str(fleet.workers), c.ACCENT_TEAL),
         ]
-        for label, value in stats:
-            self._text(screen, "body", label, self.c["muted"], x, y)
-            self._text_right(screen, "body_b", value, self.c["text"], right, y)
-            y += 20
-
-        # Active event pill
+        sy = y + 10
+        for label, value, val_color in stats:
+            ui.label(label, x + 12, sy)
+            ui.value(value, right - 12, sy, val_color, align="right")
+            sy += 22
+        y += 110
         if eco.active_event and eco.active_event.get("duration", 0) > 0:
-            self._panel(screen, x, y, HUD_W - 28, 24, fill=self.c["panel_hi"])
+            ui.card(x, y, HUD_W - 28, 32, selected=True)
             txt = f"{eco.active_event['name']} - {eco.active_event['remaining_days']}d"
-            self._text(screen, "small", txt, self.c["text"], x + 8, y + 4)
-        y += 30
-
-        # Buttons
-        self._section_header(screen, x, 312, "SIMULATION")
+            ui.text("body_s", txt, c.ACCENT_AMBER, x + 12, y + 8)
+            y += 40
+        y += 6
+        ui.section_header(x, y, "CONTROLS", w=HUD_W - 28)
+        y += 24
         for btn in self.buttons:
-            self._draw_button(screen, btn)
-
-        # Collections summary
-        cy = 326 + 110 + 40
-        self._section_header(screen, x, cy, "COLLECTIONS")
-        cy += 20
+            btn["rect"].y = y + (self.buttons.index(btn) * 38)
+            self._draw_button(screen, btn, ui)
+        y = self.buttons[-1]["rect"].bottom + 16
+        ui.section_header(x, y, "COLLECTIONS", w=HUD_W - 28)
+        y += 24
         due = fleet.get_total_full_bins()
         unscheduled = fleet.get_unscheduled_overflows()
-
-        self._text(screen, "body", "Bins due today", self.c["muted"], x, cy)
-        self._text_right(screen, "body_b", str(due), self.c["text"], right, cy)
-        cy += 20
-        self._text(screen, "body", "Overflowing", self.c["muted"], x, cy)
-        self._text_right(screen, "body_b", str(unscheduled),
-                         self.c["white"] if unscheduled else self.c["text"], right, cy)
-        cy += 20
-        self._text(screen, "body", "Complaints (today)", self.c["muted"], x, cy)
-        self._text_right(screen, "body_b", str(eco.complaints_today), self.c["text"], right, cy)
-        cy += 26
-
-        help_y = h - 78
-        self._section_header(screen, x, help_y, "CONTROLS")
-        help_y += 20
+        ui.label("Bins due today", x, y)
+        ui.value(str(due), right, y, c.TEXT_PRIMARY, align="right")
+        y += 22
+        ui.label("Overflowing", x, y)
+        overflow_color = c.STATUS_BAD if unscheduled > 0 else c.TEXT_SECONDARY
+        ui.value(str(unscheduled), right, y, overflow_color, align="right")
+        y += 22
+        ui.label("Complaints (today)", x, y)
+        ui.value(str(eco.complaints_today), right, y, c.TEXT_PRIMARY, align="right")
+        y += 26
+        help_y = h - 90
+        ui.section_header(x, help_y, "CONTROLS", w=HUD_W - 28)
+        help_y += 22
         for line in ["WASD / drag - pan,  scroll - zoom",
                      "Tab - planner,  G - round overlay",
                      "Click a building - inspect"]:
-            self._text(screen, "small", line, self.c["dim"], x, help_y)
+            ui.text("body_xs", line, c.TEXT_DIM, x, help_y)
             help_y += 16
 
-    def _section_header(self, screen, x, y, label):
-        self._text(screen, "header", label, self.c["dim"], x, y)
-        pygame.draw.line(screen, self.c["border_lo"],
-                         (x + self.fonts["header"].size(label)[0] + 8, y + 7),
-                         (HUD_W - 14, y + 7), 1)
-
-    def _draw_button(self, screen, btn):
-        rect = btn["rect"]
-        mouse = pygame.mouse.get_pos()
-        hovered = rect.collidepoint(mouse)
-        affordable = self.game.economy.budget >= btn["cost"] if "cost" in btn else True
-
-        if "cost" in btn and not affordable:
-            fill, border, text_col = self.c["panel_lo"], self.c["border_lo"], self.c["dim"]
-        elif hovered:
-            fill, border, text_col = (66, 66, 66), self.c["white"], self.c["white"]
-        else:
-            fill, border, text_col = self.c["panel_hi"], self.c["border"], self.c["text"]
-
-        pygame.draw.rect(screen, fill, rect)
-        pygame.draw.rect(screen, border, rect, 1)
-
-        label = btn["label"]
-        if "cost" in btn:
-            label = f"{btn['label']}  GBP{btn['cost']:,}"
-        if btn["action"] == "pause":
-            label = "Pause" if self.game.running else "Resume"
-        elif btn["action"] == "speed":
-            label = f"{self.game.speed}x Speed"
-        elif btn["action"] == "planner":
-            label = "Close Planner" if self.game.planner_open else "Collection Planner"
-
-        surf = self.fonts["body_b"].render(label, True, text_col)
-        screen.blit(surf, surf.get_rect(center=rect.center))
-
-    # ----------------------------------------------------------- top banners
     def _draw_event_banner(self, screen, w):
         if not self._event_visible or not self._current_event:
             return
+        ui = self.ui
+        c = ui.c
         bw = min(520, max(360, w // 2))
-        bh = 74
+        bh = 80
         bx = (w - bw) // 2
         progress = min(1.0, self._event_timer_active / 0.45)
         if self._event_timer_active > self._event_duration - 0.45:
             progress = 1.0 - min(1.0, (self._event_timer_active - (self._event_duration - 0.45)) / 0.45)
-        by = int(-90 + (118 * progress))
-
-        pygame.draw.rect(screen, self.c["panel"], pygame.Rect(bx, by, bw, bh))
-        pygame.draw.rect(screen, self.c["white"], pygame.Rect(bx, by, bw, bh), 2)
-        pygame.draw.rect(screen, self.c["white"], pygame.Rect(bx, by, 5, bh))
-
+        by = int(-100 + (130 * progress))
+        pygame.draw.rect(screen, (0, 0, 0, 80), pygame.Rect(bx + 3, by + 3, bw, bh), border_radius=8)
+        pygame.draw.rect(screen, c.BG_CARD, pygame.Rect(bx, by, bw, bh), border_radius=8)
+        pygame.draw.rect(screen, c.ACCENT_AMBER, pygame.Rect(bx, by, 5, bh), border_radius=8)
+        pygame.draw.rect(screen, c.BORDER, pygame.Rect(bx, by, bw, bh), 1, border_radius=8)
         e = self._current_event
-        self._text(screen, "title", e["name"], self.c["white"], bx + 18, by + 12)
-        self._text(screen, "body", e["desc"], self.c["text"], bx + 18, by + 42)
+        ui.text("h2", e["name"], c.ACCENT_AMBER, bx + 20, by + 14)
+        ui.text("body", e["desc"], c.TEXT_SECONDARY, bx + 20, by + 44)
 
     def _draw_crisis_banner(self, screen, w, h):
         if not self._insufficient_funds_flash and not self.game.economy.is_budget_crisis():
             return
-        text = "Insufficient funds" if self._insufficient_funds_flash else "Budget crisis - you are overspending"
-        bw, bh = 460, 38
+        ui = self.ui
+        text = "Insufficient funds" if self._insufficient_funds_flash else "Budget crisis - overspending detected"
+        bw, bh = 480, 42
         bx = (w - bw) // 2
-        pygame.draw.rect(screen, (60, 60, 60), pygame.Rect(bx, h - 54, bw, bh))
-        pygame.draw.rect(screen, self.c["white"], pygame.Rect(bx, h - 54, bw, bh), 2)
-        surf = self.fonts["body_b"].render(text, True, self.c["white"])
-        screen.blit(surf, surf.get_rect(center=(w // 2, h - 35)))
+        by = h - 60
+        pygame.draw.rect(screen, (0, 0, 0, 80), pygame.Rect(bx + 2, by + 2, bw, bh), border_radius=6)
+        pygame.draw.rect(screen, ui.c.BG_CARD, pygame.Rect(bx, by, bw, bh), border_radius=6)
+        pygame.draw.rect(screen, ui.c.STATUS_BAD, pygame.Rect(bx, by, 4, bh), border_radius=6)
+        pygame.draw.rect(screen, ui.c.STATUS_BAD, pygame.Rect(bx, by, bw, bh), 1, border_radius=6)
+        surf = ui.fonts.render("body_b", text, ui.c.STATUS_BAD)
+        screen.blit(surf, surf.get_rect(center=(w // 2, by + bh // 2)))
 
     def _draw_win_banner(self, screen, w, h):
-        """Draw win celebration banner when player achieves 7 perfect days."""
         eco = self.game.economy
         if not eco.has_won:
             return
-
-        # Fade out over time
-        eco.win_celebration_timer -= 0.016  # approx 60fps
+        eco.win_celebration_timer -= 0.016
         if eco.win_celebration_timer <= 0:
             return
-
         alpha = min(1.0, eco.win_celebration_timer / 3.0)
         if alpha <= 0:
             return
-
+        ui = self.ui
         bw = min(600, w - 100)
-        bh = 120
+        bh = 130
         bx = (w - bw) // 2
         by = (h - bh) // 2 - 50
+        pygame.draw.rect(screen, (35, 30, 18), pygame.Rect(bx, by, bw, bh), border_radius=10)
+        pygame.draw.rect(screen, ui.c.ACCENT_AMBER, pygame.Rect(bx, by, bw, bh), 2, border_radius=10)
+        title = ui.fonts.render("display", "BOROUGH CHAMPION", ui.c.ACCENT_AMBER)
+        screen.blit(title, title.get_rect(center=(w // 2, by + 40)))
+        sub = ui.fonts.render("h2", f"7 consecutive days with zero complaints! Day {eco.win_day}.", ui.c.TEXT_PRIMARY)
+        screen.blit(sub, sub.get_rect(center=(w // 2, by + 75)))
+        hint = ui.fonts.render("body_s", "Keep it up to maintain your perfect record!", ui.c.TEXT_MUTED)
+        screen.blit(hint, hint.get_rect(center=(w // 2, by + 100)))
 
-        # Gold background with fade
-        bg_color = (40, 35, 20)
-        pygame.draw.rect(screen, bg_color, pygame.Rect(bx, by, bw, bh))
-        pygame.draw.rect(screen, self.c["gold"], pygame.Rect(bx, by, bw, bh), 3)
-
-        # Trophy text
-        title = self.fonts["win"].render("★ BOROUGH CHAMPION ★", True, self.c["gold"])
-        screen.blit(title, title.get_rect(center=(w // 2, by + 35)))
-
-        sub = self.fonts["win_sub"].render(
-            f"7 consecutive days with zero complaints! Achieved on Day {eco.win_day}.",
-            True, self.c["white"]
-        )
-        screen.blit(sub, sub.get_rect(center=(w // 2, by + 70)))
-
-        hint = self.fonts["small"].render(
-            "Keep it up to maintain your perfect record!",
-            True, self.c["muted"]
-        )
-        screen.blit(hint, hint.get_rect(center=(w // 2, by + 95)))
-
-    # ----------------------------------------------------------- inspect panel
     def _draw_inspect_panel(self, screen, w, h):
         if not self.game.selected_tile or self.game.planner_open:
             return
-        pw, ph = 256, 240
-        px = w - pw - 16
-        py = h - ph - 16
-        self._panel(screen, px, py, pw, ph, fill=self.c["panel"])
-
+        ui = self.ui
+        c = ui.c
+        pw, ph = 280, 260
+        px = w - pw - 20
+        py = h - ph - 20
+        pygame.draw.rect(screen, (0, 0, 0, 60), pygame.Rect(px + 3, py + 3, pw, ph), border_radius=8)
+        ui.card(px, py, pw, ph)
         tile = self.game.selected_tile["tile"]
         tx, ty = self.game.selected_tile["x"], self.game.selected_tile["y"]
-        rx = px + 14
-        rr = px + pw - 14
-
+        rx = px + 16
+        rr = px + pw - 16
         if tile.type == "road":
-            self._text(screen, "header", "Road", self.c["text"], rx, py + 12)
-            self._text(screen, "small", "Part of the collection network.",
-                       self.c["muted"], rx, py + 40)
+            ui.text("h2", "Road", c.TEXT_PRIMARY, rx, py + 14)
+            ui.text("body_s", "Part of the collection network.", c.TEXT_MUTED, rx, py + 44)
             return
-
         if tile.type == "green":
-            self._text(screen, "header", "Green Space", self.c["text"], rx, py + 12)
-            self._text(screen, "small", "Park or garden area.",
-                       self.c["muted"], rx, py + 40)
+            ui.text("h2", "Green Space", c.TEXT_PRIMARY, rx, py + 14)
+            ui.text("body_s", "Park or garden area.", c.TEXT_MUTED, rx, py + 44)
             return
-
         if tile.type == "landfill":
-            self._text(screen, "header", "Landfill Site", self.c["text"], rx, py + 12)
-            self._text(screen, "small", "Where full lorries tip their loads.",
-                       self.c["muted"], rx, py + 40)
-            self._text(screen, "small", "Disposal gate fees are charged here,",
-                       self.c["muted"], rx, py + 62)
-            self._text(screen, "small", "driven by landfill tax on residual waste.",
-                       self.c["muted"], rx, py + 80)
+            ui.text("h2", "Landfill Site", c.TEXT_PRIMARY, rx, py + 14)
+            ui.text("body_s", "Where full lorries tip their loads.", c.TEXT_MUTED, rx, py + 44)
+            ui.text("body_xs", "Disposal gate fees charged here.", c.TEXT_DIM, rx, py + 66)
             return
-
         label = STYLE_LABELS.get(tile.building_style, tile.type.title())
-        self._text(screen, "header", label, self.c["text"], rx, py + 12)
-        self._text_right(screen, "tiny", f"({tx}, {ty})", self.c["dim"], rr, py + 14)
-
+        ui.text("h2", label, c.TEXT_PRIMARY, rx, py + 12)
+        ui.text("caption", f"({tx}, {ty})", c.TEXT_DIM, rr, py + 14, align="right")
         area = self.game.city.get_area(tile.area_id)
-        row = py + 38
-        lh = 22
-
+        row = py + 44
+        lh = 24
         if area:
-            self._text(screen, "body", "Round", self.c["muted"], rx, row)
-            self._text_right(screen, "body_b", area.name, self.c["text"], rr, row)
+            ui.label("Round", rx, row)
+            ui.value(area.name, rr, row, c.ACCENT_TEAL, align="right")
             row += lh
-            self._text(screen, "body", "Collection day", self.c["muted"], rx, row)
-            self._text_right(screen, "body_b", DAY_NAMES[area.collection_day], self.c["text"], rr, row)
+            ui.label("Collection day", rx, row)
+            ui.value(DAY_NAMES[area.collection_day], rr, row, c.TEXT_PRIMARY, align="right")
             row += lh
-            # Route type with color
             rt = area.route_type
             rt_label = ROUTE_TYPE_LABELS.get(rt, rt)
-            rt_color = ROUTE_TYPE_COLORS.get(rt, self.c["text"])
-            self._text(screen, "body", "Route type", self.c["muted"], rx, row)
-            self._text_right(screen, "body_b", rt_label, rt_color, rr, row)
-            row += lh + 4
-
+            rt_color = ROUTE_TYPE_COLORS.get(rt, c.TEXT_SECONDARY)
+            ui.label("Route type", rx, row)
+            ui.value(rt_label, rr, row, rt_color, align="right")
+            row += lh + 6
         pct = int(tile.bin_fill)
         if pct < 50:
             status = "Low"
+            status_type = "good"
         elif pct < 75:
             status = "Filling up"
+            status_type = "neutral"
         elif pct < 90:
             status = "Nearly full"
+            status_type = "warn"
         else:
             status = "Overflowing"
-        self._text(screen, "body", "Bin fill", self.c["muted"], rx, row)
-        self._text_right(screen, "body_b", f"{pct}%  {status}", self.c["text"], rr, row)
-        row += lh
-        pygame.draw.rect(screen, (50, 50, 50), pygame.Rect(rx, row, pw - 28, 6))
-        pygame.draw.rect(screen, self.c["white"], pygame.Rect(rx, row, int((pw - 28) * pct / 100), 6))
-        row += 16
-
+            status_type = "bad"
+        ui.label("Bin fill", rx, row)
+        ui.value(f"{pct}%", rr, row, c.TEXT_PRIMARY, align="right")
+        row += 18
+        ui.progress_bar(rx, row, pw - 32, 8, pct, 100,
+                       color=c.STATUS_BAD if pct > 85 else c.STATUS_WARN if pct > 60 else c.STATUS_GOOD,
+                       show_text=False)
+        ui.status_pill(rr - 70, row - 16, status, status_type)
+        row += 22
         if tile.population:
-            self._text(screen, "body", "Residents", self.c["muted"], rx, row)
-            self._text_right(screen, "body", str(tile.population), self.c["text"], rr, row)
+            ui.label("Residents", rx, row)
+            ui.value(str(tile.population), rr, row, c.TEXT_SECONDARY, align="right")
             row += lh
+        ui.text("body_xs", "Open planner (Tab) to reschedule.", c.TEXT_DIM, rx, py + ph - 24)
 
-        self._text(screen, "small", "Open the planner (Tab) to reschedule rounds.",
-                   self.c["dim"], rx, py + ph - 24)
-
-    # ----------------------------------------------------------- planner
     def _draw_planner(self, screen, w, h):
-        """Tabbed management console. Dispatches to the active tab body."""
-        # Solid scrim over the world (no alpha, stays readable).
-        pygame.draw.rect(screen, (10, 10, 10), pygame.Rect(0, 0, w, h))
-
-        # Reset per-frame clickable registries; tab bodies repopulate them.
+        ui = self.ui
+        c = ui.c
+        scrim = pygame.Surface((w, h), pygame.SRCALPHA)
+        scrim.fill((14, 16, 22, 240))
+        screen.blit(scrim, (0, 0))
         self.planner_widgets = []
         self.planner_cells = []
-
         tab = getattr(self.game, "planner_tab", "rounds")
-
-        # ------- panel geometry (fixed, generous; tabs lay out inside) -------
-        pw, ph = 760, 540
+        pw, ph = 800, 580
         px = (w - pw) // 2
         py = (h - ph) // 2
-        self._panel(screen, px, py, pw, ph, fill=self.c["panel"])
-
-        # ------- title + close -------
-        self._text(screen, "title", "Borough Management", self.c["text"], px + 20, py + 14)
-        self._planner_close = pygame.Rect(px + pw - 36, py + 12, 24, 24)
-        pygame.draw.rect(screen, self.c["panel_hi"], self._planner_close)
-        pygame.draw.rect(screen, self.c["border"], self._planner_close, 1)
-        self._text_center(screen, "body_b", "x", self.c["text"],
-                          self._planner_close.centerx, self._planner_close.y + 3)
-
-        # ------- tab bar -------
-        tab_y = py + 44
-        tab_x = px + 20
+        pygame.draw.rect(screen, (0, 0, 0, 100), pygame.Rect(px + 4, py + 4, pw, ph), border_radius=10)
+        ui.card(px, py, pw, ph, selected=False)
+        ui.text("h1", "Borough Management", c.TEXT_PRIMARY, px + 24, py + 16)
+        self._planner_close = pygame.Rect(px + pw - 44, py + 14, 32, 32)
+        ui.icon_button(self._planner_close, "X", hovered=False)
+        tab_y = py + 56
+        tab_x = px + 24
         for key, label in PLANNER_TABS:
-            tw = self.fonts["body_b"].size(label)[0] + 28
-            rect = pygame.Rect(tab_x, tab_y, tw, 28)
+            tw = ui.fonts.size("body_b", label)[0] + 32
+            rect = pygame.Rect(tab_x, tab_y, tw, 32)
             active = (key == tab)
-            fill = self.c["panel_hi"] if active else self.c["panel_lo"]
-            pygame.draw.rect(screen, fill, rect)
-            pygame.draw.rect(screen, self.c["white"] if active else self.c["border_lo"], rect, 1)
-            self._text_center(screen, "body_b", label,
-                              self.c["white"] if active else self.c["muted"],
-                              rect.centerx, tab_y + 6)
             if active:
-                pygame.draw.rect(screen, self.c["white"],
-                                 pygame.Rect(rect.x, rect.bottom - 2, rect.w, 2))
-            self.planner_widgets.append(
-                (rect, (lambda k=key: self.game.open_planner_tab(k))))
-            tab_x += tw + 6
-        pygame.draw.line(screen, self.c["border_lo"],
-                         (px + 20, tab_y + 30), (px + pw - 20, tab_y + 30), 1)
-
-        # ------- body region -------
-        bx = px + 20
-        by = tab_y + 42
-        bw = pw - 40
-        bh = (py + ph - 16) - by
-
+                pygame.draw.rect(screen, c.BG_ACTIVE, rect, border_radius=6)
+                pygame.draw.rect(screen, c.ACCENT_AMBER, rect, 2, border_radius=6)
+                ui.text("body_b", label, c.ACCENT_AMBER, rect.centerx, tab_y + 8, align="center")
+                pygame.draw.rect(screen, c.ACCENT_AMBER, pygame.Rect(rect.x, rect.bottom - 3, rect.w, 3), border_radius=2)
+            else:
+                mouse = pygame.mouse.get_pos()
+                hover = rect.collidepoint(mouse)
+                bg = c.BG_HOVER if hover else c.BG_CARD
+                pygame.draw.rect(screen, bg, rect, border_radius=6)
+                pygame.draw.rect(screen, c.BORDER_SUBTLE, rect, 1, border_radius=6)
+                ui.text("body_b", label, c.TEXT_MUTED if not hover else c.TEXT_SECONDARY, rect.centerx, tab_y + 8, align="center")
+            self.planner_widgets.append((rect, (lambda k=key: self.game.open_planner_tab(k))))
+            tab_x += tw + 8
+        bx = px + 24
+        by = tab_y + 44
+        bw = pw - 48
+        bh = (py + ph - 20) - by
         if tab == "rounds":
             self._tab_rounds(screen, bx, by, bw, bh)
         elif tab == "waste":
@@ -564,374 +780,252 @@ class UIManager:
         elif tab == "data":
             self._tab_data(screen, bx, by, bw, bh)
 
-    # ----------------------------------------------------------- planner: util
-    def _pbtn(self, screen, rect, label, fn, enabled=True, fkey="body_b",
-              fill=None, accent=False):
-        """Draw a clickable button and register it (if enabled)."""
+    def _pbtn(self, screen, rect, label, fn, enabled=True, fkey="body_b", fill=None, accent=False):
+        ui = self.ui
         mouse = pygame.mouse.get_pos()
         hovered = rect.collidepoint(mouse) and enabled
-        if not enabled:
-            bg, bd, tc = self.c["panel_lo"], self.c["border_lo"], self.c["dim"]
-        elif hovered:
-            bg, bd, tc = (66, 66, 66), self.c["white"], self.c["white"]
-        elif accent:
-            bg, bd, tc = self.c["panel_hi"], self.c["white"], self.c["white"]
-        else:
-            bg, bd, tc = (fill or self.c["panel_hi"]), self.c["border"], self.c["text"]
-        pygame.draw.rect(screen, bg, rect)
-        pygame.draw.rect(screen, bd, rect, 1)
-        surf = self.fonts[fkey].render(label, True, tc)
-        screen.blit(surf, surf.get_rect(center=rect.center))
+        ui.button(rect, label, enabled=enabled, accent=accent, hovered=hovered)
         if enabled:
             self.planner_widgets.append((rect, fn))
 
-    def _stepper(self, screen, x, y, label, value_str, dec_fn, inc_fn,
-                 label_w=190, val_w=92):
-        """A '- value +' control with a label. Returns next y."""
-        self._text(screen, "body", label, self.c["muted"], x, y + 4)
-        minus = pygame.Rect(x + label_w, y, 26, 24)
-        valr = pygame.Rect(minus.right + 4, y, val_w, 24)
-        plus = pygame.Rect(valr.right + 4, y, 26, 24)
-        self._pbtn(screen, minus, "-", dec_fn, fkey="body_b")
-        pygame.draw.rect(screen, self.c["panel_lo"], valr)
-        pygame.draw.rect(screen, self.c["border_lo"], valr, 1)
-        self._text_center(screen, "mono_b", value_str, self.c["text"],
-                          valr.centerx, y + 5)
-        self._pbtn(screen, plus, "+", inc_fn, fkey="body_b")
-        return y + 32
+    def _stepper(self, screen, x, y, label, value_str, dec_fn, inc_fn, label_w=190, val_w=92):
+        ui = self.ui
+        ui.label(label, x, y + 6)
+        minus = pygame.Rect(x + label_w, y, 28, 28)
+        valr = pygame.Rect(minus.right + 4, y, val_w, 28)
+        plus = pygame.Rect(valr.right + 4, y, 28, 28)
+        ui.icon_button(minus, "-", hovered=False)
+        ui.inset_panel(valr.x, valr.y, valr.w, valr.h)
+        ui.text("mono_b", value_str, ui.c.TEXT_PRIMARY, valr.centerx, valr.y + 6, align="center")
+        ui.icon_button(plus, "+", hovered=False)
+        self.planner_widgets.append((minus, dec_fn))
+        self.planner_widgets.append((plus, inc_fn))
+        return y + 36
 
-    # ----------------------------------------------------------- planner: ROUNDS
     def _tab_rounds(self, screen, x, y, w, h):
+        ui = self.ui
+        c = ui.c
         eco = self.game.economy
         city = self.game.city
         fleet = self.game.fleet
         today = eco.get_day_of_week()
         week = eco.week_index
-
-        self._text(screen, "small",
-                   "Click a weekday to move a round. FREQ toggles weekly / fortnightly.",
-                   self.c["muted"], x, y)
-        ty = y + 22
-
-        name_w = 150
-        day_w = 34
-        freq_w = 84
-        type_w = 70
+        ui.text("body_s", "Click a weekday to move a round. FREQ toggles weekly/fortnightly.", c.TEXT_MUTED, x, y)
+        ty = y + 24
+        name_w = 160
+        day_w = 38
+        freq_w = 90
+        type_w = 80
         left_cols = name_w + 7 * day_w + freq_w + type_w
-        rest = {"props": 54, "due": 56, "status": 96}
-
-        # header
-        self._text(screen, "tiny", "ROUND", self.c["dim"], x, ty)
+        rest = {"props": 60, "due": 60, "status": 110}
+        ui.label("ROUND", x, ty)
         cxp = x + name_w
         for i, d in enumerate(DAY_NAMES):
-            cell = pygame.Rect(cxp + i * day_w, ty - 2, day_w, 16)
+            cell = pygame.Rect(cxp + i * day_w, ty - 2, day_w, 18)
             if i == today:
-                pygame.draw.rect(screen, self.c["panel_hi"], cell)
-            self._text_center(screen, "tiny", d,
-                              self.c["white"] if i == today else self.c["dim"],
-                              cell.centerx, ty)
+                pygame.draw.rect(screen, c.BG_ACTIVE, cell, border_radius=3)
+            ui.text("caption", d, c.ACCENT_AMBER if i == today else c.TEXT_DIM, cell.centerx, ty, align="center")
         fx = cxp + 7 * day_w
-        self._text_center(screen, "tiny", "FREQ", self.c["dim"], fx + freq_w // 2, ty)
+        ui.text("caption", "FREQ", c.TEXT_DIM, fx + freq_w // 2, ty, align="center")
         tx = fx + freq_w
-        self._text_center(screen, "tiny", "TYPE", self.c["dim"], tx + type_w // 2, ty)
+        ui.text("caption", "TYPE", c.TEXT_DIM, tx + type_w // 2, ty, align="center")
         sx = tx + type_w
         for label, key in (("PROPS", "props"), ("LEFT", "due"), ("STATUS", "status")):
-            self._text_center(screen, "tiny", label, self.c["dim"], sx + rest[key] // 2, ty)
+            ui.text("caption", label, c.TEXT_DIM, sx + rest[key] // 2, ty, align="center")
             sx += rest[key]
-        ty += 18
-        pygame.draw.line(screen, self.c["border_lo"],
-                         (x, ty), (x + left_cols + sum(rest.values()), ty), 1)
-        ty += 4
-
+        ty += 20
+        ui.h_line(x, ty, left_cols + sum(rest.values()))
+        ty += 6
         per_day_rounds = [0] * 7
         for area in city.areas:
             st = city.area_stats(area.id, today, fleet.service_threshold, week)
             if not st:
                 continue
             per_day_rounds[area.collection_day] += 1
-            rowrect = pygame.Rect(x, ty - 2, left_cols + sum(rest.values()), 22)
+            rowrect = pygame.Rect(x, ty - 2, left_cols + sum(rest.values()), 26)
             if st["is_today"]:
-                pygame.draw.rect(screen, self.c["panel_lo"], rowrect)
-            self._text(screen, "small", area.name, self.c["text"], x, ty)
-
+                pygame.draw.rect(screen, (40, 50, 65), rowrect, border_radius=3)
+            ui.text("body_s", area.name, c.TEXT_PRIMARY, x, ty + 2)
             for i in range(7):
-                cell = pygame.Rect(cxp + i * day_w + 3, ty - 1, day_w - 6, 18)
+                cell = pygame.Rect(cxp + i * day_w + 3, ty, day_w - 6, 20)
                 if i == area.collection_day:
-                    pygame.draw.rect(screen, self.c["white"], cell)
-                    self._text_center(screen, "mono_b", "o", self.c["black"], cell.centerx, ty)
+                    pygame.draw.rect(screen, c.ACCENT_AMBER, cell, border_radius=4)
+                    ui.text("body_b", "o", c.BG_DEEP, cell.centerx, ty + 2, align="center")
                 else:
-                    pygame.draw.rect(screen, self.c["panel_hi"], cell, 1)
+                    pygame.draw.rect(screen, c.BG_CARD, cell, border_radius=4)
+                    pygame.draw.rect(screen, c.BORDER_SUBTLE, cell, 1, border_radius=4)
                 self.planner_cells.append((cell, area.id, i))
-
-            # FREQ toggle
-            frect = pygame.Rect(fx + 6, ty - 1, freq_w - 12, 18)
-            self._pbtn(screen, frect, st["freq_label"],
-                       (lambda a=area.id: self._cycle_round_freq(a)),
-                       fkey="tiny")
-
-            # Route type indicator
+            frect = pygame.Rect(fx + 6, ty + 1, freq_w - 12, 20)
+            self._pbtn(screen, frect, st["freq_label"], (lambda a=area.id: self._cycle_round_freq(a)), fkey="caption")
             rt = area.route_type
-            rt_color = ROUTE_TYPE_COLORS.get(rt, self.c["text"])
             rt_label = ROUTE_TYPE_LABELS.get(rt, rt)
-            trect = pygame.Rect(tx + 6, ty - 1, type_w - 12, 18)
-            pygame.draw.rect(screen, self.c["panel_lo"], trect)
-            pygame.draw.rect(screen, rt_color, trect, 1)
-            self._text_center(screen, "tiny", rt_label, rt_color, trect.centerx, ty + 1)
-
+            trect = pygame.Rect(tx + 6, ty + 1, type_w - 12, 20)
+            ui.status_pill(trect.x, trect.y, rt_label, "good" if rt == "residential" else "info" if rt == "commercial" else "neutral")
             sx = tx + type_w
-            self._text_center(screen, "mono", str(st["props"]), self.c["text"],
-                              sx + rest["props"] // 2, ty)
+            ui.text("mono_s", str(st["props"]), c.TEXT_SECONDARY, sx + rest["props"] // 2, ty + 2, align="center")
             sx += rest["props"]
             left = fleet.area_due_count(area.id)
-            self._text_center(screen, "mono", str(left),
-                              self.c["white"] if left else self.c["muted"],
-                              sx + rest["due"] // 2, ty)
+            left_color = c.STATUS_BAD if left > 5 else c.STATUS_WARN if left > 0 else c.TEXT_MUTED
+            ui.text("mono_s", str(left), left_color, sx + rest["due"] // 2, ty + 2, align="center")
             sx += rest["due"]
-            stcol = self.c["white"] if st["status"] in ("OVERFLOW", "DUE TODAY") else \
-                self.c["muted"] if st["status"] in ("WATCH", "NEXT WEEK") else self.c["dim"]
-            stkey = "mono_b" if st["status"] in ("OVERFLOW", "DUE TODAY") else "mono"
-            self._text_center(screen, stkey, st["status"], stcol,
-                              sx + rest["status"] // 2, ty)
-            ty += 22
-
-        ty += 6
-        pygame.draw.line(screen, self.c["border_lo"],
-                         (x, ty), (x + left_cols + sum(rest.values()), ty), 1)
+            stcol = c.STATUS_BAD if st["status"] in ("OVERFLOW", "DUE TODAY") else c.STATUS_WARN if st["status"] in ("WATCH", "NEXT WEEK") else c.TEXT_MUTED
+            stkey = "body_s" if st["status"] in ("OVERFLOW", "DUE TODAY") else "caption"
+            ui.text(stkey, st["status"], stcol, sx + rest["status"] // 2, ty + 2, align="center")
+            ty += 26
+        ty += 8
+        ui.h_line(x, ty, left_cols + sum(rest.values()))
         ty += 10
-        self._text(screen, "small", "Rounds / day", self.c["muted"], x, ty)
+        ui.label("Rounds / day", x, ty)
         for i in range(7):
-            self._text_center(screen, "mono_b", str(per_day_rounds[i]),
-                              self.c["white"] if i == today else self.c["text"],
-                              cxp + i * day_w + day_w // 2, ty)
-        ty += 26
-
-        # service threshold lever + capacity verdict
-        ty = self._stepper(
-            screen, x, ty, "Service threshold (% full)",
-            f"{int(fleet.service_threshold)}%",
-            (lambda: self._adjust_threshold(-5)),
-            (lambda: self._adjust_threshold(5)))
+            ui.text("mono_b", str(per_day_rounds[i]), c.ACCENT_AMBER if i == today else c.TEXT_SECONDARY, cxp + i * day_w + day_w // 2, ty, align="center")
+        ty += 28
+        ty = self._stepper(screen, x, ty, "Service threshold (% full)", f"{int(fleet.service_threshold)}%",
+                          (lambda: self._adjust_threshold(-5)), (lambda: self._adjust_threshold(5)))
         demand = fleet.get_today_demand()
         capacity = fleet.estimated_daily_capacity()
         verdict = "within capacity" if demand <= capacity else "OVER CAPACITY"
-        self._text(screen, "small",
-                   f"Today: {fleet.active_lorries()} lorries  |  est. capacity {capacity}"
-                   f"  |  demand {demand}  ->  {verdict}",
-                   self.c["text"] if demand <= capacity else self.c["white"], x, ty + 2)
+        vcolor = c.STATUS_GOOD if demand <= capacity else c.STATUS_BAD
+        ui.text("body_s", f"Today: {fleet.active_lorries()} lorries  |  capacity {capacity}  |  demand {demand}  ->  ", c.TEXT_SECONDARY, x, ty + 2)
+        ui.text("body_b", verdict, vcolor, x + 420, ty + 2)
 
-    # ----------------------------------------------------------- planner: WASTE
     def _tab_waste(self, screen, x, y, w, h):
+        ui = self.ui
+        c = ui.c
         waste = self.game.waste
-        self._text(screen, "small",
-                   "Choose which streams the borough collects. More streams lift "
-                   "satisfaction but fill bins faster and add disposal cost.",
-                   self.c["muted"], x, y)
-        ty = y + 26
-
+        ui.text("body_s", "Choose which streams the borough collects. More streams lift satisfaction but fill bins faster.", c.TEXT_MUTED, x, y)
+        ty = y + 28
         for s in waste.streams:
-            card = pygame.Rect(x, ty, w, 70)
-            self._panel(screen, card.x, card.y, card.w, card.h, fill=self.c["panel_lo"])
+            card = pygame.Rect(x, ty, w, 80)
+            ui.card(card.x, card.y, card.w, card.h, hover=False)
             on = s.enabled
-            # on/off toggle
-            tgl = pygame.Rect(x + 12, ty + 12, 60, 24)
+            tgl = pygame.Rect(x + 12, ty + 14, 64, 26)
             if s.can_disable:
-                self._pbtn(screen, tgl, "ON" if on else "OFF",
-                           (lambda sid=s.id: self._toggle_stream(sid)),
-                           accent=on, fkey="body_b")
+                self._pbtn(screen, tgl, "ON" if on else "OFF", (lambda sid=s.id: self._toggle_stream(sid)), accent=on, fkey="body_b")
             else:
-                pygame.draw.rect(screen, self.c["panel_hi"], tgl)
-                pygame.draw.rect(screen, self.c["border_lo"], tgl, 1)
-                self._text_center(screen, "body_b", "ON", self.c["dim"], tgl.centerx, ty + 17)
-
-            name_col = self.c["text"] if on else self.c["dim"]
-            self._text(screen, "body_b", s.name, name_col, x + 84, ty + 8)
-            self._text(screen, "tiny", s.blurb, self.c["muted"] if on else self.c["dim"],
-                       x + 84, ty + 28)
-
-            # economics line
-            econ = (f"gate GBP{s.gate_fee:.3f}/u  |  "
-                    f"{'credit' if s.id != 'garden' else 'charge'} GBP{s.credit:.3f}/u  |  "
-                    f"+{s.satisfaction} satis")
-            self._text(screen, "tiny", econ, self.c["dim"], x + 84, ty + 48)
-
-            # frequency toggle (right)
-            frect = pygame.Rect(x + w - 116, ty + 12, 104, 24)
+                ui.status_pill(tgl.x, tgl.y, "ON", "good")
+            name_col = c.TEXT_PRIMARY if on else c.TEXT_DIM
+            ui.text("body_b", s.name, name_col, x + 88, ty + 8)
+            ui.text("body_s", s.blurb, c.TEXT_MUTED if on else c.TEXT_DIM, x + 88, ty + 30)
+            econ = (f"gate £{s.gate_fee:.3f}/u  |  "
+                   f"{'credit' if s.id != 'garden' else 'charge'} £{s.credit:.3f}/u  |  "
+                   f"+{s.satisfaction} satis")
+            ui.text("caption", econ, c.TEXT_DIM, x + 88, ty + 52)
+            frect = pygame.Rect(x + w - 120, ty + 14, 108, 26)
             if on:
-                self._pbtn(screen, frect, s.freq_label,
-                           (lambda sid=s.id: self._cycle_stream_freq(sid)), fkey="small")
+                self._pbtn(screen, frect, s.freq_label, (lambda sid=s.id: self._cycle_stream_freq(sid)), fkey="body_s")
             else:
-                pygame.draw.rect(screen, self.c["panel_hi"], frect, 1)
-                self._text_center(screen, "small", s.freq_label, self.c["dim"],
-                                  frect.centerx, ty + 17)
-            ty += 78
+                pygame.draw.rect(screen, c.BG_PANEL, frect, border_radius=4)
+                pygame.draw.rect(screen, c.BORDER_SUBTLE, frect, 1, border_radius=4)
+                ui.text("body_s", s.freq_label, c.TEXT_DIM, frect.centerx, ty + 18, align="center")
+            ty += 88
+        ty += 6
+        ui.h_line(x, ty, w)
+        ty += 12
+        ui.label("Bin fill rate", x, ty)
+        ui.value(f"x{waste.fill_multiplier():.2f}", x + 140, ty, c.ACCENT_TEAL)
+        ui.label("Satisfaction ceiling", x + 280, ty)
+        ui.value(f"{int(waste.satisfaction_ceiling())}%", x + 450, ty, c.ACCENT_TEAL)
 
-        ty += 4
-        pygame.draw.line(screen, self.c["border_lo"], (x, ty), (x + w, ty), 1)
-        ty += 10
-        self._text(screen, "body", "Bin fill rate", self.c["muted"], x, ty)
-        self._text(screen, "body_b", f"x{waste.fill_multiplier():.2f}", self.c["text"], x + 150, ty)
-        self._text(screen, "body", "Satisfaction ceiling", self.c["muted"], x + 300, ty)
-        self._text(screen, "body_b", f"{int(waste.satisfaction_ceiling())}%",
-                   self.c["text"], x + 470, ty)
-
-    # ----------------------------------------------------------- planner: FLEET
     def _tab_fleet(self, screen, x, y, w, h):
+        ui = self.ui
+        c = ui.c
         eco = self.game.economy
         fleet = self.game.fleet
-
-        self._text(screen, "small",
-                   "Choose a procurement method, then select a vehicle model and place your order.",
-                   self.c["muted"], x, y)
-        ty = y + 20
-
-        # --- PROCUREMENT TIER SELECTION ---
+        ui.text("body_s", "Choose a procurement method, then select a vehicle model and place your order.", c.TEXT_MUTED, x, y)
+        ty = y + 24
         tier_w = (w - 24) // 3
-        tier_h = 56
+        tier_h = 64
         tier_data = [
-            ("factory", "Factory Custom", "180-220 days", "-35% price", (100, 180, 120),
+            ("factory", "Factory Custom", "180-220 days", "-35% price", c.STATUS_GOOD,
              "Bespoke build. Cheapest but plan 6+ months ahead."),
-            ("dealer", "Dealer Stock", "14-18 days", "+15% premium", (120, 160, 220),
+            ("dealer", "Dealer Stock", "14-18 days", "+15% premium", c.ACCENT_TEAL,
              "Pre-built. MOT, O-License & delivery. Watch for delays."),
-            ("rental", "Spot Rental", "1-2 days", "4.5x daily cost", (220, 140, 100),
+            ("rental", "Spot Rental", "1-2 days", "4.5x daily cost", c.STATUS_BAD,
              "Emergency hire. Arrives fast, burns budget fast."),
         ]
-
-        # Store selected tier on the game object if not present
         if not hasattr(self.game, '_selected_procurement_tier'):
             self.game._selected_procurement_tier = "dealer"
         selected_tier = self.game._selected_procurement_tier
-
         for i, (tid, tname, ttime, tprice, tcolour, tblurb) in enumerate(tier_data):
             tx = x + 8 + i * (tier_w + 8)
             rect = pygame.Rect(tx, ty, tier_w, tier_h)
             is_sel = selected_tier == tid
-
-            # Background
-            bg = tuple(min(255, c + 30) for c in tcolour) if is_sel else self.c["panel_lo"]
-            pygame.draw.rect(screen, bg, rect, border_radius=3)
-            border_col = tcolour if is_sel else self.c["border_lo"]
-            pygame.draw.rect(screen, border_col, rect, 2 if is_sel else 1, border_radius=3)
-
-            # Title
-            name_col = self.c["white"] if is_sel else self.c["text"]
-            self._text(screen, "body_b", tname, name_col, tx + 8, ty + 6)
-            self._text(screen, "tiny", ttime, self.c["muted"], tx + 8, ty + 24)
-            self._text(screen, "tiny", tprice, tcolour, tx + 8, ty + 38)
-
-            # Clickable
+            ui.card(tx, ty, tier_w, tier_h, selected=is_sel)
+            if is_sel:
+                pygame.draw.rect(screen, tcolour, pygame.Rect(tx, ty, 4, tier_h), border_radius=4)
+            name_col = c.ACCENT_AMBER if is_sel else c.TEXT_PRIMARY
+            ui.text("body_b", tname, name_col, tx + 10, ty + 8)
+            ui.text("caption", ttime, c.TEXT_MUTED, tx + 10, ty + 26)
+            ui.text("caption", tprice, tcolour, tx + 10, ty + 42)
             self.planner_widgets.append((rect, (lambda t=tid: setattr(self.game, '_selected_procurement_tier', t))))
-
-        ty += tier_h + 10
-
-        # --- TIER DETAIL BLURB ---
+        ty += tier_h + 12
         tier_blurbs = {
-            "factory": (
-                "Factory Custom Order: Order a bespoke RCV direct from the manufacturer. "
-                "You choose the exact capacity, fuel type, and crew configuration. "
-                "Cheapest upfront cost (-35%), but you will wait 180-220 days before it hits the road. "
-                "Best for long-term fleet expansion when you can see demand coming."
-            ),
-            "dealer": (
-                "Dealer Stock Purchase: Buy a pre-built chassis and compactor body from an authorised dealer. "
-                "The 2-week wait covers UK MOT safety plating, operator licensing (O-License), "
-                "vehicle registration, and delivery logistics. Premium price (+15%) for near-immediate delivery. "
-                "WARNING: Bureaucracy Bottleneck (O-License delay +5 days) or PDI Flaw (hydraulic fault +3 days) "
-                "can occur during the waiting period."
-            ),
-            "rental": (
-                "Spot Rental: Emergency spot-hire to cover a sudden breakdown or demand spike. "
-                "Vehicle arrives in 1-2 days, but the daily operating cost is 4.5 times normal. "
-                "This will devour your budget if kept on the books for more than a few days. "
-                "Use sparingly -- rent only while a factory or dealer order is in transit."
-            ),
+            "factory": ("Factory Custom Order: Order a bespoke RCV direct from the manufacturer. "
+                       "Cheapest upfront cost (-35%), but 180-220 day wait. Best for long-term planning."),
+            "dealer": ("Dealer Stock Purchase: Pre-built chassis and body. 2-week wait covers MOT, "
+                      "O-License and delivery. Premium price (+15%). Watch for paperwork delays."),
+            "rental": ("Spot Rental: Emergency hire for breakdowns. 1-2 day arrival, 4.5x daily cost. "
+                      "Use sparingly -- rent only while other orders are in transit."),
         }
         blurb = tier_blurbs.get(selected_tier, "")
-        self._draw_wrapped_text(screen, blurb, x + 8, ty, w - 16, self.fonts["tiny"], self.c["muted"])
-        ty += 50
-
-        # --- VEHICLE CATALOGUE ---
-        col_w = (w - 12) // 2
-        col2_x = x + col_w + 12
+        self._draw_wrapped_text(screen, blurb, x + 8, ty, w - 16, ui.fonts._fonts["caption"], c.TEXT_MUTED)
+        ty += 44
+        col_w = (w - 16) // 2
+        col2_x = x + col_w + 16
         cat_y = ty
-
         for idx, v in enumerate(VEHICLE_CATALOGUE):
             cx = x if idx % 2 == 0 else col2_x
             if idx % 2 == 0:
                 row_y = cat_y
-
-            # Get tier-adjusted price
             from procurement import get_tier
             tier = get_tier(selected_tier)
             adj_price = v.get_price_for_tier(selected_tier) if hasattr(v, 'get_price_for_tier') else v.price
             adj_run = v.get_running_cost_for_tier(selected_tier) if hasattr(v, 'get_running_cost_for_tier') else v.running_cost
             lead = tier.random_lead_time() if tier else v.lead_time
-
-            card = pygame.Rect(cx, row_y, col_w, 110)
-            self._panel(screen, card.x, card.y, card.w, card.h, fill=self.c["panel_lo"])
-            self._text(screen, "body_b", v.name, self.c["text"], cx + 10, row_y + 8)
-            self._text(screen, "tiny",
-                       f"cap {v.capacity:,}  crew {v.crew_cap}  spd x{v.speed_factor:.2f}",
-                       self.c["muted"], cx + 10, row_y + 28)
-            self._text(screen, "tiny", f"run GBP{adj_run}/day  |  lead {lead}d",
-                       self.c["dim"], cx + 10, row_y + 44)
-
-            # Price display varies by tier
+            card = pygame.Rect(cx, row_y, col_w, 120)
+            ui.card(cx, row_y, card.w, card.h)
+            ui.text("body_b", v.name, c.TEXT_PRIMARY, cx + 12, row_y + 8)
+            ui.text("body_s", f"cap {v.capacity:,}  crew {v.crew_cap}  spd x{v.speed_factor:.2f}", c.TEXT_MUTED, cx + 12, row_y + 28)
+            ui.text("caption", f"run £{adj_run}/day  |  lead {lead}d", c.TEXT_DIM, cx + 12, row_y + 46)
             if selected_tier == "rental":
-                price_label = f"Rent GBP{adj_price//1000 or 1}k deposit"
+                price_label = f"Rent £{adj_price//1000 or 1}k deposit"
                 can_afford = eco.budget >= adj_price
-                btn = pygame.Rect(cx + 10, row_y + 64, col_w - 20, 28)
-                self._pbtn(screen, btn, price_label,
-                           (lambda vid=v.id: self._buy_vehicle(vid, selected_tier, False)),
-                           enabled=can_afford, fkey="small", accent=True)
+                btn = pygame.Rect(cx + 12, row_y + 68, col_w - 24, 30)
+                self._pbtn(screen, btn, price_label, (lambda vid=v.id: self._buy_vehicle(vid, selected_tier, False)), enabled=can_afford, fkey="body_b", accent=True)
             else:
-                # Buy / Lease buttons
-                buy = pygame.Rect(cx + 10, row_y + 64, (col_w - 30) // 2, 28)
-                lease = pygame.Rect(buy.right + 10, row_y + 64, (col_w - 30) // 2, 28)
+                buy = pygame.Rect(cx + 12, row_y + 68, (col_w - 32) // 2, 30)
+                lease = pygame.Rect(buy.right + 8, row_y + 68, (col_w - 32) // 2, 30)
                 can_buy = eco.budget >= adj_price
                 can_lease = eco.budget >= v.deposit()
-                self._pbtn(screen, buy, f"Buy GBP{adj_price//1000}k",
-                           (lambda vid=v.id: self._buy_vehicle(vid, selected_tier, False)),
-                           enabled=can_buy, fkey="small")
-                self._pbtn(screen, lease, f"Lease GBP{v.deposit()//1000 or 1}k",
-                           (lambda vid=v.id: self._buy_vehicle(vid, selected_tier, True)),
-                           enabled=can_lease, fkey="small")
-
+                self._pbtn(screen, buy, f"Buy £{adj_price//1000}k", (lambda vid=v.id: self._buy_vehicle(vid, selected_tier, False)), enabled=can_buy, fkey="body_s")
+                self._pbtn(screen, lease, f"Lease £{v.deposit()//1000 or 1}k", (lambda vid=v.id: self._buy_vehicle(vid, selected_tier, True)), enabled=can_lease, fkey="body_s")
             if idx % 2 == 1:
-                cat_y += 118
-
+                cat_y += 128
         if len(VEHICLE_CATALOGUE) % 2 == 1:
-            cat_y += 118
-        ty = cat_y + 4
-        pygame.draw.line(screen, self.c["border_lo"], (x, ty), (x + w, ty), 1)
-        ty += 10
-
-        # --- CURRENT FLEET + ORDERS ---
+            cat_y += 128
+        ty = cat_y + 8
+        ui.h_line(x, ty, w)
+        ty += 12
         owned = len(fleet.trucks)
         leased_n = sum(1 for t in fleet.trucks if t.get("leased"))
         rental_n = sum(1 for t in fleet.trucks if t.get("tier_id") == "rental")
-        self._text(screen, "body_b", "Current fleet", self.c["text"], x, ty)
+        ui.text("h3", "Current fleet", c.TEXT_PRIMARY, x, ty)
         fleet_info = f"{owned} lorries"
         if leased_n:
             fleet_info += f" ({leased_n} leased)"
         if rental_n:
             fleet_info += f"  [Rental: {rental_n}]"
-        fleet_info += f"  |  {fleet.workers} crew  |  running GBP{int(fleet.daily_vehicle_cost())}/day"
-        self._text(screen, "small", fleet_info, self.c["muted"], x, ty + 20)
-
-        # Crew hire/fire
-        hire = pygame.Rect(x, ty + 46, 120, 26)
-        fire = pygame.Rect(hire.right + 10, ty + 46, 120, 26)
-        self._pbtn(screen, hire, "Hire crew GBP2.5k",
-                   self._hire, enabled=eco.budget >= 2500, fkey="small")
-        self._pbtn(screen, fire, "Release crew",
-                   self._fire, enabled=fleet.workers > 0, fkey="small")
-
-        # --- PENDING ORDERS (right column) ---
+        fleet_info += f"  |  {fleet.workers} crew  |  £{int(fleet.daily_vehicle_cost())}/day"
+        ui.text("body_s", fleet_info, c.TEXT_MUTED, x, ty + 22)
+        hire = pygame.Rect(x, ty + 50, 130, 28)
+        fire = pygame.Rect(hire.right + 10, ty + 50, 130, 28)
+        self._pbtn(screen, hire, "Hire crew £2.5k", self._hire, enabled=eco.budget >= 2500, fkey="body_s")
+        self._pbtn(screen, fire, "Release crew", self._fire, enabled=fleet.workers > 0, fkey="body_s")
         ox = x + w - 300
-        self._text(screen, "body_b", "On order", self.c["text"], ox, ty)
-        oy = ty + 20
+        ui.text("h3", "On order", c.TEXT_PRIMARY, ox, ty)
+        oy = ty + 24
         if not fleet.orders:
-            self._text(screen, "small", "Nothing on order.", self.c["dim"], ox, oy)
+            ui.text("body_s", "Nothing on order.", c.TEXT_DIM, ox, oy)
         else:
             for o in fleet.orders[:5]:
                 rem = o.days_remaining(eco.day)
@@ -940,102 +1034,84 @@ class UIManager:
                 if o.leased:
                     tag += " lease"
                 line = f"{o.vehicle.name} ({tag}) - {rem}d"
-                # Check for pending procurement events
                 if hasattr(o, 'event_name') and o.event_name and not o.event_triggered:
                     line += f"  !{o.event_name}"
-                    col = self.c["white"]
+                    col = c.STATUS_BAD
                 elif hasattr(o, 'event_triggered') and o.event_triggered:
                     line += "  (delayed)"
-                    col = self.c["muted"]
+                    col = c.TEXT_MUTED
                 else:
-                    col = self.c["muted"]
-                self._text(screen, "small", line, col, ox, oy)
-                oy += 18
+                    col = c.TEXT_MUTED
+                ui.text("body_s", line, col, ox, oy)
+                oy += 20
+
     def _tab_finance(self, screen, x, y, w, h):
-            eco = self.game.economy
-            snap = eco.ledger_snapshot()
+        ui = self.ui
+        c = ui.c
+        eco = self.game.economy
+        snap = eco.ledger_snapshot()
+        ui.text("body_s", "Yesterday's profit & loss. Adjust council tax to balance books against satisfaction.", c.TEXT_MUTED, x, y)
+        ty = y + 26
+        lx = x
+        rx = x + 320
+        for key, label in eco.LEDGER_LABELS:
+            val = snap.get(key, 0.0)
+            is_rev = key in eco.REVENUE_KEYS
+            ui.label(label, lx, ty)
+            sign = "+" if is_rev else ""
+            val_color = c.STATUS_GOOD if is_rev else c.TEXT_SECONDARY
+            ui.text("mono", f"{sign}£{abs(val):,.0f}", val_color, rx, ty, align="right")
+            ty += 22
+        ui.h_line(lx, ty + 2, rx - lx)
+        ty += 10
+        net = snap.get("net", 0.0)
+        ui.text("body_b", "Net / day", c.TEXT_PRIMARY, lx, ty)
+        net_color = c.STATUS_GOOD if net >= 0 else c.STATUS_BAD
+        ui.text("mono_b", f"{'+' if net >= 0 else ''}£{abs(net):,.0f}", net_color, rx, ty, align="right")
+        ty += 32
+        ty2 = self._stepper(screen, lx, ty, "Council tax (£/resident/day)", f"{eco.council_tax_rate:.2f}",
+                           (lambda: self._adjust_tax(-0.10)), (lambda: self._adjust_tax(0.10)), label_w=240)
+        ui.text("caption", "Higher tax raises revenue but dents satisfaction.", c.TEXT_DIM, lx, ty2)
+        gx = x + 360
+        gw = w - 360
+        ui.text("h3", "Net trend (14 days)", c.TEXT_PRIMARY, gx, y + 26)
+        hist = eco.history[-14:]
+        if hist:
+            nets = [eco._ledger_net(d) for d in hist]
+            peak = max(1.0, max(abs(n) for n in nets))
+            base_y = y + 160
+            bw = max(8, (gw - (len(nets) - 1) * 4) // max(1, len(nets)))
+            bxx = gx
+            for n in nets:
+                bh_px = int((abs(n) / peak) * 60)
+                if n >= 0:
+                    rect = pygame.Rect(bxx, base_y - bh_px, bw, bh_px)
+                    pygame.draw.rect(screen, c.STATUS_GOOD, rect, border_radius=3)
+                    shine = pygame.Rect(bxx, base_y - bh_px, bw, bh_px // 2)
+                    s_surf = pygame.Surface((shine.w, shine.h), pygame.SRCALPHA)
+                    s_surf.fill((255, 255, 255, 30))
+                    screen.blit(s_surf, shine)
+                else:
+                    rect = pygame.Rect(bxx, base_y, bw, bh_px)
+                    pygame.draw.rect(screen, c.STATUS_BAD, rect, border_radius=3)
+                bxx += bw + 4
+            ui.h_line(gx, base_y, gw - 20)
+            ui.text("caption", "zero", c.TEXT_DIM, gx, base_y + 4)
+        else:
+            ui.text("body_s", "Trend builds after a few days.", c.TEXT_DIM, gx, y + 60)
+        ui.label("Budget", gx, y + 200)
+        ui.text("display", f"£{int(eco.budget):,}", c.TEXT_PRIMARY, gx, y + 218)
 
-            self._text(screen, "small",
-                       "Yesterday's profit & loss. Adjust the council tax lever to "
-                       "balance the books against public satisfaction.",
-                       self.c["muted"], x, y)
-            ty = y + 24
-
-            # ledger table (left)
-            lx = x
-            rx = x + 300
-            for key, label in eco.LEDGER_LABELS:
-                val = snap.get(key, 0.0)
-                is_rev = key in eco.REVENUE_KEYS
-                self._text(screen, "body", label, self.c["muted"], lx, ty)
-                sign = "+" if is_rev else "-"
-                self._text_right(screen, "mono", f"{sign}GBP{abs(val):,.0f}",
-                                 self.c["text"], rx, ty)
-                ty += 20
-            pygame.draw.line(screen, self.c["border_lo"], (lx, ty + 2), (rx, ty + 2), 1)
-            ty += 8
-            net = snap.get("net", 0.0)
-            self._text(screen, "body_b", "Net / day", self.c["text"], lx, ty)
-            self._text_right(screen, "mono_b",
-                             f"{'+' if net >= 0 else '-'}GBP{abs(net):,.0f}",
-                             self.c["white"], rx, ty)
-            ty += 28
-
-            # council tax lever
-            ty2 = self._stepper(
-                screen, lx, ty, "Council tax (GBP/resident/day)",
-                f"{eco.council_tax_rate:.2f}",
-                (lambda: self._adjust_tax(-0.10)),
-                (lambda: self._adjust_tax(0.10)),
-                label_w=220)
-            self._text(screen, "tiny",
-                       "Higher tax raises revenue but dents satisfaction over time.",
-                       self.c["dim"], lx, ty2)
-
-            # 14-day net trend (right column)
-            gx = x + 360
-            gw = w - 360
-            self._text(screen, "body_b", "Net trend (last 14 days)", self.c["text"], gx, y + 24)
-            hist = eco.history[-14:]
-            if hist:
-                nets = [eco._ledger_net(d) for d in hist]
-                peak = max(1.0, max(abs(n) for n in nets))
-                base_y = y + 150
-                bw = max(6, (gw - (len(nets) - 1) * 4) // max(1, len(nets)))
-                bxx = gx
-                for n in nets:
-                    bh_px = int((abs(n) / peak) * 56)
-                    if n >= 0:
-                        rect = pygame.Rect(bxx, base_y - bh_px, bw, bh_px)
-                        pygame.draw.rect(screen, self.c["white"], rect)
-                    else:
-                        rect = pygame.Rect(bxx, base_y, bw, bh_px)
-                        pygame.draw.rect(screen, self.c["dim"], rect)
-                    bxx += bw + 4
-                pygame.draw.line(screen, self.c["border_lo"],
-                                 (gx, base_y), (gx + gw - 20, base_y), 1)
-                self._text(screen, "tiny", "zero", self.c["dim"], gx, base_y + 4)
-            else:
-                self._text(screen, "small", "Trend builds after a few days.",
-                           self.c["dim"], gx, y + 50)
-
-            self._text(screen, "body", "Budget", self.c["muted"], gx, y + 180)
-            self._text(screen, "big", f"GBP {int(eco.budget):,}", self.c["white"], gx, y + 196)
-
-        # ----------------------------------------------------------- planner: DATA
     def _tab_data(self, screen, x, y, w, h):
-        self._text(screen, "small",
-                   "Export the borough plan to a spreadsheet (.ods or .xml) you can open "
-                   "in Excel or LibreOffice, edit, and import back in.",
-                   self.c["muted"], x, y)
-        ty = y + 30
-
-        exp = pygame.Rect(x, ty, 220, 36)
-        imp = pygame.Rect(exp.right + 16, ty, 220, 36)
+        ui = self.ui
+        c = ui.c 
+        ui.text("body_s", "Export the borough plan to a spreadsheet (.ods or .xml)", c.TEXT_MUTED, x, y)
+        ty = y + 32
+        exp = pygame.Rect(x, ty, 240, 40)
+        imp = pygame.Rect(exp.right + 16, ty, 240, 40)
         self._pbtn(screen, exp, "Export plan (.ods/.xml)", self._export_xml, accent=True)
         self._pbtn(screen, imp, "Import plan (.ods/.xml)", self._import_xml)
         ty += 56
-
         lines = [
             "Editable sheets (round-trip on import):",
             "  - Collection Rounds  (day + weekly/fortnightly)",
@@ -1046,17 +1122,16 @@ class UIManager:
             "  - Place Orders       (set Quantity to order from Catalogue)",
             "  - Config             (day length, event chance, win target)",
             "",
-            "Catalogue and Procurement Orders are read-only reference. On",
-            "import only safe levers apply: money is never edited directly,",
+            "Catalogue and Procurement Orders are read-only reference.",
+            "On import only safe levers apply: money is never edited directly,",
             "and crew/vehicles are only bought within the available budget.",
             "A summary of each import is written to the Summary sheet.",
         ]
         for ln in lines:
-            self._text(screen, "small", ln, self.c["muted"] if ln.strip() else self.c["dim"],
-                       x, ty)
-            ty += 19
+            color = c.TEXT_MUTED if ln.strip() else c.TEXT_DIM
+            ui.text("body_s", ln, color, x, ty)
+            ty += 20
 
-    # ----------------------------------------------------- planner: callbacks
     def _cycle_round_freq(self, area_id):
         self.game.city.cycle_area_frequency(area_id)
 
@@ -1077,7 +1152,6 @@ class UIManager:
             self.game.set_toast(msg)
             return
         if eco.budget < cost:
-            # roll the order back; can't afford the up-front cost
             self.game.fleet.orders.pop()
             self._flash_insufficient()
             self.game.set_toast("Insufficient funds for that order.")
@@ -1110,10 +1184,7 @@ class UIManager:
         ok, msg = xmlio.prompt_import(self.game)
         self.game.set_toast(msg)
 
-    # ----------------------------------------------------------------- update
-    
     def _draw_wrapped_text(self, screen, text, x, y, max_width, font, colour):
-        """Simple word-wrap for multi-line descriptions."""
         words = text.split(" ")
         lines = []
         current = ""
@@ -1127,20 +1198,24 @@ class UIManager:
                 current = word
         if current:
             lines.append(current)
-
         for line in lines:
             surf = font.render(line, True, colour)
             screen.blit(surf, (x, y))
             y += font.get_height() + 2
 
     def update(self, dt):
-            if self._event_visible:
-                self._event_timer_active += dt
-                if self._event_timer_active >= self._event_duration:
-                    self._event_visible = False
-                    self._event_timer_active = 0
-            if self._insufficient_funds_flash:
-                self._flash_timer += dt
-                if self._flash_timer >= self._flash_duration:
-                    self._insufficient_funds_flash = False
-                    self._flash_timer = 0
+        if self._event_visible:
+            self._event_timer_active += dt
+            if self._event_timer_active >= self._event_duration:
+                self._event_visible = False
+                self._event_timer_active = 0
+        if self._insufficient_funds_flash:
+            self._flash_timer += dt
+            if self._flash_timer >= self._flash_duration:
+                self._insufficient_funds_flash = False
+                self._flash_timer = 0
+        self._tooltip_timer += dt
+        mouse = pygame.mouse.get_pos()
+        if self._tooltip_pos and math.hypot(mouse[0] - self._tooltip_pos[0], mouse[1] - self._tooltip_pos[1]) > 10:
+            self._tooltip_text = None
+            self._tooltip_timer = 0
