@@ -137,6 +137,7 @@ class Tile:
         self.wall_color_dark = "#c5c5c5"
         self.roof_color = "#8b2d2d"
         self.seed = random.random()                # per-building visual jitter
+        self.days_overflowing = 0
 
     def get_collection_day_name(self):
         return DAY_NAMES[self.collection_due]

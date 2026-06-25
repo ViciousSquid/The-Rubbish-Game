@@ -222,21 +222,38 @@ class Economy:
             self.pending_event = self.active_event
 
     # ----- service quality -------------------------------------------------
-    def register_day_quality(self, overflow_count, property_count, service_ceiling=100.0):
-        """Once per new day: adjust satisfaction from overflow snapshot, then
-        drift toward the ceiling implied by the waste service on offer."""
-        if property_count > 0:
-            overflow_ratio = overflow_count / property_count
+    def register_day_quality(self, city, service_ceiling=100.0):
+        """Once per new day: adjust satisfaction from overflow snapshot."""
+        daily_complaints = 0
+        
+        # Check all tiles for sustained overflows
+        for y in range(city.height):
+            for x in range(city.width):
+                tile = city.tiles[y][x]
+                if tile.type in ("road", "green", "landfill"):
+                    continue
+                
+                if tile.bin_fill >= 100:
+                    tile.days_overflowing += 1
+                    # Generate a complaint if overflowing for MORE than 1 day
+                    if tile.days_overflowing > 1:
+                        daily_complaints += 1
+                else:
+                    tile.days_overflowing = 0
+
+        self.complaints_today = daily_complaints
+        self.complaints_total += daily_complaints
+
+        if city.property_count > 0:
+            overflow_ratio = daily_complaints / city.property_count
             if overflow_ratio <= 0.02:
                 self.satisfaction = min(100.0, self.satisfaction + 3.0)
             else:
                 drop = min(22.0, overflow_ratio * 140.0)
                 self.satisfaction = max(0.0, self.satisfaction - drop)
-            self.complaints_today = overflow_count
-            self.complaints_total += overflow_count
 
-        # Win condition: 7 consecutive days with 0 complaints
-        if overflow_count == 0:
+        # Win condition tracking
+        if daily_complaints == 0:
             self.perfect_days_streak += 1
         else:
             self.perfect_days_streak = 0
@@ -246,7 +263,6 @@ class Economy:
             self.win_day = self.day
             self.win_celebration_timer = 10.0
 
-        # Pull gently toward the service ceiling (more streams -> happier baseline).
         self.satisfaction += (service_ceiling - self.satisfaction) * 0.10
         self.satisfaction = max(0.0, min(100.0, self.satisfaction))
 

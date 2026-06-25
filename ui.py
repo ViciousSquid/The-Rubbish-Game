@@ -502,7 +502,7 @@ class UIManager:
         pygame.draw.rect(screen, c.BG_DEEP, pygame.Rect(0, 0, HUD_W, h))
         pygame.draw.line(screen, c.BORDER_SUBTLE, (HUD_W, 0), (HUD_W, h), 1)
         y = 16
-        ui.text("display_sub", "Waste Borough", c.ACCENT_AMBER, x, y)
+        #ui.text("display_sub", "Waste Borough", c.ACCENT_AMBER, x, y)
         y += 32
         ui.text("h2", f"Day {eco.day}", c.TEXT_PRIMARY, x, y)
         ui.text("body", eco.get_day_of_week_name(), c.TEXT_MUTED, x + 80, y + 4)
@@ -585,14 +585,6 @@ class UIManager:
         ui.label("Complaints (today)", x, y)
         ui.value(str(eco.complaints_today), right, y, c.TEXT_PRIMARY, align="right")
         y += 26
-        help_y = h - 90
-        ui.section_header(x, help_y, "CONTROLS", w=HUD_W - 28)
-        help_y += 22
-        for line in ["WASD / drag - pan,  scroll - zoom",
-                     "Tab - planner,  G - round overlay",
-                     "Click a building - inspect"]:
-            ui.text("body_xs", line, c.TEXT_DIM, x, help_y)
-            help_y += 16
 
     def _draw_event_banner(self, screen, w):
         if not self._event_visible or not self._current_event:
