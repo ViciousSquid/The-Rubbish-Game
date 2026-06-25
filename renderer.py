@@ -1174,7 +1174,7 @@ class Renderer:
 
             if zoom > 0.35:
                 font = _get_font("monospace", max(5, int(6 * s)), bold=True)
-                text = font.render(f"L{truck['id']}", True, (255, 255, 255))
+                text = font.render(truck.get("nickname", f"L{truck['id']}"), True, (255, 255, 255))
                 self.screen.blit(text, text.get_rect(center=(int(x), int(y + 6 * s))))
             return
 
@@ -1242,7 +1242,7 @@ class Renderer:
 
         if zoom > 0.35:
             font = _get_font("monospace", max(5, int(6 * s)), bold=True)
-            text = font.render(f"L{truck['id']}", True, (255, 255, 255))
+            text = font.render(truck.get("nickname", f"L{truck['id']}"), True, (255, 255, 255))
             self.screen.blit(text, text.get_rect(center=(int(x), int(y + 6 * s))))
 
         if truck.get("broken"):

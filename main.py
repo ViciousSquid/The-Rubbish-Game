@@ -181,11 +181,13 @@ class WasteCityGame:
         new_day = self.economy.update(sim_dt, self.city, self.fleet, self.waste)
 
         if new_day:
-            delivered, events_triggered = self.fleet.process_deliveries(self.economy.day)
-            if delivered:                          # ← must stay indented under new_day
+            # Deliver any vehicles that have arrived.
+            delivered = self.fleet.process_deliveries(self.economy.day)
+            if delivered:
                 self.set_toast("Delivered: " + ", ".join(str(d) for d in delivered))
+            # Once-per-day service-quality snapshot (one scan, not per frame).
             self.economy.register_day_quality(
-                self.city, self.waste.satisfaction_ceiling())
+            self.city, self.waste.satisfaction_ceiling())
 
         if self.economy.pending_event:
             self.ui.show_event(self.economy.pending_event)
@@ -231,20 +233,24 @@ class WasteCityGame:
                     self.ui._setup_buttons()
 
                 elif event.type == pygame.KEYDOWN:
-                    tab_keys = {pygame.K_1: "rounds", pygame.K_2: "waste",
-                                pygame.K_3: "fleet", pygame.K_4: "finance",
-                                pygame.K_5: "data"}
-                    if self.planner_open and event.key in tab_keys:
-                        self.planner_tab = tab_keys[event.key]
-                    elif event.key == pygame.K_TAB:
-                        self.planner_open = not self.planner_open
-                    elif event.key == pygame.K_g:
-                        self.show_areas = not self.show_areas
-                    elif event.key == pygame.K_ESCAPE:
-                        if self.planner_open:
-                            self.planner_open = False
-                        else:
-                            self.clear_selection()
+                    # If a truck rename is in progress, all keys go to the UI.
+                    if self.ui._renaming_truck_id is not None:
+                        self.ui.handle_key(event)
+                    else:
+                        tab_keys = {pygame.K_1: "rounds", pygame.K_2: "waste",
+                                    pygame.K_3: "fleet", pygame.K_4: "finance",
+                                    pygame.K_5: "data"}
+                        if self.planner_open and event.key in tab_keys:
+                            self.planner_tab = tab_keys[event.key]
+                        elif event.key == pygame.K_TAB:
+                            self.planner_open = not self.planner_open
+                        elif event.key == pygame.K_g:
+                            self.show_areas = not self.show_areas
+                        elif event.key == pygame.K_ESCAPE:
+                            if self.planner_open:
+                                self.planner_open = False
+                            else:
+                                self.clear_selection()
 
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if event.button == 1:

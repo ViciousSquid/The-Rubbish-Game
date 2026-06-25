@@ -90,6 +90,7 @@ class FleetManager:
 
         truck = {
             "id": len(self.trucks) + 1,
+            "nickname": f"L{len(self.trucks) + 1}",
             "x": float(self.depot_x),
             "y": float(self.depot_y),
             "model_id": model.id,

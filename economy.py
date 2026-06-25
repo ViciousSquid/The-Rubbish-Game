@@ -102,9 +102,6 @@ class Economy:
         # default £16.50/hr wage).  Falls when wages are cut, rises when raised.
         # Low morale strongly increases the chance of a crew_strike event.
         self.worker_morale = self._morale_target()
-        # Extra strike-weight spike from recent wage cuts; added to immediately
-        # on any cut and decays by 8 pts/day (gone in ~10–12 days).
-        self._wage_anger = 0.0
 
         self.events = [
             # ---- bin-rate (fill speed) ----------------------------------------
@@ -430,12 +427,10 @@ class Economy:
 
     def _update_worker_morale(self):
         """Drift morale 12 % of the way toward the wage-based target each day.
-        Workers notice pay cuts gradually — morale doesn't crater overnight.
-        Wage-cut anger spike decays by 8 pts/day (clears in ~10–12 days)."""
+        Workers notice pay cuts gradually — morale doesn't crater overnight."""
         target = self._morale_target()
         self.worker_morale += (target - self.worker_morale) * 0.12
         self.worker_morale = max(0.0, min(100.0, self.worker_morale))
-        self._wage_anger = max(0.0, getattr(self, "_wage_anger", 0.0) - 8.0)
 
     def _crew_strike_weight(self):
         """Event weight for crew_strike relative to every other event (1.0).
@@ -443,22 +438,18 @@ class Economy:
         High morale  → weight < 1  (strikes suppressed)
         Neutral (72) → weight ≈ 1  (baseline)
         Low morale   → weight up to 8  (strikes very likely when any event fires)
-        Recent wage-cut anger adds up to +6 on top of the morale weight.
         """
         m = self.worker_morale / 100.0
         if m >= 0.72:
             # Morale at or above neutral — gradually suppress strike events
             # 0.72 → 1.0,  1.0 → 0.15
             t = (m - 0.72) / 0.28
-            base = max(0.15, 1.0 - t * 0.85)
+            return max(0.15, 1.0 - t * 0.85)
         else:
             # Morale below neutral — ramp up sharply
             # 0.72 → 1.0,  0.0 → 8.0
             t = (0.72 - m) / 0.72
-            base = 1.0 + t * 7.0
-        # Recent wage-cut anger amplifies strike risk independently of morale
-        anger_boost = getattr(self, "_wage_anger", 0.0) / 100.0 * 6.0
-        return base + anger_boost
+            return 1.0 + t * 7.0
 
     def _weighted_event_choice(self):
         """Pick a random event, biasing crew_strike by current morale."""
@@ -626,6 +617,7 @@ class Economy:
                 cost_type = "owned"
             result.append({
                 "id":        t["id"],
+                "nickname":  t.get("nickname", f"L{t['id']}"),
                 "name":      t.get("model_name", "Unknown"),
                 "daily":     daily,
                 "cost_type": cost_type,
@@ -639,25 +631,9 @@ class Economy:
         return result
 
     def adjust_wage(self, delta):
-        """Adjust hourly wage rate. Floor is UK 2025 National Living Wage (£11.44).
-
-        A pay *cut* (delta < 0) triggers an immediate morale shock — 60 % of the
-        gap to the new morale target is applied instantly rather than waiting for
-        the daily 12 % drift — and spikes _wage_anger proportional to the cut
-        size, giving a strong short-term boost to strike probability.
-        """
-        old = self.hourly_wage_rate
+        """Adjust hourly wage rate. Floor is UK 2025 National Living Wage (£11.44)."""
         self.hourly_wage_rate = round(
             max(11.44, min(50.0, self.hourly_wage_rate + delta)), 2)
-        actual = self.hourly_wage_rate - old
-        if actual < 0:
-            # Immediate morale shock: snap 60 % of the way to the new target
-            target = self._morale_target()
-            self.worker_morale = max(
-                0.0, self.worker_morale + (target - self.worker_morale) * 0.60)
-            # Anger spike: each £1/hr cut adds ~8 anger (capped at 50 per cut)
-            self._wage_anger = min(
-                100.0, getattr(self, "_wage_anger", 0.0) + min(50.0, abs(actual) * 8.0))
 
     def adjust_pension(self, delta):
         """Adjust employer pension contribution. Auto-enrolment floor is 3 %."""

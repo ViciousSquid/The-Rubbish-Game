@@ -331,6 +331,9 @@ class UIManager:
         self.planner_cells = []
         self.planner_widgets = []
         self._planner_close = None
+        # Truck rename state
+        self._renaming_truck_id = None
+        self._rename_buffer = ""
         self._setup_buttons()
 
     def _setup_buttons(self):
@@ -342,7 +345,7 @@ class UIManager:
             {"rect": pygame.Rect(x + half + 8, 0, half,  34), "label": "1x",                 "action": "speed",     "row_offset": 0},
             {"rect": pygame.Rect(x,            0, inner, 34), "label": "Procure Vehicle",     "action": "fleet_tab", "row_offset": 42},
             {"rect": pygame.Rect(x,            0, inner, 34), "label": "Hire Crew", "cost": 2500, "action": "worker",   "row_offset": 80},
-            {"rect": pygame.Rect(x,            0, inner, 34), "label": "Collection Planner",  "action": "planner",   "row_offset": 118},
+            {"rect": pygame.Rect(x,            0, inner, 34), "label": "MANAGE (TAB)",  "action": "planner",   "row_offset": 118},
         ]
 
     def handle_click(self, pos):
@@ -394,6 +397,40 @@ class UIManager:
         critical = event.get("effect") in ("crewStrike", "truckBreakdown")
         self._event_duration = 10.0 if critical else 5.5
 
+    # ----------------------------------------------------------------- rename
+    def handle_key(self, event):
+        """Route keyboard events to the truck rename field when active."""
+        if self._renaming_truck_id is None:
+            return False
+        if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self._commit_rename()
+        elif event.key == pygame.K_ESCAPE:
+            self._cancel_rename()
+        elif event.key == pygame.K_BACKSPACE:
+            self._rename_buffer = self._rename_buffer[:-1]
+        elif event.unicode and event.unicode.isprintable():
+            if len(self._rename_buffer) < 12:
+                self._rename_buffer += event.unicode
+        return True
+
+    def _start_rename(self, truck_id, current_nickname):
+        self._renaming_truck_id = truck_id
+        self._rename_buffer = current_nickname
+
+    def _commit_rename(self):
+        name = self._rename_buffer.strip()
+        if name and self._renaming_truck_id is not None:
+            for t in self.game.fleet.trucks:
+                if t["id"] == self._renaming_truck_id:
+                    t["nickname"] = name
+                    break
+        self._renaming_truck_id = None
+        self._rename_buffer = ""
+
+    def _cancel_rename(self):
+        self._renaming_truck_id = None
+        self._rename_buffer = ""
+
     def _flash_insufficient(self):
         self._insufficient_funds_flash = True
         self._flash_timer = 0
@@ -411,7 +448,7 @@ class UIManager:
         elif btn["action"] == "speed":
             label = f"{self.game.speed}x Speed"
         elif btn["action"] == "planner":
-            label = "Close Planner" if self.game.planner_open else "Collection Planner"
+            label = "Close" if self.game.planner_open else "MANAGE (TAB)"
         enabled = affordable
         accent = btn["action"] in ("fleet_tab", "worker")
         ui.button(rect, label, enabled=enabled, accent=accent, hovered=hovered)
@@ -1252,7 +1289,7 @@ class UIManager:
                 c.TEXT_MUTED, col2_x + 136, ry + 2)
         ry += 24
 
-        CARD_H = 90
+        CARD_H = 96
         veh_bd = eco.vehicle_cost_breakdown(fleet.trucks)
         shown  = 0
         for vb in veh_bd:
@@ -1263,8 +1300,9 @@ class UIManager:
                         c.TEXT_DIM, col2_x, ry)
                 break
 
-            is_broken = vb["broken"]
-            ui.card(col2_x, ry, col2_w, CARD_H, selected=is_broken)
+            is_broken  = vb["broken"]
+            is_renaming = (self._renaming_truck_id == vb["id"])
+            ui.card(col2_x, ry, col2_w, CARD_H, selected=is_broken or is_renaming)
 
             # Left accent stripe: colour = cost type
             type_stripe = {
@@ -1280,45 +1318,61 @@ class UIManager:
             id_surf = ui.fonts.render("badge", f"#{vb['id']}", c.ACCENT_AMBER)
             screen.blit(id_surf, (col2_x + 10, ry + 10))
 
-            # Model name
-            nm_col = c.STATUS_BAD if is_broken else c.TEXT_PRIMARY
-            ui.text("body_b", vb["name"], nm_col, col2_x + 34, ry + 8)
+            # Nickname (editable) or rename input field
+            nickname = vb.get("nickname", f"L{vb['id']}")
+            nm_col   = c.STATUS_BAD if is_broken else c.TEXT_PRIMARY
+            if is_renaming:
+                inp_r = pygame.Rect(col2_x + 34, ry + 6, col2_w - 120, 22)
+                ui.inset_panel(inp_r.x, inp_r.y, inp_r.w, inp_r.h)
+                ui.text("mono_b", self._rename_buffer + "|",
+                        c.ACCENT_AMBER, inp_r.x + 6, inp_r.y + 4)
+            else:
+                ui.text("body_b", nickname, nm_col, col2_x + 34, ry + 8)
+
+            # Model name (muted, below nickname)
+            ui.text("caption", vb["name"], c.TEXT_DIM, col2_x + 34, ry + 26)
 
             # Daily cost (top-right)
             ui.text("mono_b", f"£{vb['daily']:.0f}/day",
                     c.TEXT_PRIMARY, col2_x + col2_w - 10, ry + 8, align="right")
 
-            # Cost-type + broken badges (row 2)
+            # Cost-type + broken badges
             type_text = {"owned": "OWNED", "lease": "LEASED",
                          "rental": "RENTAL"}.get(vb["cost_type"], "?")
             type_tc = {"owned":  (c.ACCENT_TEAL,  (18, 50, 54)),
                        "lease":  (c.ACCENT_AMBER, (54, 44, 16)),
                        "rental": (c.STATUS_BAD,   (56, 20, 20))}.get(
                            vb["cost_type"], (c.TEXT_MUTED, c.BG_DEEP))
-            ui.badge(col2_x + 10, ry + 30, type_text,
-                     type_tc[0], type_tc[1])
+            ui.badge(col2_x + 10, ry + 40, type_text, type_tc[0], type_tc[1])
             if is_broken:
-                ui.badge(col2_x + 74, ry + 30, "BROKEN",
-                         c.STATUS_BAD, (72, 18, 18))
+                ui.badge(col2_x + 74, ry + 40, "BROKEN", c.STATUS_BAD, (72, 18, 18))
 
             # Crew / capacity
             ui.text("caption",
                     f"crew {vb['crew']}  |  cap {vb['capacity']:,}",
-                    c.TEXT_MUTED, col2_x + 10, ry + 52)
+                    c.TEXT_MUTED, col2_x + 10, ry + 62)
 
-            # Cost breakdown
-            ui.text("caption",
-                    f"fuel £{vb['fuel']}  ·  maint £{vb['maint']}"
-                    f"  ·  ins £{vb['ins']}",
-                    c.TEXT_DIM, col2_x + 10, ry + 66)
+            # Rename / OK+Cancel  and  Scrap buttons (bottom-right)
+            btn_y  = ry + 64
+            scrap_r  = pygame.Rect(col2_x + col2_w - 64, btn_y, 56, 24)
+            if is_renaming:
+                ok_r     = pygame.Rect(col2_x + col2_w - 128, btn_y, 56, 24)
+                self._pbtn(screen, ok_r, "OK",
+                           lambda: self._commit_rename(),
+                           fkey="body_s", accent=True)
+                self._pbtn(screen, scrap_r, "Cancel",
+                           lambda: self._cancel_rename(),
+                           fkey="body_s")
+            else:
+                rename_r = pygame.Rect(col2_x + col2_w - 128, btn_y, 56, 24)
+                self._pbtn(screen, rename_r, "Rename",
+                           lambda tid=vb["id"], nn=nickname: self._start_rename(tid, nn),
+                           fkey="body_s")
+                self._pbtn(screen, scrap_r, "Scrap",
+                           lambda tid=vb["id"]: self._scrap_truck(tid),
+                           fkey="body_s")
 
-            # Scrap button
-            scrap_r = pygame.Rect(col2_x + col2_w - 66, ry + 50, 58, 26)
-            self._pbtn(screen, scrap_r, "Scrap",
-                       lambda tid=vb["id"]: self._scrap_truck(tid),
-                       fkey="body_s")
-
-            ry  += CARD_H + 6
+            ry   += CARD_H + 6
             shown += 1
 
         if not fleet.trucks:
