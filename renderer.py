@@ -2,6 +2,19 @@ import pygame
 import math
 from city import AREA_COLS, AREA_ROWS, DAY_NAMES
 
+# Try to load icon.ico for truck sprites
+try:
+    from PIL import Image
+    _ico_path = "icon.ico"
+    _truck_icon = None
+    if os.path.exists(_ico_path):
+        img = Image.open(_ico_path)
+        # Convert to RGBA and create pygame surface
+        img = img.convert("RGBA")
+        _truck_icon = pygame.image.fromstring(img.tobytes(), img.size, "RGBA")
+except Exception:
+    _truck_icon = None
+
 
 def _shade(color, f):
     """Multiply an (r,g,b) or hex colour by factor f, clamped to 0..255."""
@@ -44,6 +57,17 @@ STYLE_FOOTPRINT = {
     "shop": 0.90, "office": 0.80, "warehouse": 0.92, "highrise": 0.66,
 }
 
+# Zone type colors for ground tiles - clearly differentiated
+RESIDENTIAL_ZONE = (104, 150, 86)      # Warm green for residential
+COMMERCIAL_ZONE = (96, 116, 84)         # Cooler blue-green for commercial
+ROAD_COLOR = (78, 80, 86)
+GREEN_ZONE = (95, 145, 85)
+
+# Area overlay colors by route type
+RESIDENTIAL_AREA_COLOR = (200, 220, 180, 40)
+COMMERCIAL_AREA_COLOR = (180, 200, 230, 40)
+MIXED_AREA_COLOR = (220, 210, 180, 40)
+
 
 class Renderer:
     def __init__(self, screen, camera):
@@ -52,8 +76,19 @@ class Renderer:
         self.tile_w = 64
         self.tile_h = 32
 
+        # Load truck icon if available
+        self._truck_icon = None
+        try:
+            from PIL import Image
+            ico_path = "icon.ico"
+            if os.path.exists(ico_path):
+                img = Image.open(ico_path).convert("RGBA")
+                self._truck_icon = pygame.image.fromstring(img.tobytes(), img.size, "RGBA")
+        except Exception:
+            self._truck_icon = None
+
     # ----------------------------------------------------------------- render
-    def render(self, city, fleet, selected_tile=None, today=0, show_areas=False):
+    def render(self, city, fleet, selected_tile=None, today=0, show_areas=False, hovered_tile=None):
         cx = self.screen.get_width() // 2 + self.camera["x"]
         cy = 120 + self.camera["y"]
         zoom = self.camera["zoom"]
@@ -74,9 +109,10 @@ class Renderer:
 
                 tile = city.get_tile(x, y)
                 selected = selected_tile and selected_tile["x"] == x and selected_tile["y"] == y
-                self.draw_tile(ix, iy, tile, selected, zoom)
-                if tile.type != "road":
-                    self.draw_building(ix, iy, tile, zoom, today)
+                hovered = hovered_tile and hovered_tile["x"] == x and hovered_tile["y"] == y
+                self.draw_tile(ix, iy, tile, selected, zoom, city)
+                if tile.type not in ("road", "green"):
+                    self.draw_building(ix, iy, tile, zoom, today, hovered)
 
         # Depot
         depot_iso = self.to_iso(fleet.depot_x, fleet.depot_y)
@@ -130,28 +166,90 @@ class Renderer:
         return {"x": round(tile_x), "y": round(tile_y)}
 
     # ------------------------------------------------------------- tile floor
-    def draw_tile(self, x, y, tile, is_selected, zoom):
-        if tile.type == "road":
-            base = (78, 80, 86)
-        elif tile.type == "commercial":
-            base = (96, 116, 84)
-        else:
-            base = (104, 150, 86)
-
+    def draw_tile(self, x, y, tile, is_selected, zoom, city=None):
         hw = (self.tile_w / 2) * zoom
         hh = (self.tile_h / 2) * zoom
         points = [(x, y), (x + hw, y + hh), (x, y + 2 * hh), (x - hw, y + hh)]
+
+        # ---- ROAD (more prominent) ----
+        if tile.type == "road":
+            pygame.draw.polygon(self.screen, ROAD_COLOR, points)
+            # Curb outline
+            pygame.draw.polygon(self.screen, (55, 58, 65), points, max(2, int(1.5 * zoom)))
+            # Thicker, brighter centre line
+            if zoom >= 0.5:
+                cxp, cyp = x, y + hh
+                line_w = max(2, int(zoom * 1.2))
+                pygame.draw.line(self.screen, (175, 175, 155),
+                                 (cxp - hw * 0.45, cyp + hh * 0.45),
+                                 (cxp + hw * 0.45, cyp - hh * 0.45),
+                                 line_w)
+            if is_selected:
+                pygame.draw.polygon(self.screen, (245, 245, 245), points, max(2, int(2 * zoom)))
+            return
+
+        # ---- GREEN SPACE ----
+        if tile.type == "green":
+            pygame.draw.polygon(self.screen, GREEN_ZONE, points)
+            if zoom >= 0.8:
+                cx = x
+                cy = y + hh
+                trunk_h = max(3, int(6 * zoom))
+                trunk_w = max(2, int(3 * zoom))
+                canopy_r = max(3, int(7 * zoom))
+                # Trunk
+                pygame.draw.rect(self.screen, (120, 90, 60),
+                                 pygame.Rect(int(cx - trunk_w/2), int(cy - trunk_h),
+                                             trunk_w, trunk_h))
+                # Canopy
+                pygame.draw.circle(self.screen, (70, 130, 60),
+                                   (int(cx), int(cy - trunk_h)), canopy_r)
+                pygame.draw.circle(self.screen, (100, 170, 85),
+                                   (int(cx - canopy_r*0.3), int(cy - trunk_h - canopy_r*0.2)),
+                                   int(canopy_r*0.7))
+            if is_selected:
+                pygame.draw.polygon(self.screen, (245, 245, 245), points, max(2, int(2 * zoom)))
+            return
+
+        # ---- RESIDENTIAL / COMMERCIAL ----
+        if tile.type == "commercial":
+            base = COMMERCIAL_ZONE
+        else:
+            base = RESIDENTIAL_ZONE
+
         pygame.draw.polygon(self.screen, base, points)
 
-        detail = zoom >= 1.15
-        if detail and tile.type == "road":
-            cxp, cyp = x, y + hh
-            pygame.draw.line(self.screen, (150, 150, 120),
-                             (cxp - hw * 0.5, cyp + hh * 0.5),
-                             (cxp + hw * 0.5, cyp - hh * 0.5),
-                             max(1, int(zoom)))
+        # Zone indicator dot
+        if zoom >= 0.8:
+            if tile.type == "commercial":
+                indicator = (120, 145, 110)
+            else:
+                indicator = (130, 175, 110)
+            cx = x
+            cy = y + hh
+            pygame.draw.circle(self.screen, indicator, (int(cx), int(cy)), max(1, int(2 * zoom)))
 
+        detail = zoom >= 1.15
+
+        # ---- SELECTION TINT ----
         if is_selected:
+            tint_color = None
+            if tile.type == "residential":
+                tint_color = (120, 255, 120, 110)   # transparent green
+            elif tile.type == "commercial":
+                tint_color = (120, 200, 255, 110)   # transparent blue
+
+            if tint_color:
+                tint_surf = pygame.Surface((int(hw * 2.4), int(hh * 2.4)), pygame.SRCALPHA)
+                tint_pts = [
+                    (int(hw * 1.2), int(hh * 0.2)),
+                    (int(hw * 2.2), int(hh * 1.2)),
+                    (int(hw * 1.2), int(hh * 2.2)),
+                    (int(hw * 0.2), int(hh * 1.2)),
+                ]
+                pygame.draw.polygon(tint_surf, tint_color, tint_pts)
+                self.screen.blit(tint_surf, (int(x - hw * 0.2), int(y - hh * 0.2)))
+
             pygame.draw.polygon(self.screen, (245, 245, 245), points, max(2, int(2 * zoom)))
         elif detail:
             pygame.draw.polygon(self.screen, (40, 46, 40), points, max(1, int(zoom)))
@@ -191,7 +289,10 @@ class Renderer:
             "right": right_face, "left": left_face,
         }
 
-    def draw_building(self, x, y, tile, zoom, today):
+    def draw_building(self, x, y, tile, zoom, today, is_hovered=False):
+        if tile.type in ("road", "green"):
+            return
+
         hw = (self.tile_w / 2) * zoom
         hh = (self.tile_h / 2) * zoom
         style = tile.building_style
@@ -215,6 +316,31 @@ class Renderer:
                 (b["cxc"] + hw * f * 1.15, b["cyc"] + hh * 0.25),
                 (b["cxc"] + hw * 0.1, b["cyc"] - hh * f * 0.3),
             ])
+
+        # ---- HOVER TINT ----
+        if is_hovered:
+            if tile.type == "residential":
+                hover_color = (120, 255, 120, 90)   # transparent green
+            elif tile.type == "commercial":
+                hover_color = (120, 200, 255, 90)   # transparent blue
+            else:
+                hover_color = None
+
+            if hover_color:
+                # Tint the entire building silhouette (walls + roof base)
+                hover_surf = pygame.Surface((int(hw * 2.6), int(hh * 2.6 + H)), pygame.SRCALPHA)
+                # Build a polygon that covers the building footprint projected up
+                # Use the wall faces as the base shape
+                hover_pts = [
+                    (int(hw * 1.3), int(hh * 1.3)),
+                    (int(hw * 2.3), int(hh * 0.3)),
+                    (int(hw * 2.3), int(hh * 0.3 - H)),
+                    (int(hw * 1.3), int(hh * 1.3 - H)),
+                    (int(hw * 0.3), int(hh * 1.3 - H)),
+                    (int(hw * 0.3), int(hh * 1.3)),
+                ]
+                pygame.draw.polygon(hover_surf, hover_color, hover_pts)
+                self.screen.blit(hover_surf, (int(x - hw * 1.3), int(y - hh * 1.3)))
 
         # Walls
         pygame.draw.polygon(self.screen, cc["wr"], list(b["right"]))
@@ -251,6 +377,14 @@ class Renderer:
                 self._glass_details(tile, b, zoom)
             if style == "highrise":
                 self._rooftop_kit(b, zoom, mast=True)
+
+        # Zone type indicator on building (small icon for commercial)
+        if tile.type == "commercial" and zoom >= 1.3:
+            # Small "£" indicator for commercial buildings
+            font = pygame.font.SysFont("segoeui", max(6, int(8 * zoom)), bold=True)
+            text = font.render("£", True, (255, 220, 100))
+            text_rect = text.get_rect(center=(int(b["R_top"][0]), int(b["R_top"][1] + 8 * zoom)))
+            self.screen.blit(text, text_rect)
 
         # Kerbside wheelie bin if due today (close-up only)
         if detail and tile.collection_due == today and tile.bin_fill > 20:
@@ -542,6 +676,26 @@ class Renderer:
 
     # ------------------------------------------------------------- truck
     def draw_truck(self, x, y, truck, zoom):
+        # If icon.ico is available, use it as the truck sprite
+        if self._truck_icon is not None:
+            s = zoom * 1.2
+            flip = truck.get("facing", 1)
+            # Scale the icon to appropriate size
+            icon_size = int(32 * s)
+            scaled = pygame.transform.scale(self._truck_icon, (icon_size, icon_size))
+            if flip < 0:
+                scaled = pygame.transform.flip(scaled, True, False)
+            rect = scaled.get_rect(center=(int(x), int(y - 5 * s)))
+            self.screen.blit(scaled, rect)
+
+            # Draw truck ID label below
+            if zoom > 0.35:
+                font = pygame.font.SysFont("monospace", max(5, int(6 * s)), bold=True)
+                text = font.render(f"L{truck['id']}", True, (255, 255, 255))
+                self.screen.blit(text, text.get_rect(center=(int(x), int(y + 6 * s))))
+            return
+
+        # Fallback: draw the original truck sprite
         state = truck["state"]
         if state == "depot":
             cab_color = (80, 80, 80)
@@ -602,7 +756,8 @@ class Renderer:
 
     # ------------------------------------------------------------- area overlay
     def draw_area_overlay(self, cx, cy, city, zoom, today):
-        """Boundary lines + a small monochrome tag per round (planning view)."""
+        """Boundary lines + a small monochrome tag per round (planning view).
+        Now shows route type (residential/commercial/mixed) with color coding."""
         line = (235, 235, 235)
         for c in range(1, AREA_COLS):
             gx = city.width * c // AREA_COLS
@@ -619,19 +774,36 @@ class Renderer:
             iso = self.to_iso(mid_x, mid_y)
             sx = int(cx + iso[0] * zoom)
             sy = int(cy + iso[1] * zoom)
+
+            # Route type indicator
+            route_type = area.route_type
+            if route_type == "residential":
+                type_color = (150, 220, 150)
+                type_label = "RES"
+            elif route_type == "commercial":
+                type_color = (150, 190, 220)
+                type_label = "COM"
+            else:
+                type_color = (220, 210, 150)
+                type_label = "MIX"
+
             name = font.render(area.name, True, (245, 245, 245))
             day = small.render(DAY_NAMES[area.collection_day]
                                + ("  (today)" if area.collection_day == today else ""),
                                True, (210, 210, 210))
-            w = max(name.get_width(), day.get_width()) + 14
-            h = name.get_height() + day.get_height() + 10
+            type_surf = small.render(type_label, True, type_color)
+            w = max(name.get_width(), day.get_width(), type_surf.get_width()) + 14
+            h = name.get_height() + day.get_height() + type_surf.get_height() + 14
             box = pygame.Rect(sx - w // 2, sy - h // 2, w, h)
             pygame.draw.rect(self.screen, (24, 24, 24), box)
             pygame.draw.rect(self.screen,
                              (245, 245, 245) if area.collection_day == today else (250, 250, 250),
                              box, 2)
+            # Draw route type colored bar on left
+            pygame.draw.rect(self.screen, type_color, pygame.Rect(box.x, box.y, 4, box.height))
             self.screen.blit(name, (box.centerx - name.get_width() // 2, box.y + 4))
-            self.screen.blit(day, (box.centerx - day.get_width() // 2, box.y + 6 + name.get_height()))
+            self.screen.blit(type_surf, (box.centerx - type_surf.get_width() // 2, box.y + 6 + name.get_height()))
+            self.screen.blit(day, (box.centerx - day.get_width() // 2, box.y + 8 + name.get_height() + type_surf.get_height()))
 
     # ------------------------------------------------------------- helpers
     @staticmethod

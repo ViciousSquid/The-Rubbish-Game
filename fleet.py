@@ -174,7 +174,7 @@ class FleetManager:
 
     def _bin_serviceable(self, x, y, today, area_id=None):
         tile = self.game.city.get_tile(x, y)
-        if tile is None or tile.type == "road":
+        if tile is None or tile.type in ("road", "green"):
             return False
         if tile.bin_fill <= self.service_threshold:
             return False
@@ -465,7 +465,7 @@ class FleetManager:
         for y in range(city.height):
             for x in range(city.width):
                 tile = city.tiles[y][x]
-                if tile.type == "road" or tile.bin_fill <= 50:
+                if tile.type in ("road", "green") or tile.bin_fill <= 50:
                     continue
                 area = city.get_area(tile.area_id)
                 if area and area.due_today(today, week):
@@ -481,7 +481,7 @@ class FleetManager:
         for y in range(city.height):
             for x in range(city.width):
                 tile = city.tiles[y][x]
-                if tile.type == "road" or tile.bin_fill <= 85:
+                if tile.type in ("road", "green") or tile.bin_fill <= 85:
                     continue
                 area = city.get_area(tile.area_id)
                 if area and not area.due_today(today, week):

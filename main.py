@@ -28,6 +28,7 @@ class WasteCityGame:
         self.mouse = {"x": 0, "y": 0}
 
         self.selected_tile = None
+        self.hovered_tile = None
         self.planner_open = False
         self.planner_tab = "rounds"      # rounds | waste | fleet | finance | data
         self.show_areas = False
@@ -46,23 +47,7 @@ class WasteCityGame:
         self.ui = UIManager(self)
         self.renderer = Renderer(self.screen, self.camera)
 
-        # Menu bar state
-        self.menu_bar_height = 28
-        self.menu_items = []
-        self.menu_open = False
-        self.menu_item_rects = []
-        self._setup_menu()
-
         self._center_camera()
-
-    def _setup_menu(self):
-        self.menu_font = pygame.font.SysFont("segoeui", 12)
-        self.menu_hover_font = pygame.font.SysFont("segoeui", 12, bold=True)
-        self.menu_items = [
-            {"label": "Open Collection Planner", "action": self._toggle_planner},
-            {"label": "Toggle Round Overlay (G)", "action": self._toggle_areas},
-            {"label": "Clear and Regenerate", "action": self._clear_and_regenerate},
-        ]
 
     # ---------------------------------------------------------------- actions
     def _toggle_planner(self):
@@ -111,14 +96,6 @@ class WasteCityGame:
             self.ui.handle_planner_click((screen_x, screen_y))
             return
 
-        if screen_y < self.menu_bar_height:
-            self._handle_menu_click(screen_x, screen_y)
-            return
-
-        if self.menu_open:
-            self.menu_open = False
-            return
-
         if screen_x < 252:
             self.ui.handle_click((screen_x, screen_y))
             return
@@ -136,24 +113,22 @@ class WasteCityGame:
         else:
             self.selected_tile = {"x": coord["x"], "y": coord["y"], "tile": tile}
 
-    def _handle_menu_click(self, screen_x, screen_y):
-        debug_btn_rect = pygame.Rect(4, 2, 60, self.menu_bar_height - 4)
-        if not self.menu_open and debug_btn_rect.collidepoint(screen_x, screen_y):
-            self.menu_open = True
-            return
-        if self.menu_open:
-            for i, item_rect in enumerate(self.menu_item_rects):
-                if item_rect.collidepoint(screen_x, screen_y):
-                    self.menu_items[i]["action"]()
-                    self.menu_open = False
-                    return
-            self.menu_open = False
-
     def clear_selection(self):
         self.selected_tile = None
+        self.hovered_tile = None
 
     # ----------------------------------------------------------------- update
     def update(self, dt):
+        # Track hovered tile for building tinting
+        coord = self.renderer.screen_to_tile(self.mouse["x"], self.mouse["y"],
+                                               self.screen.get_width(),
+                                               self.screen.get_height())
+        tile = self.city.get_tile(coord["x"], coord["y"])
+        if tile and tile.type not in ("road", "green"):
+            self.hovered_tile = {"x": coord["x"], "y": coord["y"], "tile": tile}
+        else:
+            self.hovered_tile = None
+
         bin_mult = self.economy.get_bin_rate_multiplier() * self.waste.fill_multiplier()
         self.city.update(dt, bin_mult)
         self.fleet.update(dt)
@@ -192,55 +167,10 @@ class WasteCityGame:
             pygame.draw.line(self.screen, (g, g, int(g * 1.1)), (0, i), (w, i), 2)
 
         self.renderer.render(self.city, self.fleet, self.selected_tile,
-                             self.economy.get_day_of_week(), self.show_areas)
+                             self.economy.get_day_of_week(), self.show_areas,
+                             self.hovered_tile)
         self.ui.draw(self.screen)
-        self._draw_menu_bar()
         pygame.display.flip()
-
-    def _draw_menu_bar(self):
-        w = self.screen.get_width()
-        pygame.draw.rect(self.screen, (24, 24, 24), pygame.Rect(0, 0, w, self.menu_bar_height))
-        pygame.draw.line(self.screen, (96, 96, 96), (0, self.menu_bar_height), (w, self.menu_bar_height), 1)
-
-        mouse_pos = pygame.mouse.get_pos()
-        debug_btn_rect = pygame.Rect(4, 2, 60, self.menu_bar_height - 4)
-        is_hovered = debug_btn_rect.collidepoint(mouse_pos) or self.menu_open
-        if is_hovered:
-            pygame.draw.rect(self.screen, (54, 54, 54), debug_btn_rect)
-        text = self.menu_hover_font.render("Menu", True, (240, 240, 240)) if is_hovered \
-            else self.menu_font.render("Menu", True, (180, 180, 180))
-        self.screen.blit(text, text.get_rect(center=debug_btn_rect.center))
-
-        # Status hint on the right of the bar
-        hint = self.menu_font.render(
-            f"Round overlay: {'ON' if self.show_areas else 'off'}   |   Tab = planner",
-            True, (140, 140, 140))
-        self.screen.blit(hint, (w - hint.get_width() - 10, 8))
-
-        if self.menu_open:
-            self._draw_menu_dropdown()
-
-    def _draw_menu_dropdown(self):
-        menu_x = 4
-        menu_y = self.menu_bar_height
-        menu_w = 220
-        item_h = 26
-        menu_h = len(self.menu_items) * item_h + 8
-
-        pygame.draw.rect(self.screen, (32, 32, 32), pygame.Rect(menu_x, menu_y, menu_w, menu_h))
-        pygame.draw.rect(self.screen, (96, 96, 96), pygame.Rect(menu_x, menu_y, menu_w, menu_h), 1)
-
-        mouse_pos = pygame.mouse.get_pos()
-        self.menu_item_rects = []
-        for i, item in enumerate(self.menu_items):
-            item_rect = pygame.Rect(menu_x + 4, menu_y + 4 + i * item_h, menu_w - 8, item_h)
-            self.menu_item_rects.append(item_rect)
-            is_hovered = item_rect.collidepoint(mouse_pos)
-            if is_hovered:
-                pygame.draw.rect(self.screen, (66, 66, 66), item_rect)
-            text = self.menu_hover_font.render(item["label"], True, (245, 245, 245)) if is_hovered \
-                else self.menu_font.render(item["label"], True, (200, 200, 200))
-            self.screen.blit(text, (item_rect.x + 8, item_rect.y + 4))
 
     # ------------------------------------------------------------------- loop
     def run(self):
@@ -278,8 +208,6 @@ class WasteCityGame:
                     elif event.key == pygame.K_ESCAPE:
                         if self.planner_open:
                             self.planner_open = False
-                        elif self.menu_open:
-                            self.menu_open = False
                         else:
                             self.clear_selection()
 

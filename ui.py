@@ -21,6 +21,18 @@ STYLE_LABELS = {
     "highrise": "High-rise",
 }
 
+ROUTE_TYPE_LABELS = {
+    "residential": "Residential",
+    "commercial": "Commercial",
+    "mixed": "Mixed",
+}
+
+ROUTE_TYPE_COLORS = {
+    "residential": (150, 220, 150),
+    "commercial": (150, 190, 220),
+    "mixed": (220, 210, 150),
+}
+
 
 class UIManager:
     def __init__(self, game):
@@ -43,6 +55,8 @@ class UIManager:
             "big": pygame.font.SysFont("segoeui", 22, bold=True),
             "mono": pygame.font.SysFont("consolas", 12),
             "mono_b": pygame.font.SysFont("consolas", 12, bold=True),
+            "win": pygame.font.SysFont("segoeui", 28, bold=True),
+            "win_sub": pygame.font.SysFont("segoeui", 16, bold=True),
         }
 
         # Monochrome palette only. No hues, no transparency.
@@ -58,6 +72,8 @@ class UIManager:
             "dim": (120, 120, 120),
             "white": (245, 245, 245),
             "black": (16, 16, 16),
+            "gold": (255, 215, 0),
+            "green": (100, 220, 100),
         }
 
         self.buttons = []
@@ -153,6 +169,7 @@ class UIManager:
         self._draw_hud(screen, w, h)
         self._draw_event_banner(screen, w)
         self._draw_crisis_banner(screen, w, h)
+        self._draw_win_banner(screen, w, h)
         self._draw_inspect_panel(screen, w, h)
         if self.game.planner_open:
             self._draw_planner(screen, w, h)
@@ -222,6 +239,25 @@ class UIManager:
         pygame.draw.rect(screen, self.c["white"],
                          pygame.Rect(x + 10, y + 24, int(sb_w * eco.satisfaction / 100), 6))
         y += 48
+
+        # Win progress (if not yet won)
+        if not eco.has_won:
+            self._panel(screen, x, y, HUD_W - 28, 32, fill=self.c["panel_lo"])
+            self._text(screen, "tiny", "PERFECT SERVICE STREAK", self.c["muted"], x + 10, y + 4)
+            streak = eco.perfect_days_streak
+            wp = eco.win_progress()
+            self._text_right(screen, "small", f"{streak}/7 days", self.c["green"], right - 2, y + 4)
+            pygame.draw.rect(screen, (50, 50, 50), pygame.Rect(x + 10, y + 20, sb_w, 4))
+            pygame.draw.rect(screen, self.c["green"],
+                             pygame.Rect(x + 10, y + 20, int(sb_w * wp), 4))
+            y += 38
+        else:
+            # Show "CHAMPION" badge
+            self._panel(screen, x, y, HUD_W - 28, 32, fill=self.c["panel_lo"])
+            self._text(screen, "tiny", "STATUS", self.c["muted"], x + 10, y + 4)
+            self._text_right(screen, "small", "CHAMPION", self.c["gold"], right - 2, y + 4)
+            pygame.draw.rect(screen, self.c["gold"], pygame.Rect(x + 10, y + 20, sb_w, 4))
+            y += 38
 
         stats = [
             ("Population", f"{city.population:,}"),
@@ -339,11 +375,52 @@ class UIManager:
         surf = self.fonts["body_b"].render(text, True, self.c["white"])
         screen.blit(surf, surf.get_rect(center=(w // 2, h - 35)))
 
+    def _draw_win_banner(self, screen, w, h):
+        """Draw win celebration banner when player achieves 7 perfect days."""
+        eco = self.game.economy
+        if not eco.has_won:
+            return
+
+        # Fade out over time
+        eco.win_celebration_timer -= 0.016  # approx 60fps
+        if eco.win_celebration_timer <= 0:
+            return
+
+        alpha = min(1.0, eco.win_celebration_timer / 3.0)
+        if alpha <= 0:
+            return
+
+        bw = min(600, w - 100)
+        bh = 120
+        bx = (w - bw) // 2
+        by = (h - bh) // 2 - 50
+
+        # Gold background with fade
+        bg_color = (40, 35, 20)
+        pygame.draw.rect(screen, bg_color, pygame.Rect(bx, by, bw, bh))
+        pygame.draw.rect(screen, self.c["gold"], pygame.Rect(bx, by, bw, bh), 3)
+
+        # Trophy text
+        title = self.fonts["win"].render("★ BOROUGH CHAMPION ★", True, self.c["gold"])
+        screen.blit(title, title.get_rect(center=(w // 2, by + 35)))
+
+        sub = self.fonts["win_sub"].render(
+            f"7 consecutive days with zero complaints! Achieved on Day {eco.win_day}.",
+            True, self.c["white"]
+        )
+        screen.blit(sub, sub.get_rect(center=(w // 2, by + 70)))
+
+        hint = self.fonts["small"].render(
+            "Keep it up to maintain your perfect record!",
+            True, self.c["muted"]
+        )
+        screen.blit(hint, hint.get_rect(center=(w // 2, by + 95)))
+
     # ----------------------------------------------------------- inspect panel
     def _draw_inspect_panel(self, screen, w, h):
         if not self.game.selected_tile or self.game.planner_open:
             return
-        pw, ph = 256, 214
+        pw, ph = 256, 240
         px = w - pw - 16
         py = h - ph - 16
         self._panel(screen, px, py, pw, ph, fill=self.c["panel"])
@@ -356,6 +433,12 @@ class UIManager:
         if tile.type == "road":
             self._text(screen, "header", "Road", self.c["text"], rx, py + 12)
             self._text(screen, "small", "Part of the collection network.",
+                       self.c["muted"], rx, py + 40)
+            return
+
+        if tile.type == "green":
+            self._text(screen, "header", "Green Space", self.c["text"], rx, py + 12)
+            self._text(screen, "small", "Park or garden area.",
                        self.c["muted"], rx, py + 40)
             return
 
@@ -373,6 +456,13 @@ class UIManager:
             row += lh
             self._text(screen, "body", "Collection day", self.c["muted"], rx, row)
             self._text_right(screen, "body_b", DAY_NAMES[area.collection_day], self.c["text"], rr, row)
+            row += lh
+            # Route type with color
+            rt = area.route_type
+            rt_label = ROUTE_TYPE_LABELS.get(rt, rt)
+            rt_color = ROUTE_TYPE_COLORS.get(rt, self.c["text"])
+            self._text(screen, "body", "Route type", self.c["muted"], rx, row)
+            self._text_right(screen, "body_b", rt_label, rt_color, rr, row)
             row += lh + 4
 
         pct = int(tile.bin_fill)
@@ -399,7 +489,6 @@ class UIManager:
         self._text(screen, "small", "Open the planner (Tab) to reschedule rounds.",
                    self.c["dim"], rx, py + ph - 24)
 
-    # ----------------------------------------------------------- planner
     # ----------------------------------------------------------- planner
     def _draw_planner(self, screen, w, h):
         """Tabbed management console. Dispatches to the active tab body."""
@@ -517,7 +606,8 @@ class UIManager:
         name_w = 150
         day_w = 34
         freq_w = 84
-        left_cols = name_w + 7 * day_w + freq_w
+        type_w = 70
+        left_cols = name_w + 7 * day_w + freq_w + type_w
         rest = {"props": 54, "due": 56, "status": 96}
 
         # header
@@ -532,7 +622,9 @@ class UIManager:
                               cell.centerx, ty)
         fx = cxp + 7 * day_w
         self._text_center(screen, "tiny", "FREQ", self.c["dim"], fx + freq_w // 2, ty)
-        sx = fx + freq_w
+        tx = fx + freq_w
+        self._text_center(screen, "tiny", "TYPE", self.c["dim"], tx + type_w // 2, ty)
+        sx = tx + type_w
         for label, key in (("PROPS", "props"), ("LEFT", "due"), ("STATUS", "status")):
             self._text_center(screen, "tiny", label, self.c["dim"], sx + rest[key] // 2, ty)
             sx += rest[key]
@@ -567,7 +659,16 @@ class UIManager:
                        (lambda a=area.id: self._cycle_round_freq(a)),
                        fkey="tiny")
 
-            sx = fx + freq_w
+            # Route type indicator
+            rt = area.route_type
+            rt_color = ROUTE_TYPE_COLORS.get(rt, self.c["text"])
+            rt_label = ROUTE_TYPE_LABELS.get(rt, rt)
+            trect = pygame.Rect(tx + 6, ty - 1, type_w - 12, 18)
+            pygame.draw.rect(screen, self.c["panel_lo"], trect)
+            pygame.draw.rect(screen, rt_color, trect, 1)
+            self._text_center(screen, "tiny", rt_label, rt_color, trect.centerx, ty + 1)
+
+            sx = tx + type_w
             self._text_center(screen, "mono", str(st["props"]), self.c["text"],
                               sx + rest["props"] // 2, ty)
             sx += rest["props"]
@@ -817,20 +918,20 @@ class UIManager:
     # ----------------------------------------------------------- planner: DATA
     def _tab_data(self, screen, x, y, w, h):
         self._text(screen, "small",
-                   "Export the borough plan to a spreadsheet (.xml) you can open "
+                   "Export the borough plan to a spreadsheet (.ods or .xml) you can open "
                    "in Excel or LibreOffice, edit, and import back in.",
                    self.c["muted"], x, y)
         ty = y + 30
 
         exp = pygame.Rect(x, ty, 220, 36)
         imp = pygame.Rect(exp.right + 16, ty, 220, 36)
-        self._pbtn(screen, exp, "Export plan (.xml)", self._export_xml, accent=True)
-        self._pbtn(screen, imp, "Import plan (.xml)", self._import_xml)
+        self._pbtn(screen, exp, "Export plan (.ods/.xml)", self._export_xml, accent=True)
+        self._pbtn(screen, imp, "Import plan (.ods/.xml)", self._import_xml)
         ty += 56
 
         lines = [
             "The workbook contains editable sheets:",
-            "  - Collection Rounds  (day + weekly/fortnightly)",
+            "  - Collection Rounds  (day + weekly/fortnightly + route type)",
             "  - Waste Streams      (which streams are on)",
             "  - Finance            (council tax / business rates)",
             "  - Routes & Staff     (targets)",

@@ -149,6 +149,10 @@ class Area:
         self.building_tiles = []                    # (x, y) of every property
         self.property_count = 0
         self.population = 0
+        # Route type: "residential" or "commercial" or "mixed"
+        self.route_type = "mixed"
+        # Per-day route overrides (day -> list of area_ids to service together)
+        self.route_partners = {}  # day -> [area_id, ...]
 
     def due_today(self, today, week_index):
         """Is this round scheduled for collection today? Fortnightly rounds are
@@ -163,6 +167,22 @@ class Area:
     def freq_label(self):
         return "Weekly" if self.frequency <= 1 else "Fortnightly"
 
+    def get_dominant_type(self, city):
+        """Determine if this area is mostly residential or commercial."""
+        res = 0
+        com = 0
+        for (x, y) in self.building_tiles:
+            t = city.tiles[y][x]
+            if t.type == "residential":
+                res += 1
+            elif t.type == "commercial":
+                com += 1
+        if res > com * 2:
+            return "residential"
+        elif com > res * 2:
+            return "commercial"
+        return "mixed"
+
 
 class CityGenerator:
     def __init__(self, width, height):
@@ -172,7 +192,7 @@ class CityGenerator:
         self.areas = []
         self.population = 0
         self.property_count = 0
-        self.metrics = {"residential": 0, "commercial": 0, "roads": 0}
+        self.metrics = {"residential": 0, "commercial": 0, "roads": 0, "green": 0}
 
     # ------------------------------------------------------------------ areas
     def _area_index(self, x, y):
@@ -217,10 +237,14 @@ class CityGenerator:
         self.tiles = []
         self.population = 0
         self.property_count = 0
-        self.metrics = {"residential": 0, "commercial": 0, "roads": 0}
+        self.metrics = {"residential": 0, "commercial": 0, "roads": 0, "green": 0}
         self._build_areas()
 
         roads = RoadGenerator.generate_grid(self.width, self.height)
+
+        # Randomise green space between 10% and 20%
+        green_threshold = random.uniform(0.10, 0.20)
+        building_threshold = 0.82 + (0.07 - green_threshold)  # keep total probability consistent
 
         for y in range(self.height):
             row = []
@@ -233,7 +257,11 @@ class CityGenerator:
                     self.metrics["roads"] += 1
                 else:
                     roll = random.random()
-                    if roll < 0.82:
+                    if roll < green_threshold:
+                        tile = Tile("green")
+                        tile.area_id = area_id
+                        self.metrics["green"] = self.metrics.get("green", 0) + 1
+                    elif roll < building_threshold:
                         tile = self._make_building("residential", area_id)
                     else:
                         tile = self._make_building("commercial", area_id)
@@ -241,16 +269,21 @@ class CityGenerator:
             self.tiles.append(row)
 
         # Cache per-round stats and sync each tile to its round's day.
+        # Also determine route types (residential vs commercial clusters)
         for y in range(self.height):
             for x in range(self.width):
                 tile = self.tiles[y][x]
-                if tile.type == "road":
+                if tile.type in ("road", "green"):
                     continue
                 area = self.areas[tile.area_id]
                 area.building_tiles.append((x, y))
                 area.property_count += 1
                 area.population += tile.population
                 tile.collection_due = area.collection_day
+
+        # Set route types after all tiles are assigned
+        for area in self.areas:
+            area.route_type = area.get_dominant_type(self)
 
     def _make_building(self, kind, area_id):
         tile = Tile(kind)
@@ -283,7 +316,7 @@ class CityGenerator:
     def update(self, dt, bin_rate_multiplier=1):
         for row in self.tiles:
             for tile in row:
-                if tile.type == "road":
+                if tile.type in ("road", "green"):
                     continue
                 tile.bin_fill += dt * tile.fill_rate * bin_rate_multiplier
                 if tile.bin_fill > 100:
@@ -332,6 +365,7 @@ class CityGenerator:
             "status": status,
             "last": area.last_collected,
             "is_today": is_today,
+            "route_type": area.route_type,
         }
 
     # ---------------------------------------------------------------- access

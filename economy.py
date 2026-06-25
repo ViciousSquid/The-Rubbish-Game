@@ -53,6 +53,12 @@ class Economy:
         self.pending_event = None
         self._bin_rate_multiplier = 1
 
+        # Win condition tracking
+        self.perfect_days_streak = 0       # consecutive days with 0 complaints
+        self.has_won = False
+        self.win_day = None
+        self.win_celebration_timer = 0.0
+
         self.events = [
             {"id": "bank_holiday", "name": "Bank Holiday",
              "desc": "Rubbish output doubles for the day. Mind the overflows.",
@@ -211,6 +217,18 @@ class Economy:
                 self.satisfaction = max(0.0, self.satisfaction - drop)
             self.complaints_today = overflow_count
             self.complaints_total += overflow_count
+
+        # Win condition: 7 consecutive days with 0 complaints
+        if overflow_count == 0:
+            self.perfect_days_streak += 1
+        else:
+            self.perfect_days_streak = 0
+
+        if self.perfect_days_streak >= 7 and not self.has_won:
+            self.has_won = True
+            self.win_day = self.day
+            self.win_celebration_timer = 10.0
+
         # Pull gently toward the service ceiling (more streams -> happier baseline).
         self.satisfaction += (service_ceiling - self.satisfaction) * 0.10
         self.satisfaction = max(0.0, min(100.0, self.satisfaction))
@@ -236,3 +254,7 @@ class Economy:
         if s >= 20:
             return "Failing"
         return "In Crisis"
+
+    def win_progress(self):
+        """Returns progress toward win condition (0.0 to 1.0)."""
+        return min(1.0, self.perfect_days_streak / 7.0)
