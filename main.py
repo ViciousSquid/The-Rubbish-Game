@@ -14,7 +14,7 @@ CITY_H = 60
 class WasteCityGame:
     def __init__(self):
         pygame.init()
-        pygame.display.set_caption("The Rubbish Game")
+        pygame.display.set_caption("Waste Borough - UK Refuse Management Sim")
         self.screen = pygame.display.set_mode((1280, 720), pygame.RESIZABLE)
         self.clock = pygame.time.Clock()
 
@@ -119,6 +119,19 @@ class WasteCityGame:
 
     # ----------------------------------------------------------------- update
     def update(self, dt):
+        # Camera movement from held keys
+        if not self.planner_open:
+            keys = pygame.key.get_pressed()
+            speed = 35 / self.camera["zoom"] * self.speed
+            if keys[pygame.K_w]:
+                self.camera["y"] += speed * dt
+            if keys[pygame.K_s]:
+                self.camera["y"] -= speed * dt
+            if keys[pygame.K_a]:
+                self.camera["x"] += speed * dt
+            if keys[pygame.K_d]:
+                self.camera["x"] -= speed * dt
+
         # Track hovered tile for building tinting
         coord = self.renderer.screen_to_tile(self.mouse["x"], self.mouse["y"],
                                                self.screen.get_width(),
@@ -175,7 +188,7 @@ class WasteCityGame:
     # ------------------------------------------------------------------- loop
     def run(self):
         while True:
-            dt = self.clock.tick(60) / 1000.0 * self.speed
+            dt = self.clock.tick(60) / 1000.0
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -187,20 +200,11 @@ class WasteCityGame:
                     self.ui._setup_buttons()
 
                 elif event.type == pygame.KEYDOWN:
-                    speed = 35 / self.camera["zoom"]
                     tab_keys = {pygame.K_1: "rounds", pygame.K_2: "waste",
                                 pygame.K_3: "fleet", pygame.K_4: "finance",
                                 pygame.K_5: "data"}
                     if self.planner_open and event.key in tab_keys:
                         self.planner_tab = tab_keys[event.key]
-                    elif event.key == pygame.K_w:
-                        self.camera["y"] += speed
-                    elif event.key == pygame.K_s:
-                        self.camera["y"] -= speed
-                    elif event.key == pygame.K_a:
-                        self.camera["x"] += speed
-                    elif event.key == pygame.K_d:
-                        self.camera["x"] -= speed
                     elif event.key == pygame.K_TAB:
                         self.planner_open = not self.planner_open
                     elif event.key == pygame.K_g:

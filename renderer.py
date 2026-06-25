@@ -1,11 +1,12 @@
 import pygame
 import math
+import os
 from city import AREA_COLS, AREA_ROWS, DAY_NAMES
 
-# Try to load icon.ico for truck sprites
+# Try to load truck.png for truck sprites
 try:
     from PIL import Image
-    _ico_path = "icon.ico"
+    _ico_path = "truck.png"
     _truck_icon = None
     if os.path.exists(_ico_path):
         img = Image.open(_ico_path)
@@ -80,9 +81,9 @@ class Renderer:
         self._truck_icon = None
         try:
             from PIL import Image
-            ico_path = "icon.ico"
-            if os.path.exists(ico_path):
-                img = Image.open(ico_path).convert("RGBA")
+            png_path = "truck.png"
+            if os.path.exists(png_path):
+                img = Image.open(png_path).convert("RGBA")
                 self._truck_icon = pygame.image.fromstring(img.tobytes(), img.size, "RGBA")
         except Exception:
             self._truck_icon = None
@@ -112,7 +113,7 @@ class Renderer:
                 hovered = hovered_tile and hovered_tile["x"] == x and hovered_tile["y"] == y
                 self.draw_tile(ix, iy, tile, selected, zoom, city)
                 if tile.type not in ("road", "green"):
-                    self.draw_building(ix, iy, tile, zoom, today, hovered)
+                    self.draw_building(ix, iy, tile, zoom, today, hovered, selected)
 
         # Depot
         depot_iso = self.to_iso(fleet.depot_x, fleet.depot_y)
@@ -289,7 +290,7 @@ class Renderer:
             "right": right_face, "left": left_face,
         }
 
-    def draw_building(self, x, y, tile, zoom, today, is_hovered=False):
+    def draw_building(self, x, y, tile, zoom, today, is_hovered=False, is_selected=False):
         if tile.type in ("road", "green"):
             return
 
@@ -317,20 +318,56 @@ class Renderer:
                 (b["cxc"] + hw * 0.1, b["cyc"] - hh * f * 0.3),
             ])
 
-        # ---- HOVER TINT ----
-        if is_hovered:
+        # ---- SELECTION TINT & WIREFRAME ----
+        if is_selected:
             if tile.type == "residential":
-                hover_color = (120, 255, 120, 90)   # transparent green
+                sel_color = (120, 255, 120, 120)   # brighter green
+                wire_color = (80, 220, 80)
             elif tile.type == "commercial":
-                hover_color = (120, 200, 255, 90)   # transparent blue
+                sel_color = (120, 200, 255, 120)   # brighter blue
+                wire_color = (80, 170, 255)
+            else:
+                sel_color = None
+                wire_color = (255, 255, 255)
+
+            if sel_color:
+                sel_surf = pygame.Surface((int(hw * 2.6), int(hh * 2.6 + H)), pygame.SRCALPHA)
+                sel_pts = [
+                    (int(hw * 1.3), int(hh * 1.3)),
+                    (int(hw * 2.3), int(hh * 0.3)),
+                    (int(hw * 2.3), int(hh * 0.3 - H)),
+                    (int(hw * 1.3), int(hh * 1.3 - H)),
+                    (int(hw * 0.3), int(hh * 1.3 - H)),
+                    (int(hw * 0.3), int(hh * 1.3)),
+                ]
+                pygame.draw.polygon(sel_surf, sel_color, sel_pts)
+                self.screen.blit(sel_surf, (int(x - hw * 1.3), int(y - hh * 1.3)))
+
+            # Wireframe outline around the building silhouette
+            outline_pts = [
+                (x - hw * f, y + hh * f),       # B_left
+                (x, y + 2 * hh * f),             # B_bot
+                (x + hw * f, y + hh * f),        # B_right
+                (x + hw * f, y + hh * f - H),    # R_right
+                (x, y - H),                       # R_top (approx)
+                (x - hw * f, y + hh * f - H),    # R_left
+            ]
+            for i in range(len(outline_pts)):
+                p1 = outline_pts[i]
+                p2 = outline_pts[(i + 1) % len(outline_pts)]
+                pygame.draw.line(self.screen, wire_color, p1, p2, max(2, int(2 * zoom)))
+
+        # ---- HOVER TINT ----
+        elif is_hovered:
+            if tile.type == "residential":
+                hover_color = (120, 255, 120, 70)   # subtle green
+            elif tile.type == "commercial":
+                hover_color = (120, 200, 255, 70)   # subtle blue
             else:
                 hover_color = None
 
             if hover_color:
-                # Tint the entire building silhouette (walls + roof base)
                 hover_surf = pygame.Surface((int(hw * 2.6), int(hh * 2.6 + H)), pygame.SRCALPHA)
-                # Build a polygon that covers the building footprint projected up
-                # Use the wall faces as the base shape
                 hover_pts = [
                     (int(hw * 1.3), int(hh * 1.3)),
                     (int(hw * 2.3), int(hh * 0.3)),
