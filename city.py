@@ -12,14 +12,14 @@ AREA_ROWS = 3                       # -> 12 rounds
 
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-# British-sounding ward names (a couple of Welsh ones for Cardiff flavour).
+# British-sounding ward names
 AREA_NAMES = [
     "Northgate", "Elmwood", "Riverside", "St Catherine's",
-    "Oakfield", "Hillcrest", "Kingsbury", "Castell Coch",
-    "Greenway", "Old Town", "Llanfair", "Brookside",
+    "Oakfield", "Hillcrest", "Kingsbury", "Castell",
+    "Uffolk", "Old Town", "Llanfair", "Brookside",
     "Cathedral", "Saltmarsh", "Maple Park", "Westbrook",
     "Green Park", "Parkside", "Greenfield", "Meadow Park",
-    "Oak Park", "Spring Green", "Parklands", "Green Hill",
+    "Oak Park", "Spring Green", "Ystrad", "Green Hill",
 ]
 
 # ---------------------------------------------------------------------------
