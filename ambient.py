@@ -1,22 +1,3 @@
-"""
-ambient.py
-==========
-
-Purely cosmetic city-life systems.  Nothing here affects gameplay.
-
-  AmbientTraffic  — civilian cars driving along the road network
-  AmbientBirds    — seagulls orbiting the landfill
-  AmbientPeds     — pedestrians ambling on road tiles
-
-Density-aware spawning
-----------------------
-A density weight is computed once per road tile on city load: tiles near
-towers, high-rises and offices score high; tiles beside parks and green
-spaces score low (actively negative contribution).  All spawning then draws
-start/goal positions from this weighted distribution, so urban streets
-bustle while leafy avenues stay quiet.
-"""
-
 import random
 import math
 from collections import deque
@@ -377,6 +358,53 @@ class AmbientPeds:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+#  Red Phone Boxes
+# ────────────────────────────────────────────────────────────────────────────
+
+class AmbientPhoneBoxes:
+    """Iconic British K6 red telephone kiosks scattered sparsely on street corners."""
+
+    def __init__(self):
+        self.boxes      = []
+        self._built_for = None
+
+    def _rebuild(self, city):
+        self.boxes = []
+        road_list = _road_list_from(city)
+        road_set = set(road_list)
+        corners = []
+
+        for (x, y) in road_list:
+            # Check adjacent tiles to discover true corner nodes
+            neighbors = []
+            for dx, dy in ADJ:
+                if (x + dx, y + dy) in road_set:
+                    neighbors.append((dx, dy))
+            
+            # A clean corner junction will feature exactly two adjacent perpendicular roads
+            if len(neighbors) == 2:
+                (dx1, dy1), (dx2, dy2) = neighbors
+                if dx1 != dx2 and dy1 != dy2:
+                    corners.append((x, y))
+
+        # Maintain true scarcity: Sample roughly 1% of valid street corners
+        if corners:
+            num_boxes = max(1, len(corners) // 100)
+            chosen_corners = random.sample(corners, min(len(corners), num_boxes))
+            for (cx, cy) in chosen_corners:
+                self.boxes.append({
+                    "x":     float(cx),
+                    "y":     float(cy),
+                    "color": (210, 35, 35),  # Post Office Red
+                })
+        self._built_for = city
+
+    def update(self, dt, city):
+        if self._built_for is not city:
+            self._rebuild(city)
+
+
+# ────────────────────────────────────────────────────────────────────────────
 #  Container
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -384,12 +412,14 @@ class AmbientState:
     """Single object wired into main.py update/render loops."""
 
     def __init__(self):
-        self.traffic = AmbientTraffic()
-        self.birds   = AmbientBirds()
-        self.peds    = AmbientPeds()
+        self.traffic     = AmbientTraffic()
+        self.birds       = AmbientBirds()
+        self.peds        = AmbientPeds()
+        self.phone_boxes = AmbientPhoneBoxes()
 
     def update(self, dt, city, fleet=None):
         on_strike = getattr(fleet, "on_strike", False) if fleet else False
         self.traffic.update(dt, city)
         self.birds.update(dt, city)
         self.peds.update(dt, city, on_strike=on_strike)
+        self.phone_boxes.update(dt, city)

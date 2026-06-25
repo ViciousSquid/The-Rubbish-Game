@@ -287,46 +287,6 @@ class Economy:
                 self._clear_event_effects(self.active_event, city, fleet)
                 self.active_event = None
 
-        # ---- fire a new event (at most one active at a time) -----------------
-        if not self.active_event and random.random() < self.event_chance:
-            template = self._weighted_event_choice()
-            evt = {**template, "remaining_days": template["duration"]}
-            effect = template["effect"]
-
-            if effect == "truckBreakdown" and fleet:
-                days = random.randint(1, 7)
-                evt["remaining_days"] = days
-                evt["duration"]       = days
-                bd_name = self._apply_truck_breakdown(fleet)
-                if bd_name:
-                    evt["desc"] = (f"{bd_name} has broken down and will be out of "
-                                   f"action for {days} day{'s' if days != 1 else ''}.")
-            elif effect == "money":
-                self.budget = max(0, self.budget + template["value"])
-                self.ledger["grants"] += max(0, template["value"])
-            elif effect == "crewStrike" and fleet:
-                fleet.on_strike = True
-            elif effect == "councilInspection":
-                if self.satisfaction >= 70:
-                    bonus = 22000
-                    self.budget = max(0, self.budget + bonus)
-                    self.ledger["grants"] += bonus
-                    evt["desc"] = (f"Inspection passed! Performance rated "
-                                   f"\"{self.satisfaction_label()}\". "
-                                   f"GBP {bonus:,} bonus grant awarded.")
-                else:
-                    fine = 18000
-                    self.budget = max(0, self.budget - fine)
-                    evt["desc"] = (f"Inspection failed! Service rated "
-                                   f"\"{self.satisfaction_label()}\". "
-                                   f"GBP {fine:,} penalty issued.")
-            elif effect == "heavy_rain" or (effect == "binRate" and template["id"] == "heavy_rain"):
-                self.weather = "rain"
-                self._weather_timer = 1
-
-            self.active_event = evt
-            self.pending_event = evt
-
         # ---- advance road-works independently --------------------------------
         self._update_road_works(city, fleet)
 
@@ -334,7 +294,65 @@ class Economy:
         self._tick_weather()
 
         # ---- worker morale (wage-to-strike pipeline) -------------------------
+        # Update morale BEFORE the event check so fresh morale affects today.
         self._update_worker_morale()
+
+        # ---- fire a new event (at most one active at a time) -----------------
+        if not self.active_event:
+            # Guaranteed crew strike when wages are at statutory minimum and
+            # morale has cratered — workers will not tolerate minimum-wage pay.
+            _at_min = self.hourly_wage_rate <= MORALE_NLW + 0.01
+            if _at_min and self.worker_morale < 25.0:
+                template = next(
+                    (e for e in self.events if e["id"] == "crew_strike"), None)
+                if template:
+                    evt = dict(template)
+                    evt["remaining_days"] = template["duration"]
+                    evt["desc"] = ("Outrage! Wages cut to statutory minimum. "
+                                   "Crews have walked out — no collections today.")
+                    if fleet:
+                        fleet.on_strike = True
+                    self.active_event = evt
+                    self.pending_event = evt
+
+            elif random.random() < self.event_chance:
+                template = self._weighted_event_choice()
+                evt = {**template, "remaining_days": template["duration"]}
+                effect = template["effect"]
+
+                if effect == "truckBreakdown" and fleet:
+                    days = random.randint(1, 7)
+                    evt["remaining_days"] = days
+                    evt["duration"]       = days
+                    bd_name = self._apply_truck_breakdown(fleet, evt)
+                    if bd_name:
+                        evt["desc"] = (f"{bd_name} has broken down and will be out of "
+                                       f"action for {days} day{'s' if days != 1 else ''}.")
+                elif effect == "money":
+                    self.budget = max(0, self.budget + template["value"])
+                    self.ledger["grants"] += max(0, template["value"])
+                elif effect == "crewStrike" and fleet:
+                    fleet.on_strike = True
+                elif effect == "councilInspection":
+                    if self.satisfaction >= 70:
+                        bonus = 22000
+                        self.budget = max(0, self.budget + bonus)
+                        self.ledger["grants"] += bonus
+                        evt["desc"] = (f"Inspection passed! Performance rated "
+                                       f"\"{self.satisfaction_label()}\". "
+                                       f"GBP {bonus:,} bonus grant awarded.")
+                    else:
+                        fine = 18000
+                        self.budget = max(0, self.budget - fine)
+                        evt["desc"] = (f"Inspection failed! Service rated "
+                                       f"\"{self.satisfaction_label()}\". "
+                                       f"GBP {fine:,} penalty issued.")
+                elif effect == "heavy_rain" or (effect == "binRate" and template["id"] == "heavy_rain"):
+                    self.weather = "rain"
+                    self._weather_timer = 1
+
+                self.active_event = evt
+                self.pending_event = evt
 
     # ----- road-works management -------------------------------------------
     def _update_road_works(self, city, fleet):
@@ -426,10 +444,10 @@ class Economy:
         return max(0.0, min(100.0, (wage - MORALE_NLW) / span * 100.0))
 
     def _update_worker_morale(self):
-        """Drift morale 12 % of the way toward the wage-based target each day.
-        Workers notice pay cuts gradually — morale doesn't crater overnight."""
+        """Drift morale 20 % of the way toward the wage-based target each day.
+        Workers notice pay cuts — morale craters within ~3 days of a wage slash."""
         target = self._morale_target()
-        self.worker_morale += (target - self.worker_morale) * 0.12
+        self.worker_morale += (target - self.worker_morale) * 0.20
         self.worker_morale = max(0.0, min(100.0, self.worker_morale))
 
     def _crew_strike_weight(self):
@@ -482,8 +500,10 @@ class Economy:
         return "Mutinous"
 
     # ----- event effect helpers --------------------------------------------
-    def _apply_truck_breakdown(self, fleet):
-        """Mark one active truck as broken. Returns the truck name or None."""
+    def _apply_truck_breakdown(self, fleet, event=None):
+        """Mark one active truck as broken. Records the broken truck id on the
+        supplied event dict (the about-to-be-activated event, which is not yet
+        stored in self.active_event). Returns the truck name or None."""
         active = [t for t in fleet.trucks
                   if t["crew"] >= 1 and not t.get("broken")]
         if not active:
@@ -492,7 +512,9 @@ class Economy:
         truck["broken"] = True
         truck["path"]   = []
         truck["state"]  = "depot"
-        self.active_event["broken_truck_id"] = truck["id"]
+        target = event if event is not None else self.active_event
+        if target is not None:
+            target["broken_truck_id"] = truck["id"]
         return truck.get("model_name", f"Truck #{truck['id']}")
 
     def _clear_event_effects(self, event, city=None, fleet=None):
@@ -632,8 +654,13 @@ class Economy:
 
     def adjust_wage(self, delta):
         """Adjust hourly wage rate. Floor is UK 2025 National Living Wage (£11.44)."""
+        old_wage = self.hourly_wage_rate
         self.hourly_wage_rate = round(
             max(11.44, min(50.0, self.hourly_wage_rate + delta)), 2)
+        # Immediate morale shock when wages are slashed to statutory minimum.
+        # Workers don't adjust gradually to this — it causes instant outrage.
+        if self.hourly_wage_rate <= MORALE_NLW + 0.01 and old_wage > MORALE_NLW + 0.01:
+            self.worker_morale = max(0.0, self.worker_morale - 55.0)
 
     def adjust_pension(self, delta):
         """Adjust employer pension contribution. Auto-enrolment floor is 3 %."""
