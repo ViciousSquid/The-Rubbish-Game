@@ -11,6 +11,7 @@ PLANNER_TABS = [
     ("rounds",  "Rounds"),
     ("waste",   "Waste"),
     ("fleet",   "Fleet"),
+    ("staff",   "Staff"),
     ("finance", "Finance"),
     ("data",    "Data"),
 ]
@@ -765,6 +766,8 @@ class UIManager:
             self._tab_waste(screen, bx, by, bw, bh)
         elif tab == "fleet":
             self._tab_fleet(screen, bx, by, bw, bh)
+        elif tab == "staff":
+            self._tab_staff(screen, bx, by, bw, bh)
         elif tab == "finance":
             self._tab_finance(screen, bx, by, bw, bh)
         elif tab == "data":
@@ -1035,6 +1038,217 @@ class UIManager:
                 ui.text("body_s", line, col, ox, oy)
                 oy += 20
 
+
+    def _tab_staff(self, screen, x, y, w, h):
+        """Deep staff & vehicle cost management tab."""
+        ui    = self.ui
+        c     = ui.c
+        eco   = self.game.economy
+        fleet = self.game.fleet
+
+        col1_w = min(348, w // 2 - 8)
+        col2_x = x + col1_w + 16
+        col2_w = w - col1_w - 16
+        rx     = x + col1_w          # right edge for mono value alignment
+
+        # ── Summary banner ───────────────────────────────────────────────────
+        assigned  = sum(t.get("crew", 0) for t in fleet.trucks)
+        idle_crew = max(0, fleet.workers - assigned)
+        veh_daily = sum(
+            (t.get("lease_weekly", 0) / 7.0 if t.get("leased")
+             else t.get("running_cost", 0))
+            for t in fleet.trucks
+        )
+        ui.text("body_s",
+                f"Workforce: {fleet.workers} crew  |  Assigned: {assigned}"
+                f"  Idle: {idle_crew}  |  Vehicle fleet: £{veh_daily:.0f}/day",
+                c.TEXT_MUTED, x, y)
+        ty = y + 26
+
+        # ── LEFT COLUMN: Pay rates & per-worker breakdown ────────────────────
+        ui.section_header(x, ty, "PAY RATES", col1_w)
+        ty += 22
+
+        ty = self._stepper(screen, x, ty,
+                           "Base wage (£/hr)",
+                           f"£{eco.hourly_wage_rate:.2f}",
+                           lambda: self._adjust_wage(-0.50),
+                           lambda: self._adjust_wage(+0.50),
+                           label_w=178, val_w=70)
+
+        ty = self._stepper(screen, x, ty,
+                           "Employer pension",
+                           f"{eco.pension_rate * 100:.1f}%",
+                           lambda: self._adjust_pension(-0.005),
+                           lambda: self._adjust_pension(+0.005),
+                           label_w=178, val_w=70)
+
+        ty = self._stepper(screen, x, ty,
+                           "PPE / uniform (£/worker/day)",
+                           f"£{eco.ppe_daily:.2f}",
+                           lambda: self._adjust_ppe(-0.50),
+                           lambda: self._adjust_ppe(+0.50),
+                           label_w=178, val_w=70)
+
+        ui.text("caption",
+                f"Employer NI: 13.8% fixed (HMRC 2025/26)  |  "
+                f"Min wage floor: £11.44/hr",
+                c.TEXT_DIM, x, ty)
+        ty += 18
+
+        ui.h_line(x, ty, col1_w)
+        ty += 12
+
+        # ── Per-worker cost breakdown ─────────────────────────────────────────
+        ui.section_header(x, ty, "COST PER WORKER / DAY", col1_w)
+        ty += 22
+
+        bd  = eco.staff_cost_breakdown(fleet.workers)
+        n   = max(1, fleet.workers)
+        per_base    = bd["base"]    / n
+        per_ni      = bd["ni"]      / n
+        per_pension = bd["pension"] / n
+        per_ppe     = bd["ppe"]     / n
+        per_total   = bd["per_head"]
+
+        # label, per-head value, colour, annotation
+        bdown_rows = [
+            ("Base wages",    per_base,    c.TEXT_SECONDARY,
+             f"(8h × £{eco.hourly_wage_rate:.2f})"),
+            ("Employer NI",   per_ni,      c.STATUS_WARN,
+             f"(13.8% on earnings above £{eco.ni_secondary_daily:.2f})"),
+            ("Pension",       per_pension, c.TEXT_SECONDARY,
+             f"({eco.pension_rate * 100:.1f}%)"),
+            ("PPE / uniform", per_ppe,     c.TEXT_SECONDARY, ""),
+        ]
+        for lbl, val, vcol, note in bdown_rows:
+            ui.label(lbl, x, ty)
+            ui.text("mono", f"£{val:6.2f}", vcol, rx - 2, ty, align="right")
+            if note:
+                ui.text("caption", note, c.TEXT_DIM, rx + 4, ty + 1)
+            ty += 22
+
+        # Separator + totals
+        pygame.draw.line(screen, c.BORDER_SUBTLE, (x, ty), (x + col1_w - 30, ty))
+        ty += 8
+        ui.text("body_b", "Per worker / day", c.TEXT_PRIMARY, x, ty)
+        ui.text("mono_b", f"£{per_total:.2f}",
+                c.ACCENT_AMBER, rx - 2, ty, align="right")
+        ty += 24
+
+        total_col = c.STATUS_BAD if bd["total"] > 0.5 * eco.budget else c.TEXT_PRIMARY
+        ui.text("body_b", f"Total ({fleet.workers} workers)", c.TEXT_PRIMARY, x, ty)
+        ui.text("mono_b", f"£{bd['total']:.0f}/day",
+                total_col, rx - 2, ty, align="right")
+        ty += 32
+
+        # Full staff + vehicle daily burn
+        all_daily = bd["total"] + veh_daily
+        ui.label("All-in daily cost (staff + fleet)", x, ty)
+        burn_col = c.STATUS_BAD if all_daily > eco.budget * 0.6 else c.TEXT_SECONDARY
+        ui.text("mono_b", f"£{all_daily:.0f}/day",
+                burn_col, rx - 2, ty, align="right")
+        ty += 30
+
+        # Hire / fire buttons
+        hire_r = pygame.Rect(x, ty, 138, 28)
+        fire_r = pygame.Rect(x + 148, ty, 126, 28)
+        self._pbtn(screen, hire_r, "Hire crew  £2,500", self._hire,
+                   enabled=eco.budget >= 2500, fkey="body_s",
+                   accent=eco.budget >= 2500)
+        self._pbtn(screen, fire_r, "Release crew", self._fire,
+                   enabled=fleet.workers > 0, fkey="body_s")
+
+        # ── RIGHT COLUMN: Vehicle fleet cards ────────────────────────────────
+        ry = y + 26
+        ui.section_header(col2_x, ry, "VEHICLE FLEET", col2_w)
+        ui.text("caption",
+                f"{len(fleet.trucks)} vehicle(s)  |  £{veh_daily:.0f}/day",
+                c.TEXT_MUTED, col2_x + 136, ry + 2)
+        ry += 24
+
+        CARD_H = 90
+        veh_bd = eco.vehicle_cost_breakdown(fleet.trucks)
+        shown  = 0
+        for vb in veh_bd:
+            if ry + CARD_H > y + h - 4:
+                remaining = len(veh_bd) - shown
+                ui.text("caption",
+                        f"... and {remaining} more. Scrap to reveal.",
+                        c.TEXT_DIM, col2_x, ry)
+                break
+
+            is_broken = vb["broken"]
+            ui.card(col2_x, ry, col2_w, CARD_H, selected=is_broken)
+
+            # Left accent stripe: colour = cost type
+            type_stripe = {
+                "owned":  c.ACCENT_TEAL,
+                "lease":  c.ACCENT_AMBER,
+                "rental": c.STATUS_BAD,
+            }.get(vb["cost_type"], c.TEXT_DIM)
+            pygame.draw.rect(screen, type_stripe,
+                             pygame.Rect(col2_x, ry, 4, CARD_H),
+                             border_radius=3)
+
+            # Truck ID badge
+            id_surf = ui.fonts.render("badge", f"#{vb['id']}", c.ACCENT_AMBER)
+            screen.blit(id_surf, (col2_x + 10, ry + 10))
+
+            # Model name
+            nm_col = c.STATUS_BAD if is_broken else c.TEXT_PRIMARY
+            ui.text("body_b", vb["name"], nm_col, col2_x + 34, ry + 8)
+
+            # Daily cost (top-right)
+            ui.text("mono_b", f"£{vb['daily']:.0f}/day",
+                    c.TEXT_PRIMARY, col2_x + col2_w - 10, ry + 8, align="right")
+
+            # Cost-type + broken badges (row 2)
+            type_text = {"owned": "OWNED", "lease": "LEASED",
+                         "rental": "RENTAL"}.get(vb["cost_type"], "?")
+            type_tc = {"owned":  (c.ACCENT_TEAL,  (18, 50, 54)),
+                       "lease":  (c.ACCENT_AMBER, (54, 44, 16)),
+                       "rental": (c.STATUS_BAD,   (56, 20, 20))}.get(
+                           vb["cost_type"], (c.TEXT_MUTED, c.BG_DEEP))
+            ui.badge(col2_x + 10, ry + 30, type_text,
+                     type_tc[0], type_tc[1])
+            if is_broken:
+                ui.badge(col2_x + 74, ry + 30, "BROKEN",
+                         c.STATUS_BAD, (72, 18, 18))
+
+            # Crew / capacity
+            ui.text("caption",
+                    f"crew {vb['crew']}  |  cap {vb['capacity']:,}",
+                    c.TEXT_MUTED, col2_x + 10, ry + 52)
+
+            # Cost breakdown
+            ui.text("caption",
+                    f"fuel £{vb['fuel']}  ·  maint £{vb['maint']}"
+                    f"  ·  ins £{vb['ins']}",
+                    c.TEXT_DIM, col2_x + 10, ry + 66)
+
+            # Scrap button
+            scrap_r = pygame.Rect(col2_x + col2_w - 66, ry + 50, 58, 26)
+            self._pbtn(screen, scrap_r, "Scrap",
+                       lambda tid=vb["id"]: self._scrap_truck(tid),
+                       fkey="body_s")
+
+            ry  += CARD_H + 6
+            shown += 1
+
+        if not fleet.trucks:
+            ui.text("body_s", "No vehicles in fleet.", c.TEXT_DIM, col2_x, ry)
+
+        # Fleet cost totals at bottom of right column (if room)
+        if ry < y + h - 28:
+            pygame.draw.line(screen, c.BORDER_SUBTLE,
+                             (col2_x, ry), (col2_x + col2_w, ry))
+            ry += 8
+            all_veh = sum(v["daily"] for v in veh_bd)
+            ui.label("Fleet daily total", col2_x, ry)
+            ui.text("mono_b", f"£{all_veh:.0f}/day",
+                    c.TEXT_PRIMARY, col2_x + col2_w, ry, align="right")
+
     def _tab_finance(self, screen, x, y, w, h):
         ui = self.ui
         c = ui.c
@@ -1161,6 +1375,21 @@ class UIManager:
     def _fire(self):
         if self.game.fleet.fire_worker():
             self.game.set_toast("Released one crew member.")
+
+    def _adjust_wage(self, delta):
+        self.game.economy.adjust_wage(delta)
+
+    def _adjust_pension(self, delta):
+        self.game.economy.adjust_pension(delta)
+
+    def _adjust_ppe(self, delta):
+        self.game.economy.adjust_ppe(delta)
+
+    def _scrap_truck(self, truck_id):
+        if self.game.fleet.scrap_truck(truck_id):
+            self.game.set_toast(f"Vehicle #{truck_id} removed from fleet.")
+        else:
+            self.game.set_toast("Cannot remove that vehicle.")
 
     def _adjust_tax(self, delta):
         eco = self.game.economy

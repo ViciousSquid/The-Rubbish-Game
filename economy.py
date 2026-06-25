@@ -13,17 +13,18 @@ class Economy:
     # ----- profit & loss ledger schema ------------------------------------
     REVENUE_KEYS = {"council_tax", "business_rates", "recycling_credit",
                     "garden_charges", "grants"}
-    EXPENSE_KEYS = {"wages", "vehicles", "gate_fees", "rental_costs"}
+    EXPENSE_KEYS = {"wages", "oncosts", "vehicles", "gate_fees", "rental_costs"}
     LEDGER_LABELS = [
-        ("council_tax",     "Council tax receipts"),
-        ("business_rates",  "Business rates"),
+        ("council_tax",      "Council tax receipts"),
+        ("business_rates",   "Business rates"),
         ("recycling_credit", "Recycling material credit"),
-        ("garden_charges",  "Garden waste subscriptions"),
-        ("grants",          "Grants & one-offs"),
-        ("wages",           "Crew wages"),
-        ("vehicles",        "Vehicle running / lease"),
-        ("rental_costs",    "Emergency vehicle rentals"),
-        ("gate_fees",       "Disposal gate fees"),
+        ("garden_charges",   "Garden waste subscriptions"),
+        ("grants",           "Grants & one-offs"),
+        ("wages",            "Crew base wages"),
+        ("oncosts",          "Staff on-costs (NI / pension / PPE)"),
+        ("vehicles",         "Vehicle running / lease"),
+        ("rental_costs",     "Emergency vehicle rentals"),
+        ("gate_fees",        "Disposal gate fees"),
     ]
 
     def __init__(self):
@@ -32,6 +33,21 @@ class Economy:
         self.business_rates = 2.20
         self.hourly_wage_rate = 16.50
         self.truck_maintenance = 45.00
+
+        # ── Staff on-cost rates (editable via Staff tab) ─────────────────────
+        # Employer secondary NI rate — HMRC 2025/26 (13.8 %)
+        self.employer_ni_rate   = 0.138
+        # Secondary NI threshold as daily equivalent (£4,994 / yr ÷ 365.25)
+        self.ni_secondary_daily = 13.68
+        # Employer auto-enrolment pension minimum (3 %, can be raised)
+        self.pension_rate       = 0.030
+        # Daily PPE + uniform allowance per worker
+        self.ppe_daily          = 1.20
+
+        # ── Vehicle cost display fractions (informational, not separate charges)
+        self.fuel_fraction        = 0.54   # share of running_cost that is fuel
+        self.maintenance_fraction = 0.31   # tyres + scheduled servicing
+        self.insurance_fraction   = 0.15   # fleet insurance + VOSA plating
 
         self.day = 1
         self.day_timer = 0
@@ -204,10 +220,17 @@ class Economy:
         self.ledger["council_tax"]    += council  * frac
         self.ledger["business_rates"] += business * frac
 
-        wages        = fleet.workers * self.hourly_wage_rate * wage_mult * HOURS_PER_DAY
+        base_wages   = fleet.workers * self.hourly_wage_rate * wage_mult * HOURS_PER_DAY
+        # Employer NI: 13.8 % on earnings above the daily secondary threshold
+        _ni_ph       = max(0.0, self.hourly_wage_rate * wage_mult * HOURS_PER_DAY
+                           - self.ni_secondary_daily) * self.employer_ni_rate
+        oncosts      = (fleet.workers * _ni_ph
+                        + base_wages * self.pension_rate
+                        + fleet.workers * self.ppe_daily)
         vehicles     = fleet.daily_vehicle_cost()
         rental_costs = fleet.get_rental_costs()
-        self.ledger["wages"]        += wages        * frac
+        self.ledger["wages"]        += base_wages   * frac
+        self.ledger["oncosts"]      += oncosts      * frac
         self.ledger["vehicles"]     += vehicles     * frac
         self.ledger["rental_costs"] += rental_costs * frac
 
@@ -220,7 +243,7 @@ class Economy:
             self.ledger["garden_charges"]   += garden
 
         revenue  = (council + business) * frac
-        expenses = (wages + vehicles + rental_costs) * frac
+        expenses = (base_wages + oncosts + vehicles + rental_costs) * frac
         self.daily_revenue  += revenue
         self.daily_expenses += expenses
         self.budget += (revenue - expenses)
@@ -478,6 +501,70 @@ class Economy:
         if s >= 40: return "Poor"
         if s >= 20: return "Failing"
         return "In Crisis"
+
+
+    # ── Staff & vehicle cost helpers ─────────────────────────────────────────
+    def staff_cost_breakdown(self, workers, wage_mult=1.0):
+        """Itemised daily staff cost breakdown for the Staff management tab."""
+        base    = workers * self.hourly_wage_rate * wage_mult * HOURS_PER_DAY
+        ni_ph   = max(0.0, self.hourly_wage_rate * wage_mult * HOURS_PER_DAY
+                     - self.ni_secondary_daily) * self.employer_ni_rate
+        ni      = workers * ni_ph
+        pension = base * self.pension_rate
+        ppe     = workers * self.ppe_daily
+        oncosts = ni + pension + ppe
+        total   = base + oncosts
+        return {
+            "workers":  workers,
+            "base":     base,
+            "ni":       ni,
+            "pension":  pension,
+            "ppe":      ppe,
+            "oncosts":  oncosts,
+            "total":    total,
+            "per_head": total / max(1, workers),
+        }
+
+    def vehicle_cost_breakdown(self, trucks):
+        """Per-truck daily cost detail list for the Staff management tab."""
+        result = []
+        for t in trucks:
+            if t.get("leased"):
+                daily     = t.get("lease_weekly", 0) / 7.0
+                cost_type = "lease"
+            elif t.get("tier_id") == "rental":
+                daily     = t.get("running_cost", 0)
+                cost_type = "rental"
+            else:
+                daily     = t.get("running_cost", 130)
+                cost_type = "owned"
+            result.append({
+                "id":        t["id"],
+                "name":      t.get("model_name", "Unknown"),
+                "daily":     daily,
+                "cost_type": cost_type,
+                "crew":      t.get("crew", 0),
+                "broken":    t.get("broken", False),
+                "capacity":  int(t.get("capacity", 0)),
+                "fuel":      round(daily * self.fuel_fraction),
+                "maint":     round(daily * self.maintenance_fraction),
+                "ins":       round(daily * self.insurance_fraction),
+            })
+        return result
+
+    def adjust_wage(self, delta):
+        """Adjust hourly wage rate. Floor is UK 2025 National Living Wage (£11.44)."""
+        self.hourly_wage_rate = round(
+            max(11.44, min(50.0, self.hourly_wage_rate + delta)), 2)
+
+    def adjust_pension(self, delta):
+        """Adjust employer pension contribution. Auto-enrolment floor is 3 %."""
+        self.pension_rate = round(
+            max(0.03, min(0.15, self.pension_rate + delta)), 3)
+
+    def adjust_ppe(self, delta):
+        """Adjust daily PPE and uniform allowance per worker."""
+        self.ppe_daily = round(max(0.0, min(15.0, self.ppe_daily + delta)), 2)
 
     def win_progress(self):
         target = max(1, getattr(self, "win_streak_target", 7))

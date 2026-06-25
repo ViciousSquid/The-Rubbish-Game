@@ -7,14 +7,23 @@ Purely cosmetic city-life systems.  Nothing here affects gameplay.
   AmbientTraffic  — civilian cars driving along the road network
   AmbientBirds    — seagulls orbiting the landfill
   AmbientPeds     — pedestrians ambling on road tiles
+
+Density-aware spawning
+----------------------
+A density weight is computed once per road tile on city load: tiles near
+towers, high-rises and offices score high; tiles beside parks and green
+spaces score low (actively negative contribution).  All spawning then draws
+start/goal positions from this weighted distribution, so urban streets
+bustle while leafy avenues stay quiet.
 """
+
 import random
 import math
 from collections import deque
 
 ADJ = [(1, 0), (-1, 0), (0, 1), (0, -1)]
 
-# Believable British car colours
+# ── British car colours ──────────────────────────────────────────────────────
 _CAR_COLORS = [
     (180, 40,  40),   # red
     (40, 100, 180),   # blue
@@ -27,20 +36,46 @@ _CAR_COLORS = [
     (175, 155, 200),  # mauve
     (85, 135, 100),   # sage
     (230, 230, 230),  # white
+    (200,  90,  90),  # dark rose
+    (255, 230, 200),  # cream
+    (100,  80, 160),  # purple
+    (150, 170, 150),  # muted green
 ]
 
-# High-vis vest colours for pedestrians
+# ── Pedestrian vest / coat colours ──────────────────────────────────────────
 _VEST_COLORS = [
-    (255, 160,   0),  # orange
-    (255, 220,   0),  # yellow
+    (255, 160,   0),  # orange hi-vis
+    (255, 220,   0),  # yellow hi-vis
     (200, 200, 200),  # grey (civilian)
     (  0, 180, 100),  # green hi-vis
+    ( 50,  50, 200),  # blue jacket
+    (180,  60,  60),  # red jacket
+    (200, 200, 255),  # pale blue coat
+    ( 80,  80,  80),  # dark anorak
 ]
 
+# ── Density scoring per building style ──────────────────────────────────────
+# Scores how much a neighbouring building attracts traffic to a road tile.
+_BUILDING_DENSITY = {
+    "tower":    10,
+    "highrise": 10,
+    "flats":     6,
+    "office":    5,
+    "shop":      4,
+    "warehouse": 3,
+    "semi":      2,
+    "terrace":   2,
+    "detached":  2,
+    "bungalow":  1,
+}
+_GREEN_PENALTY  = -3    # green tiles actively suppress traffic
+_DENSITY_RADIUS =  4    # Manhattan-distance kernel around each road tile
+_DENSITY_FLOOR  = 0.05  # minimum weight so even quiet streets see a trickle
 
-# ---------------------------------------------------------------------------
-#  Helpers
-# ---------------------------------------------------------------------------
+
+# ────────────────────────────────────────────────────────────────────────────
+#  Internal helpers
+# ────────────────────────────────────────────────────────────────────────────
 
 def _road_list_from(city):
     return [
@@ -51,8 +86,51 @@ def _road_list_from(city):
     ]
 
 
+def _build_density_weights(city, road_list):
+    """Compute a positive density weight for every road tile.
+
+    Inverse-distance weighting over a radius-4 kernel:
+      building tiles contribute +score / Manhattan-distance
+      green tiles contribute a negative penalty  / Manhattan-distance
+    Result is clamped to [_DENSITY_FLOOR, ∞) so no tile is completely dead.
+    """
+    weights = []
+    for (rx, ry) in road_list:
+        score = 0.0
+        for dy in range(-_DENSITY_RADIUS, _DENSITY_RADIUS + 1):
+            for dx in range(-_DENSITY_RADIUS, _DENSITY_RADIUS + 1):
+                if dx == 0 and dy == 0:
+                    continue
+                nx, ny = rx + dx, ry + dy
+                tile = city.get_tile(nx, ny)
+                if tile is None:
+                    continue
+                dist = abs(dx) + abs(dy)
+                fall = 1.0 / dist
+                if tile.type in ("residential", "commercial"):
+                    score += _BUILDING_DENSITY.get(tile.building_style, 1) * fall
+                elif tile.type == "green":
+                    score += _GREEN_PENALTY * fall
+        weights.append(max(_DENSITY_FLOOR, score))
+    return weights
+
+
+def _weighted_sample(candidates, weights):
+    """Return one element chosen proportionally to its weight."""
+    total = sum(weights)
+    if total <= 0:
+        return random.choice(candidates)
+    r = random.random() * total
+    cumulative = 0.0
+    for item, w in zip(candidates, weights):
+        cumulative += w
+        if r <= cumulative:
+            return item
+    return candidates[-1]
+
+
 def _bfs(start, goal, road_set, blocked=None):
-    """BFS on a set of road tiles, optionally avoiding `blocked`."""
+    """BFS on a set of road tiles, optionally avoiding *blocked*."""
     if blocked is None:
         blocked = set()
     if start == goal:
@@ -80,30 +158,39 @@ def _bfs(start, goal, road_set, blocked=None):
     return None
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 #  Civilian cars
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 
 class AmbientTraffic:
-    """Cars that pick random road-to-road routes and drive them."""
+    """Cars that pick random road-to-road routes and drive them.
 
-    MAX_CARS  = 14
-    MIN_PATH  = 6    # discard very short trips
-    MAX_TRIES = 12
+    Start and goal tiles are drawn from the density-weighted distribution, so
+    high-density urban streets carry proportionally more traffic.  Urban cars
+    also drive *slower* (traffic calming, junctions, pedestrian crossings).
+    """
+
+    MAX_CARS  = 28    # raised from 14; density weighting prevents ugly crowding
+    MIN_PATH  = 6     # discard very short trips
+    MAX_TRIES = 18
 
     def __init__(self):
-        self.cars       = []
-        self._road_set  = set()
-        self._road_list = []
-        self._built_for = None
+        self.cars           = []
+        self._road_set      = set()
+        self._road_list     = []
+        self._road_weights  = []
+        self._road_density  = {}   # {tile: weight} for O(1) per-tile lookup
+        self._built_for     = None
 
-    # -- road graph ----------------------------------------------------------
+    # ── road graph ----------------------------------------------------------
     def _rebuild(self, city):
-        self._road_list = _road_list_from(city)
-        self._road_set  = set(self._road_list)
-        self._built_for = city
+        self._road_list    = _road_list_from(city)
+        self._road_set     = set(self._road_list)
+        self._road_weights = _build_density_weights(city, self._road_list)
+        self._road_density = dict(zip(self._road_list, self._road_weights))
+        self._built_for    = city
 
-    # -- update --------------------------------------------------------------
+    # ── update --------------------------------------------------------------
     def update(self, dt, city):
         if self._built_for is not city:
             self._rebuild(city)
@@ -112,20 +199,29 @@ class AmbientTraffic:
 
         blocked = getattr(city, "road_works_tiles", set())
 
-        # Spawn
-        if len(self.cars) < self.MAX_CARS and random.random() < dt * 1.4:
+        # Spawn: higher global rate to populate the city; density weighting
+        # naturally concentrates cars on urban roads without extra logic.
+        if len(self.cars) < self.MAX_CARS and random.random() < dt * 2.4:
             for _ in range(self.MAX_TRIES):
-                start = random.choice(self._road_list)
-                goal  = random.choice(self._road_list)
+                start = _weighted_sample(self._road_list, self._road_weights)
+                goal  = _weighted_sample(self._road_list, self._road_weights)
                 if start == goal:
                     continue
                 path = _bfs(start, goal, self._road_set, blocked)
                 if path and len(path) >= self.MIN_PATH:
+                    d = self._road_density.get(start, 1.0)
+                    # Urban streets → slower (traffic calming & junctions)
+                    if d > 6:
+                        speed = random.uniform(1.6, 3.2)
+                    elif d > 3:
+                        speed = random.uniform(2.4, 4.2)
+                    else:
+                        speed = random.uniform(3.2, 5.8)
                     self.cars.append({
                         "x":      float(start[0]),
                         "y":      float(start[1]),
                         "path":   path,
-                        "speed":  random.uniform(2.0, 5.0),
+                        "speed":  speed,
                         "color":  random.choice(_CAR_COLORS),
                         "facing": 1,
                     })
@@ -150,14 +246,14 @@ class AmbientTraffic:
                 car["y"] += dy / dist * step
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 #  Landfill seagulls
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 
 class AmbientBirds:
     """Seagulls that orbit the landfill in lazy circles."""
 
-    MAX_BIRDS = 8
+    MAX_BIRDS = 10
 
     def __init__(self):
         self.birds = []
@@ -175,38 +271,48 @@ class AmbientBirds:
                 "speed":  random.uniform(0.22, 0.60) * random.choice([-1, 1]),
                 "bob":    random.uniform(0, math.tau),
                 "bob_sp": random.uniform(1.0, 2.2),
-                "lcx": lcx, "lcy": lcy,
-                "wing":   0.0,    # wing-flap phase
-                "wing_sp":random.uniform(4.0, 8.0),
+                "lcx":    lcx,
+                "lcy":    lcy,
+                "wing":   0.0,
+                "wing_sp": random.uniform(4.0, 8.0),
             })
 
         for b in self.birds:
             b["angle"]  += b["speed"]  * dt
             b["bob"]    += b["bob_sp"] * dt
-            b["wing"]   += b["wing_sp"]* dt
+            b["wing"]   += b["wing_sp"] * dt
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 #  Street pedestrians
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 
 class AmbientPeds:
-    """Pedestrians who wander along road tiles and linger near buildings."""
+    """Pedestrians who wander along road tiles.
 
-    MAX_PEDS  = 20
+    Urban roads (near towers, offices, shops) attract many more pedestrians;
+    green-area roads are quiet.  Peds near high-density tiles also walk
+    *slower*, simulating window-shoppers and commuters at junctions.
+    """
+
+    MAX_PEDS  = 42    # raised from 20
     MIN_PATH  = 3
-    MAX_TRIES = 8
+    MAX_TRIES = 12
 
     def __init__(self):
-        self.peds       = []
-        self._road_set  = set()
-        self._road_list = []
-        self._built_for = None
+        self.peds           = []
+        self._road_set      = set()
+        self._road_list     = []
+        self._road_weights  = []
+        self._road_density  = {}
+        self._built_for     = None
 
     def _rebuild(self, city):
-        self._road_list = _road_list_from(city)
-        self._road_set  = set(self._road_list)
-        self._built_for = city
+        self._road_list    = _road_list_from(city)
+        self._road_set     = set(self._road_list)
+        self._road_weights = _build_density_weights(city, self._road_list)
+        self._road_density = dict(zip(self._road_list, self._road_weights))
+        self._built_for    = city
 
     def update(self, dt, city, on_strike=False):
         if self._built_for is not city:
@@ -214,26 +320,35 @@ class AmbientPeds:
         if not self._road_list:
             return
 
-        # During a strike, peds cluster near depot (handled visually in renderer)
+        # During a strike peds cluster near depot (handled visually in renderer)
         if on_strike:
             return
 
         blocked = getattr(city, "road_works_tiles", set())
 
-        # Spawn
-        if len(self.peds) < self.MAX_PEDS and random.random() < dt * 1.8:
+        # Higher spawn rate than traffic; density weighting concentrates them
+        # in commercial / residential cores.
+        if len(self.peds) < self.MAX_PEDS and random.random() < dt * 3.4:
             for _ in range(self.MAX_TRIES):
-                start = random.choice(self._road_list)
-                goal  = random.choice(self._road_list)
+                start = _weighted_sample(self._road_list, self._road_weights)
+                goal  = _weighted_sample(self._road_list, self._road_weights)
                 if start == goal:
                     continue
                 path = _bfs(start, goal, self._road_set, blocked)
                 if path and len(path) >= self.MIN_PATH:
+                    d = self._road_density.get(start, 1.0)
+                    # Shoppers in busy zones amble; walkers in quiet zones stride
+                    if d > 6:
+                        speed = random.uniform(0.35, 0.75)
+                    elif d > 3:
+                        speed = random.uniform(0.65, 1.20)
+                    else:
+                        speed = random.uniform(0.90, 1.60)
                     self.peds.append({
                         "x":      float(start[0]),
                         "y":      float(start[1]),
                         "path":   path,
-                        "speed":  random.uniform(0.5, 1.4),
+                        "speed":  speed,
                         "vest":   random.choice(_VEST_COLORS),
                         "facing": 1,
                         "bob":    random.uniform(0, math.tau),
@@ -261,9 +376,9 @@ class AmbientPeds:
                 ped["y"] += dy / dist * step
 
 
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 #  Container
-# ---------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────
 
 class AmbientState:
     """Single object wired into main.py update/render loops."""
