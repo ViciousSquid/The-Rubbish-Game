@@ -3,6 +3,11 @@ import random
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 DAY_ABBRS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
+# Worker morale constants
+MORALE_NLW       = 11.44   # National Living Wage floor — workers are very unhappy here
+MORALE_FAIR_WAGE = 18.00   # Above this, morale is fully satisfied (100 %)
+MORALE_DEFAULT   = 16.50   # Starting wage → starting morale ≈ 77 %
+
 # One in-game "day" is `day_duration` seconds of accumulated dt. Daily figures
 # below are quoted per in-game day and metered out each frame by the fraction of
 # a day that elapsed, so the live ledger always sums to the per-day totals.
@@ -91,6 +96,12 @@ class Economy:
         # Road-works events — independent of active_event, up to 3 concurrent.
         # Each entry: {"tiles": set, "remaining_days": int}
         self.road_works_active = []
+
+        # ── Worker morale (0–100) ──────────────────────────────────────────────
+        # Tracks crew sentiment toward their pay.  Starts at ~72 (neutral at the
+        # default £16.50/hr wage).  Falls when wages are cut, rises when raised.
+        # Low morale strongly increases the chance of a crew_strike event.
+        self.worker_morale = self._morale_target()
 
         self.events = [
             # ---- bin-rate (fill speed) ----------------------------------------
@@ -278,7 +289,7 @@ class Economy:
 
         # ---- fire a new event (at most one active at a time) -----------------
         if not self.active_event and random.random() < self.event_chance:
-            template = random.choice(self.events)
+            template = self._weighted_event_choice()
             evt = {**template, "remaining_days": template["duration"]}
             effect = template["effect"]
 
@@ -321,6 +332,9 @@ class Economy:
 
         # ---- ambient weather transitions -------------------------------------
         self._tick_weather()
+
+        # ---- worker morale (wage-to-strike pipeline) -------------------------
+        self._update_worker_morale()
 
     # ----- road-works management -------------------------------------------
     def _update_road_works(self, city, fleet):
@@ -403,6 +417,69 @@ class Economy:
             if any(abs(tx - bx) + abs(ty - by) <= 1 for bx, by in blocked):
                 blocked.add((tx, ty))
         return blocked
+
+    # ----- worker morale & strike risk ------------------------------------
+    def _morale_target(self):
+        """Ideal morale given the current wage rate (0–100)."""
+        wage = getattr(self, "hourly_wage_rate", MORALE_DEFAULT)
+        span = MORALE_FAIR_WAGE - MORALE_NLW
+        return max(0.0, min(100.0, (wage - MORALE_NLW) / span * 100.0))
+
+    def _update_worker_morale(self):
+        """Drift morale 12 % of the way toward the wage-based target each day.
+        Workers notice pay cuts gradually — morale doesn't crater overnight."""
+        target = self._morale_target()
+        self.worker_morale += (target - self.worker_morale) * 0.12
+        self.worker_morale = max(0.0, min(100.0, self.worker_morale))
+
+    def _crew_strike_weight(self):
+        """Event weight for crew_strike relative to every other event (1.0).
+
+        High morale  → weight < 1  (strikes suppressed)
+        Neutral (72) → weight ≈ 1  (baseline)
+        Low morale   → weight up to 8  (strikes very likely when any event fires)
+        """
+        m = self.worker_morale / 100.0
+        if m >= 0.72:
+            # Morale at or above neutral — gradually suppress strike events
+            # 0.72 → 1.0,  1.0 → 0.15
+            t = (m - 0.72) / 0.28
+            return max(0.15, 1.0 - t * 0.85)
+        else:
+            # Morale below neutral — ramp up sharply
+            # 0.72 → 1.0,  0.0 → 8.0
+            t = (0.72 - m) / 0.72
+            return 1.0 + t * 7.0
+
+    def _weighted_event_choice(self):
+        """Pick a random event, biasing crew_strike by current morale."""
+        weights = [
+            self._crew_strike_weight() if e["id"] == "crew_strike" else 1.0
+            for e in self.events
+        ]
+        return random.choices(self.events, weights=weights, k=1)[0]
+
+    def strike_risk_pct(self):
+        """Approximate daily probability (%) that the next event is a crew strike.
+        Used by the UI to show a human-readable risk indicator."""
+        if not self.events:
+            return 0.0
+        weights = [
+            self._crew_strike_weight() if e["id"] == "crew_strike" else 1.0
+            for e in self.events
+        ]
+        total_w = sum(weights)
+        strike_w = self._crew_strike_weight()
+        p_strike_given_event = strike_w / total_w
+        return round(self.event_chance * p_strike_given_event * 100.0, 1)
+
+    def morale_label(self):
+        m = self.worker_morale
+        if m >= 85: return "High"
+        if m >= 65: return "Neutral"
+        if m >= 45: return "Unhappy"
+        if m >= 25: return "Hostile"
+        return "Mutinous"
 
     # ----- event effect helpers --------------------------------------------
     def _apply_truck_breakdown(self, fleet):

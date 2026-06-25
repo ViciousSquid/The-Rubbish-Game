@@ -1076,6 +1076,46 @@ class UIManager:
                            lambda: self._adjust_wage(+0.50),
                            label_w=178, val_w=70)
 
+        # ── Worker morale & strike risk ───────────────────────────────────────
+        morale      = eco.worker_morale
+        morale_lbl  = eco.morale_label()
+        strike_risk = eco.strike_risk_pct()
+
+        # Colour the bar: green → amber → red as morale falls
+        if morale >= 65:
+            bar_col = c.STATUS_GOOD
+        elif morale >= 40:
+            bar_col = c.STATUS_WARN
+        else:
+            bar_col = c.STATUS_BAD
+
+        # Morale label + bar
+        ui.text("body_s", "Worker morale", c.TEXT_SECONDARY, x, ty)
+        mtext_col = bar_col
+        ui.text("body_s", f"{morale_lbl}  ({morale:.0f}%)", mtext_col, rx - 2, ty, align="right")
+        ty += 18
+        bar_w = col1_w - 30
+        bar_h = 7
+        pygame.draw.rect(screen, c.BG_CARD, (x, ty, bar_w, bar_h), border_radius=3)
+        fill_w = int(bar_w * morale / 100.0)
+        if fill_w > 0:
+            pygame.draw.rect(screen, bar_col, (x, ty, fill_w, bar_h), border_radius=3)
+        pygame.draw.rect(screen, c.BORDER_SUBTLE, (x, ty, bar_w, bar_h), 1, border_radius=3)
+        ty += 14
+
+        # Strike risk line
+        if strike_risk < 3.0:
+            risk_col  = c.TEXT_DIM
+            risk_text = f"Strike risk: {strike_risk:.1f}%  — crew content"
+        elif strike_risk < 8.0:
+            risk_col  = c.STATUS_WARN
+            risk_text = f"Strike risk: {strike_risk:.1f}%  ⚠ Consider a pay rise"
+        else:
+            risk_col  = c.STATUS_BAD
+            risk_text = f"Strike risk: {strike_risk:.1f}%  ⚠⚠ Union action likely!"
+        ui.text("caption", risk_text, risk_col, x, ty)
+        ty += 20
+
         ty = self._stepper(screen, x, ty,
                            "Employer pension",
                            f"{eco.pension_rate * 100:.1f}%",
