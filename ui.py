@@ -45,7 +45,7 @@ WINDOW_DEFS = [
     ("waste",   "Waste",   "Waste Streams",        660, 466),
     ("fleet",   "Fleet",   "Fleet & Procurement",  800, 548),
     ("staff",   "Staff",   "Staff & Vehicles",     864, 560),
-    ("finance", "Finance", "Finance",              788, 520),
+    ("finance", "Finance", "Finance",              788, 640),
     ("charts",  "Charts",  "Financial Charts",     760, 560),
     ("data",    "Data",    "Data & Plan I/O",      620, 420),
 ]
@@ -1995,77 +1995,6 @@ class UIManager:
             ui.text("caption", "At or below the baseline rate — the high street stays put.",
                     c.TEXT_DIM, lx, ty)
         ty += 14
-        # ── Diesel market readout ────────────────────────────────────────────
-        ty += 12
-        ui.section_header(lx, ty, "DIESEL MARKET", 300)
-        ty += 22
-        idx = getattr(eco, "fuel_index", 1.0)
-        tr = getattr(eco, "fuel_index_trend", 0.0)
-        arrow = "rising" if tr > 0.002 else "falling" if tr < -0.002 else "steady"
-        dcol = (c.STATUS_BAD if idx >= 1.15 else
-                c.STATUS_GOOD if idx <= 0.92 else c.TEXT_SECONDARY)
-        ui.label("Pump price (£/litre)", lx, ty)
-        ui.text("mono_b", f"£{eco.fuel_price():.2f}", dcol, lx + 320, ty, align="right")
-        ty += 20
-        ui.label("Market", lx, ty)
-        ui.text("body_s", f"{eco.fuel_index_label()} — {arrow}", dcol, lx + 320, ty, align="right")
-        ty += 20
-        ui.text("caption",
-                "Diesel RCV running costs track this. Electric eRCVs are immune.",
-                c.TEXT_DIM, lx, ty)
-        ty += 26
-
-        # ── Debt & statutory obligations ─────────────────────────────────────
-        ui.section_header(lx, ty, "DEBT & STATUTORY", 300)
-        ty += 22
-        if not eco.loan_cleared():
-            ui.label("Startup loan outstanding", lx, ty)
-            ui.text("mono_b", f"£{int(eco.loan_balance()):,}", c.ACCENT_CORAL,
-                    lx + 320, ty, align="right")
-            ty += 20
-            ui.label("Daily repayment", lx, ty)
-            ui.text("mono", f"£{eco.loan_daily_payment():.0f}/day", c.TEXT_SECONDARY,
-                    lx + 320, ty, align="right")
-            ty += 26
-            can_pay = eco.can_pay_off_loan()
-            pay_label = (f"Pay off loan now (£{int(eco.loan_balance()):,})" if can_pay
-                        else f"Pay off loan (need £{int(eco.loan_balance()):,})")
-            pay_rect = pygame.Rect(lx, ty, 280, 28)
-            self._pbtn(screen, pay_rect, pay_label, self._pay_off_loan,
-                      enabled=can_pay, accent=can_pay)
-            ty += 36
-        else:
-            ui.label("Startup loan", lx, ty)
-            ui.text("body_s", "Cleared", c.STATUS_GOOD, lx + 320, ty, align="right")
-            ty += 20
-
-        ui.label("Landfill tax escalator", lx, ty)
-        lt = eco.landfill_tax_pct_increase()
-        ui.text("mono", f"+{lt:.0f}% vs yr 1", c.STATUS_WARN if lt > 0 else c.TEXT_DIM,
-                lx + 320, ty, align="right")
-        ty += 20
-
-        div = eco.current_diversion_pct()
-        tgt = eco.diversion_target * 100.0
-        ui.label("Recycling diversion (yr)", lx, ty)
-        if div is None:
-            ui.text("body_s", "no data yet", c.TEXT_DIM, lx + 320, ty, align="right")
-        else:
-            dcol2 = c.STATUS_GOOD if div >= tgt else c.STATUS_BAD
-            ui.text("mono", f"{div:.0f}% / {tgt:.0f}%", dcol2, lx + 320, ty, align="right")
-        ty += 18
-        ui.text("caption",
-                f"Miss the {tgt:.0f}% statutory target at year-end for a DEFRA fine.",
-                c.TEXT_DIM, lx, ty)
-
-        if eco.achievements:
-            ty += 30
-            ui.section_header(lx, ty, "ACHIEVEMENTS", 300)
-            ty += 22
-            for ach in eco.achievements.values():
-                short_name = ach["name"].replace("Achievement Unlocked: ", "")
-                ui.text("body_s", f"{short_name} — Day {ach['day']}", c.ACCENT_SAGE, lx, ty)
-                ty += 18
 
         gx = x + 360
         gw = w - 360
@@ -2129,6 +2058,83 @@ class UIManager:
                                       label_w=150, val_w=54)
                 ui.text("caption", "Lower day length = faster game pace.",
                         c.TEXT_DIM, gx, cfg_y)
+
+        # Track where the right column content ends so subsequent sections
+        # start below the dev options block (collapsed or expanded).
+        ry = cfg_y + 20 if self._dev_options_visible else y + 278 + 30
+
+        # ── Diesel market readout ────────────────────────────────────────────
+        ry += 4
+        ui.section_header(gx, ry, "DIESEL MARKET", gw)
+        ry += 22
+        _idx = getattr(eco, "fuel_index", 1.0)
+        _tr  = getattr(eco, "fuel_index_trend", 0.0)
+        _arrow = "rising" if _tr > 0.002 else "falling" if _tr < -0.002 else "steady"
+        _dcol = (c.STATUS_BAD if _idx >= 1.15 else
+                 c.STATUS_GOOD if _idx <= 0.92 else c.TEXT_SECONDARY)
+        ui.label("Pump price (£/litre)", gx, ry)
+        ui.text("mono_b", f"£{eco.fuel_price():.2f}", _dcol, gx + gw, ry, align="right")
+        ry += 20
+        ui.label("Market", gx, ry)
+        ui.text("body_s", f"{eco.fuel_index_label()} — {_arrow}", _dcol, gx + gw, ry, align="right")
+        ry += 20
+        ui.text("caption",
+                "Diesel RCV running costs track this. Electric eRCVs are immune.",
+                c.TEXT_DIM, gx, ry)
+        ry += 30
+
+        # ── Debt & statutory obligations ─────────────────────────────────────
+        ui.section_header(gx, ry, "DEBT & STATUTORY", gw)
+        ry += 22
+        if not eco.loan_cleared():
+            ui.label("Startup loan outstanding", gx, ry)
+            ui.text("mono_b", f"£{int(eco.loan_balance()):,}", c.ACCENT_CORAL,
+                    gx + gw, ry, align="right")
+            ry += 20
+            ui.label("Daily repayment", gx, ry)
+            ui.text("mono", f"£{eco.loan_daily_payment():.0f}/day", c.TEXT_SECONDARY,
+                    gx + gw, ry, align="right")
+            ry += 26
+            can_pay = eco.can_pay_off_loan()
+            pay_label = (f"Pay off loan now (£{int(eco.loan_balance()):,})" if can_pay
+                         else f"Pay off loan (need £{int(eco.loan_balance()):,})")
+            pay_rect = pygame.Rect(gx, ry, gw, 28)
+            self._pbtn(screen, pay_rect, pay_label, self._pay_off_loan,
+                       enabled=can_pay, accent=can_pay)
+            ry += 36
+        else:
+            ui.label("Startup loan", gx, ry)
+            ui.text("body_s", "Cleared", c.STATUS_GOOD, gx + gw, ry, align="right")
+            ry += 20
+
+        ui.label("Landfill tax escalator", gx, ry)
+        _lt = eco.landfill_tax_pct_increase()
+        ui.text("mono", f"+{_lt:.0f}% vs yr 1",
+                c.STATUS_WARN if _lt > 0 else c.TEXT_DIM, gx + gw, ry, align="right")
+        ry += 20
+
+        _div = eco.current_diversion_pct()
+        _tgt = eco.diversion_target * 100.0
+        ui.label("Recycling diversion (yr)", gx, ry)
+        if _div is None:
+            ui.text("body_s", "no data yet", c.TEXT_DIM, gx + gw, ry, align="right")
+        else:
+            _dcol2 = c.STATUS_GOOD if _div >= _tgt else c.STATUS_BAD
+            ui.text("mono", f"{_div:.0f}% / {_tgt:.0f}%", _dcol2, gx + gw, ry, align="right")
+        ry += 18
+        ui.text("caption",
+                f"Miss the {_tgt:.0f}% statutory target at year-end for a DEFRA fine.",
+                c.TEXT_DIM, gx, ry)
+
+        # ── Achievements ─────────────────────────────────────────────────────
+        if eco.achievements:
+            ry += 28
+            ui.section_header(gx, ry, "ACHIEVEMENTS", gw)
+            ry += 22
+            for ach in eco.achievements.values():
+                short_name = ach["name"].replace("Achievement Unlocked: ", "")
+                ui.text("body_s", f"{short_name} — Day {ach['day']}", c.ACCENT_SAGE, gx, ry)
+                ry += 18
 
     # ── Financial charts ──────────────────────────────────────────────────
     def _tab_charts(self, screen, x, y, w, h):
