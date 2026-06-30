@@ -271,15 +271,6 @@ class Renderer:
         # Road works barriers (drawn before trucks so trucks appear on top)
         self.draw_road_works(cx, cy, city, zoom)
 
-        # Red phone & post boxes -- sparse British street furniture
-        if ambient:
-            for box in ambient.phone_boxes.boxes:
-                biso = self.to_iso(box["x"], box["y"])
-                self.draw_phone_box(cx + biso[0] * zoom, cy + biso[1] * zoom, zoom)
-            for box in ambient.post_boxes.boxes:
-                biso = self.to_iso(box["x"], box["y"])
-                self.draw_post_box(cx + biso[0] * zoom, cy + biso[1] * zoom, zoom)
-
         # Ambient pedestrians
         if ambient:
             for ped in ambient.peds.peds:
@@ -1511,48 +1502,6 @@ class Renderer:
             if math.sin(pygame.time.get_ticks() / 250.0 + p["blink"]) > 0.6:
                 pygame.draw.circle(self.screen, (235, 60, 60),
                                    (int(px + 6 * s * dirx), int(py)), max(1, int(s * 0.5)))
-
-    # ─── British street furniture ──────────────────────────────────────────────
-
-    def draw_phone_box(self, x, y, zoom):
-        """An iconic K6 red telephone kiosk."""
-        s = max(1.0, 2.0 * zoom)
-        w, h = 5 * s, 11 * s
-        body = pygame.Rect(int(x - w / 2), int(y - h), int(w), int(h))
-        pygame.draw.rect(self.screen, (190, 30, 30), body, border_radius=max(1, int(s * 0.4)))
-        pygame.draw.rect(self.screen, (230, 230, 230), body,
-                         max(1, int(s * 0.25)), border_radius=max(1, int(s * 0.4)))
-        pygame.draw.rect(self.screen, (150, 20, 20),
-                         pygame.Rect(body.x - int(s * 0.6), body.y - int(s * 1.4),
-                                     int(w + s * 1.2), int(s * 1.4)))
-        if zoom > 0.7:
-            for i in range(3):
-                wy = body.y + int(h * 0.18) + i * int(h * 0.22)
-                pygame.draw.line(self.screen, (230, 230, 230),
-                                 (body.x + 1, wy), (body.right - 1, wy), max(1, int(s * 0.18)))
-        shadow_r = max(1, int(2.4 * s))
-        pygame.draw.ellipse(self.screen, (15, 16, 20),
-                            pygame.Rect(int(x - shadow_r), int(y + 1),
-                                        shadow_r * 2, max(1, int(shadow_r * 0.5))))
-
-    def draw_post_box(self, x, y, zoom):
-        """A red Royal Mail pillar post box."""
-        s = max(1.0, 2.0 * zoom)
-        r = 3.2 * s
-        h = 9 * s
-        body = pygame.Rect(int(x - r), int(y - h), int(r * 2), int(h))
-        pygame.draw.rect(self.screen, (175, 25, 25), body, border_radius=int(r))
-        pygame.draw.ellipse(self.screen, (140, 18, 18),
-                            pygame.Rect(body.x, body.y - int(s), int(r * 2), int(s * 2)))
-        if zoom > 0.7:
-            slot_y = body.y + int(h * 0.28)
-            pygame.draw.rect(self.screen, (40, 40, 44),
-                             pygame.Rect(body.centerx - int(r * 0.6), slot_y,
-                                         int(r * 1.2), max(1, int(s * 0.35))))
-        shadow_r = max(1, int(2.0 * s))
-        pygame.draw.ellipse(self.screen, (15, 16, 20),
-                            pygame.Rect(int(x - shadow_r), int(y + 1),
-                                        shadow_r * 2, max(1, int(shadow_r * 0.5))))
 
     # ─── day / night ──────────────────────────────────────────────────────────
 

@@ -694,7 +694,7 @@ class UIManager:
                 if action == "pause":
                     self.game.running = not self.game.running
                 elif action == "speed":
-                    self.game.speed = {1: 2, 2: 5}.get(self.game.speed, 1)
+                    self.game.speed = {1: 2, 2: 5, 5: 10}.get(self.game.speed, 1)
                 elif isinstance(action, tuple) and action[0] == "win":
                     self.toggle_window(action[1])
                 return True
@@ -722,6 +722,10 @@ class UIManager:
         # first appearance before the active_event is set.
         critical = event.get("effect") in ("crewStrike", "truckBreakdown")
         self._event_duration = 10.0 if critical else 5.5
+        # Drop to 1x so the player can react — skip procurement notices which
+        # are purely informational (vehicle deliveries, O-licence delays, etc.).
+        if event.get("effect") != "procurement":
+            self.game.speed = 1
 
     # ----------------------------------------------------------------- rename
     def handle_key(self, event):
@@ -1970,20 +1974,22 @@ class UIManager:
         ui.text("mono_b", f"{'+' if net >= 0 else ''}£{abs(net):,.0f}", net_color, rx, ty, align="right")
         ty += 32
         ty2 = self._stepper(screen, lx, ty, "Council tax (£/resident/day)", f"{eco.council_tax_rate:.2f}",
-                           (lambda: self._adjust_tax(-0.10)), (lambda: self._adjust_tax(0.10)), label_w=240)
+                           (lambda: self._adjust_tax(-0.10)), (lambda: self._adjust_tax(0.10)), label_w=280)
         tax_pressure = eco.council_tax_pressure()
         if tax_pressure > 0:
             ui.text("caption",
                     f"+{tax_pressure*100:.0f}% above baseline — satisfaction ceiling down "
                     f"{min(45.0, tax_pressure*80.0):.0f} pts. Residents notice.",
                     c.STATUS_WARN, lx, ty2)
+            ty = ty2 + 40  # Account for multi-line text wrapping
         else:
             ui.text("caption", "At or below the baseline rate — no satisfaction penalty.",
                     c.TEXT_DIM, lx, ty2)
-        ty = ty2 + 14
+            ty = ty2 + 20
+        
         ty = self._stepper(screen, lx, ty, "Business rates (£/commercial/day)", f"£{eco.business_rates:.2f}",
                       (lambda: self._adjust_business_rates(-0.10)), (lambda: self._adjust_business_rates(0.10)),
-                      label_w=240)
+                      label_w=280)
         biz_pressure = eco.business_rate_pressure()
         if biz_pressure > 0:
             lost_pct = (1.0 - eco.business_rate_elasticity()) * 100.0
@@ -1991,10 +1997,11 @@ class UIManager:
                     f"+{biz_pressure*100:.0f}% above baseline — ~{lost_pct:.0f}% of that revenue "
                     f"lost as marginal firms close or relocate.",
                     c.STATUS_WARN, lx, ty)
+            ty += 40  # Account for multi-line text wrapping
         else:
             ui.text("caption", "At or below the baseline rate — the high street stays put.",
                     c.TEXT_DIM, lx, ty)
-        ty += 14
+            ty += 20
 
         gx = x + 360
         gw = w - 360

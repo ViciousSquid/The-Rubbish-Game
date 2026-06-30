@@ -358,99 +358,6 @@ class AmbientPeds:
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  Red Phone Boxes
-# ────────────────────────────────────────────────────────────────────────────
-
-class AmbientPhoneBoxes:
-    """Iconic British K6 red telephone kiosks scattered sparsely on street corners."""
-
-    def __init__(self):
-        self.boxes      = []
-        self._built_for = None
-
-    def _rebuild(self, city):
-        self.boxes = []
-        road_list = _road_list_from(city)
-        road_set = set(road_list)
-        corners = []
-
-        for (x, y) in road_list:
-            # Check adjacent tiles to discover true corner nodes
-            neighbors = []
-            for dx, dy in ADJ:
-                if (x + dx, y + dy) in road_set:
-                    neighbors.append((dx, dy))
-            
-            # A clean corner junction will feature exactly two adjacent perpendicular roads
-            if len(neighbors) == 2:
-                (dx1, dy1), (dx2, dy2) = neighbors
-                if dx1 != dx2 and dy1 != dy2:
-                    corners.append((x, y))
-
-        # Maintain true scarcity: Sample roughly 1% of valid street corners
-        if corners:
-            num_boxes = max(1, len(corners) // 100)
-            chosen_corners = random.sample(corners, min(len(corners), num_boxes))
-            for (cx, cy) in chosen_corners:
-                self.boxes.append({
-                    "x":     float(cx),
-                    "y":     float(cy),
-                    "color": (210, 35, 35),  # Post Office Red
-                })
-        self._built_for = city
-
-    def update(self, dt, city):
-        if self._built_for is not city:
-            self._rebuild(city)
-
-
-# ────────────────────────────────────────────────────────────────────────────
-#  Red Pillar Post Boxes
-# ────────────────────────────────────────────────────────────────────────────
-
-class AmbientPostBoxes:
-    """Royal Mail-red pillar post boxes. Sparser than phone boxes and set
-    along straight kerbside runs rather than junctions, so the two props
-    don't cluster on top of each other."""
-
-    def __init__(self):
-        self.boxes      = []
-        self._built_for = None
-
-    def _rebuild(self, city):
-        self.boxes = []
-        road_list = _road_list_from(city)
-        road_set = set(road_list)
-        midstreet = []
-
-        for (x, y) in road_list:
-            neighbors = [(dx, dy) for dx, dy in ADJ if (x + dx, y + dy) in road_set]
-            # A straight kerbside run has exactly two road neighbours running
-            # in opposite directions -- not a junction, not a corner.
-            if len(neighbors) == 2:
-                (dx1, dy1), (dx2, dy2) = neighbors
-                if dx1 == -dx2 and dy1 == -dy2:
-                    midstreet.append((x, y))
-
-        # Keep them rarer than phone boxes still: roughly 1 in every 140
-        # eligible kerbside tiles.
-        if midstreet:
-            num_boxes = max(1, len(midstreet) // 140)
-            chosen = random.sample(midstreet, min(len(midstreet), num_boxes))
-            for (cx, cy) in chosen:
-                self.boxes.append({
-                    "x":     float(cx),
-                    "y":     float(cy),
-                    "color": (175, 25, 25),
-                })
-        self._built_for = city
-
-    def update(self, dt, city):
-        if self._built_for is not city:
-            self._rebuild(city)
-
-
-# ────────────────────────────────────────────────────────────────────────────
 #  Aircraft
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -516,8 +423,6 @@ class AmbientState:
         self.traffic     = AmbientTraffic()
         self.birds       = AmbientBirds()
         self.peds        = AmbientPeds()
-        self.phone_boxes = AmbientPhoneBoxes()
-        self.post_boxes  = AmbientPostBoxes()
         self.aircraft    = AmbientAircraft()
         self.snow_level  = 0.0   # 0..1, how deeply snow has settled on the city
 
@@ -526,8 +431,6 @@ class AmbientState:
         self.traffic.update(dt, city)
         self.birds.update(dt, city)
         self.peds.update(dt, city, on_strike=on_strike)
-        self.phone_boxes.update(dt, city)
-        self.post_boxes.update(dt, city)
         self.aircraft.update(dt, city)
         self._update_snow(dt, economy)
 
