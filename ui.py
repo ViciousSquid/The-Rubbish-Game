@@ -1974,7 +1974,7 @@ class UIManager:
         ui.text("mono_b", f"{'+' if net >= 0 else ''}£{abs(net):,.0f}", net_color, rx, ty, align="right")
         ty += 32
         ty2 = self._stepper(screen, lx, ty, "Council tax (£/resident/day)", f"{eco.council_tax_rate:.2f}",
-                           (lambda: self._adjust_tax(-0.10)), (lambda: self._adjust_tax(0.10)), label_w=280)
+                           (lambda: self._adjust_tax(-0.10)), (lambda: self._adjust_tax(0.10)))
         tax_pressure = eco.council_tax_pressure()
         if tax_pressure > 0:
             ui.text("caption",
@@ -1988,8 +1988,7 @@ class UIManager:
             ty = ty2 + 20
         
         ty = self._stepper(screen, lx, ty, "Business rates (£/commercial/day)", f"£{eco.business_rates:.2f}",
-                      (lambda: self._adjust_business_rates(-0.10)), (lambda: self._adjust_business_rates(0.10)),
-                      label_w=280)
+                      (lambda: self._adjust_business_rates(-0.10)), (lambda: self._adjust_business_rates(0.10)))
         biz_pressure = eco.business_rate_pressure()
         if biz_pressure > 0:
             lost_pct = (1.0 - eco.business_rate_elasticity()) * 100.0

@@ -21,7 +21,8 @@ AREA_NAMES = [
     "Hampton", "Broughton-in-the-Mud",
     "Green Park", "Parkside", "Greenfield", "Meadow Park",
     "Sodden-under-Edge", "Bilehurst", "Dampford", "Upper Furlong",
-    "Oak Park", "Spring Green", "Ystrad", "Green Hill",
+    "Oak Park", "Spring Green", "Ystrad", "Green Hill", "Chipping-Misery",
+    "Upper-Grumble", "Great-Yawning", "Bishops-Folly",
 ]
 
 # ---------------------------------------------------------------------------
