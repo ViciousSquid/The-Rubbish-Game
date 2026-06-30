@@ -2,5 +2,4 @@
 ### Manage profit and loss, procurement, collection schedules etc using real spreadsheets<br> [Work in progress]
 
 
-<img width="1002" height="645" alt="image" src="https://github.com/user-attachments/assets/1d0189a9-58d9-4f3b-bf52-c30a4a5ac9e1" />
-
+<img src="https://github.com/user-attachments/assets/c705220c-2d74-4aaf-afd0-12c3f6eee658" width="900">
