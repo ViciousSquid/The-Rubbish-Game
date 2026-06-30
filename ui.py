@@ -392,8 +392,6 @@ class UIManager:
         # Truck rename state
         self._renaming_truck_id = None
         self._rename_buffer = ""
-        # Developer options toggle (Finance tab)
-        self._dev_options_visible = False
         # Staff tab fleet scroll state
         self._staff_fleet_scroll = 0
         self._staff_fleet_max_scroll = 0
@@ -482,7 +480,7 @@ class UIManager:
         win = self._win_index.get("debug")
         if win is None:
             w, h = self._screen_size
-            ww, hh = 760, 580
+            ww, hh = 760, 676
             x = min(HUD_W + 80, max(HUD_W + 4, w - ww - 8))
             y = min(TOOLBAR_H + 40, max(TOOLBAR_H + 4, h - hh - 8))
             win = FloatingWindow("debug", "Debug Tools (Ctrl+Shift+D)", x, y, ww, hh)
@@ -1978,12 +1976,12 @@ class UIManager:
         tax_pressure = eco.council_tax_pressure()
         if tax_pressure > 0:
             ui.text("caption",
-                    f"+{tax_pressure*100:.0f}% above baseline — satisfaction ceiling down "
+                    f"+{tax_pressure*100:.0f}% above baseline: satisfaction ceiling down "
                     f"{min(45.0, tax_pressure*80.0):.0f} pts. Residents notice.",
                     c.STATUS_WARN, lx, ty2)
             ty = ty2 + 40  # Account for multi-line text wrapping
         else:
-            ui.text("caption", "At or below the baseline rate — no satisfaction penalty.",
+            ui.text("caption", "At or below the baseline rate: no satisfaction penalty.",
                     c.TEXT_DIM, lx, ty2)
             ty = ty2 + 20
         
@@ -1993,12 +1991,12 @@ class UIManager:
         if biz_pressure > 0:
             lost_pct = (1.0 - eco.business_rate_elasticity()) * 100.0
             ui.text("caption",
-                    f"+{biz_pressure*100:.0f}% above baseline — ~{lost_pct:.0f}% of that revenue "
+                    f"+{biz_pressure*100:.0f}% above baseline: ~{lost_pct:.0f}% of that revenue "
                     f"lost as marginal firms close or relocate.",
                     c.STATUS_WARN, lx, ty)
             ty += 40  # Account for multi-line text wrapping
         else:
-            ui.text("caption", "At or below the baseline rate — the high street stays put.",
+            ui.text("caption", "At or below baseline rate: the high street stays put.",
                     c.TEXT_DIM, lx, ty)
             ty += 20
 
@@ -2031,43 +2029,9 @@ class UIManager:
             ui.text("body_s", "Trend builds after a few days.", c.TEXT_DIM, gx, y + 60)
         ui.label("Budget", gx, y + 200)
         ui.text("display", f"£{int(eco.budget):,}", c.TEXT_PRIMARY, gx, y + 218)
-        # Developer options (hidden behind a toggle)
-        cfg_y = y + 278
-        if cfg_y < y + h - 22:
-            dev_on = self._dev_options_visible
-            dev_lbl = "▾ Developer options" if dev_on else "▸ Developer options"
-            dev_col = c.ACCENT_AMBER if dev_on else c.TEXT_DIM
-            dev_btn = pygame.Rect(gx, cfg_y, 200, 22)
-            pygame.draw.rect(screen, c.BG_CARD if dev_on else c.BG_PANEL,
-                             dev_btn, border_radius=4)
-            pygame.draw.rect(screen, c.BORDER_SUBTLE, dev_btn, 1, border_radius=4)
-            ui.text("body_s", dev_lbl, dev_col, gx + 8, cfg_y + 3)
-            self.planner_widgets.append(
-                (dev_btn, lambda: setattr(self, '_dev_options_visible',
-                                          not self._dev_options_visible)))
-            if dev_on:
-                cfg_y += 28
-                cfg_y = self._stepper(screen, gx, cfg_y, "Event chance",
-                                      f"{int(eco.event_chance * 100)}%",
-                                      lambda: self._adjust_event_chance(-0.05),
-                                      lambda: self._adjust_event_chance(0.05),
-                                      label_w=150, val_w=54)
-                cfg_y = self._stepper(screen, gx, cfg_y, "Win streak (days)",
-                                      str(eco.win_streak_target),
-                                      lambda: self._adjust_win_target(-1),
-                                      lambda: self._adjust_win_target(1),
-                                      label_w=150, val_w=54)
-                cfg_y = self._stepper(screen, gx, cfg_y, "Day length (sec)",
-                                      str(eco.day_duration),
-                                      lambda: self._adjust_day_duration(-5),
-                                      lambda: self._adjust_day_duration(5),
-                                      label_w=150, val_w=54)
-                ui.text("caption", "Lower day length = faster game pace.",
-                        c.TEXT_DIM, gx, cfg_y)
 
-        # Track where the right column content ends so subsequent sections
-        # start below the dev options block (collapsed or expanded).
-        ry = cfg_y + 20 if self._dev_options_visible else y + 278 + 30
+        # (Developer options have moved to the Debug Tools window, Ctrl+Shift+D)
+        ry = y + 278 + 30
 
         # ── Diesel market readout ────────────────────────────────────────────
         ry += 4
@@ -2472,8 +2436,8 @@ class UIManager:
 
         ui.section_header(x, ty, "Force event", w)
         ty += 26
-        cols = 2
-        col_w = (w - 16) // cols
+        cols = 4
+        col_w = (w - 16 * (cols - 1)) // cols
         for i, ev in enumerate(economy.events):
             col = i % cols
             row = i // cols
@@ -2492,6 +2456,29 @@ class UIManager:
             ui.text("body_s", f"Active: {economy.active_event['name']}", c.TEXT_MUTED,
                     clear_rect.right + 16, ty + 8)
         ty += 46
+        ui.h_line(x, ty, w)
+        ty += 16
+
+        ui.section_header(x, ty, "Developer options", w)
+        ty += 26
+        ty = self._stepper(screen, x, ty, "Event chance",
+                           f"{int(economy.event_chance * 100)}%",
+                           lambda: self._adjust_event_chance(-0.05),
+                           lambda: self._adjust_event_chance(0.05),
+                           label_w=150, val_w=54)
+        ty = self._stepper(screen, x, ty, "Win streak (days)",
+                           str(economy.win_streak_target),
+                           lambda: self._adjust_win_target(-1),
+                           lambda: self._adjust_win_target(1),
+                           label_w=150, val_w=54)
+        ty = self._stepper(screen, x, ty, "Day length (sec)",
+                           str(economy.day_duration),
+                           lambda: self._adjust_day_duration(-5),
+                           lambda: self._adjust_day_duration(5),
+                           label_w=150, val_w=54)
+        ui.text("caption", "Lower day length = faster game pace.", c.TEXT_DIM, x, ty)
+        ty += 24
+
         if self._debug_status:
             ui.text("body_s", self._debug_status, c.ACCENT_TEAL, x, ty)
 
