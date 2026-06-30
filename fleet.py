@@ -1,10 +1,24 @@
 import math
+import random
 from collections import deque
 
 from procurement import get_vehicle, Order, get_tier
 
 # --- Tuning -----------------------------------------------------------------
 SERVICE_FILL_THRESHOLD = 20      # default "worth emptying" %% (now a fleet lever)
+# --- Vehicle ageing / reliability -------------------------------------------
+# Lorries wear out. Daily running cost climbs with age, and the daily chance of
+# an age-related breakdown rises sharply once a vehicle is a few years old, so
+# running a lorry forever is a false economy -- you have to plan replacements.
+DAYS_PER_YEAR        = 112       # one council year (matches economy season cycle)
+WEAR_COST_PER_YEAR   = 0.16      # +16% running cost per year of age
+WEAR_COST_CAP        = 1.20      # never more than +120% over base
+BREAKDOWN_BASE       = 0.003     # daily breakdown chance for a near-new lorry
+BREAKDOWN_LINEAR     = 0.007     # added per year of age
+BREAKDOWN_QUAD       = 0.0035    # added per year^2 of age
+BREAKDOWN_CAP        = 0.060     # hard ceiling on daily breakdown chance
+REPAIR_DAYS_MIN      = 2
+REPAIR_DAYS_MAX      = 5
 TRUCK_SPEED = 11.0               # tiles / second (base, scaled by crew + model)
 WORKER_SPEED = 9.0               # tiles / second (loaders, cosmetic)
 PER_BIN_TIME = 0.10              # seconds per bin within a wave of loaders
@@ -49,7 +63,9 @@ class FleetManager:
 
     # ------------------------------------------------------------ initial fleet
     def setup_initial_fleet(self, lorries=4, crew=16):
-        """Give the council a starting fleet for free (no budget hit)."""
+        """Spawn the council's starting fleet. No direct cash hit here -- the
+        vehicles are financed by the startup loan held in the Economy, which is
+        paid back daily with interest (see economy.StartupLoan)."""
         for _ in range(lorries):
             self.purchase_truck(DEFAULT_MODEL)
         for _ in range(crew):
@@ -115,6 +131,10 @@ class FleetManager:
             "service_need": 0.0,
             "service_bins": [],
             "facing": 1,
+            # --- ageing / reliability ---
+            "age_days": 0,            # in-service age, ticked once per day
+            "broken": False,          # out of action awaiting repair
+            "repair_days": 0,         # days left in the repair bay
         }
         self.trucks.append(truck)
         return truck
@@ -184,14 +204,26 @@ class FleetManager:
 
         return delivered, events_triggered
 
-    def daily_vehicle_cost(self):
-        """Per-day running + lease cost across the fleet (for the ledger)."""
+    def daily_vehicle_cost(self, fuel_index=1.0, fuel_fraction=0.54):
+        """Per-day running + lease cost across the fleet (for the ledger).
+
+        The diesel portion of each owned/rental lorry's running cost is scaled
+        by the current pump-price index, so a spike at the forecourt shows up
+        as a real daily hit. Electric RCVs (model id 'electric') are immune —
+        that's the whole point of paying the premium for one. Leased vehicles
+        bill a flat weekly charge and aren't fuel-adjusted here."""
         total = 0.0
         for t in self.trucks:
             if t.get("leased"):
                 total += t["lease_weekly"] / 7.0
+                continue
+            running = t["running_cost"] * self.wear_factor(t)
+            if t.get("model_id") == "electric":
+                total += running
             else:
-                total += t["running_cost"]
+                fuel = running * fuel_fraction
+                rest = running - fuel
+                total += rest + fuel * fuel_index
         return total
 
     def get_rental_costs(self):
@@ -464,6 +496,97 @@ class FleetManager:
         for b in list(truck["claimed"]):
             self.claimed.discard(b)
         truck["claimed"].clear()
+
+    # ------------------------------------------------------------- ageing
+    def wear_factor(self, truck):
+        """Running-cost multiplier from age (1.0 when new, up to 1+CAP)."""
+        years = truck.get("age_days", 0) / DAYS_PER_YEAR
+        return 1.0 + min(WEAR_COST_CAP, years * WEAR_COST_PER_YEAR)
+
+    def breakdown_chance(self, truck):
+        """Daily probability this lorry suffers an age-related breakdown."""
+        years = truck.get("age_days", 0) / DAYS_PER_YEAR
+        chance = BREAKDOWN_BASE + BREAKDOWN_LINEAR * years + BREAKDOWN_QUAD * years * years
+        if truck.get("model_id") == "electric":
+            chance *= 0.70            # fewer moving parts, gentler wear
+        return min(BREAKDOWN_CAP, chance)
+
+    def condition_pct(self, truck):
+        """Headline 0-100 'condition' for the UI. New ~100, falls with age."""
+        years = truck.get("age_days", 0) / DAYS_PER_YEAR
+        return max(8.0, 100.0 - years * 14.0)
+
+    def condition_label(self, truck):
+        c = self.condition_pct(truck)
+        if c >= 80: return "Pristine"
+        if c >= 60: return "Good"
+        if c >= 40: return "Worn"
+        if c >= 22: return "Tired"
+        return "Clapped-out"
+
+    def repair_bill(self, truck):
+        """Cost of an age-related breakdown repair (worse on older vehicles)."""
+        years = truck.get("age_days", 0) / DAYS_PER_YEAR
+        base = 800 + 600 * years + truck.get("running_cost", 130) * 4
+        return int(min(28000, base))
+
+    def weighted_breakdown_target(self):
+        """Pick a working lorry to break down, biased toward the least reliable
+        (oldest) vehicles. Used by the event-driven breakdown so failures land
+        on worn lorries, not pristine ones. Returns a truck or None."""
+        cands = [t for t in self.trucks if t["crew"] >= 1 and not t.get("broken")]
+        if not cands:
+            return None
+        weights = [self.breakdown_chance(t) + 0.001 for t in cands]
+        return random.choices(cands, weights=weights, k=1)[0]
+
+    def age_fleet(self):
+        """Advance the fleet one day: age every vehicle, progress repairs, and
+        roll age-related breakdowns. Repair bills are charged immediately to the
+        economy. Returns a list of notice dicts (for the UI event banner)."""
+        notices = []
+        eco = getattr(self.game, "economy", None)
+        for t in self.trucks:
+            t["age_days"] = t.get("age_days", 0) + 1
+
+            # Vehicles in the repair bay count down to roadworthy again. Only
+            # age-related breakdowns carry a repair_days countdown; event-driven
+            # breakdowns (repair_days == 0) are recovered by the event system,
+            # so we must leave those alone here.
+            if t.get("broken"):
+                if t.get("repair_days", 0) > 0:
+                    t["repair_days"] -= 1
+                    if t["repair_days"] <= 0:
+                        t["broken"] = False
+                        notices.append({
+                            "name": "Repair Complete",
+                            "desc": f"{t.get('nickname', 'L' + str(t['id']))} is "
+                                    f"back on the road after servicing.",
+                            "effect": "repairDone",
+                        })
+                continue
+
+            # Healthy, crewed lorries can break down from wear.
+            if t["crew"] >= 1 and random.random() < self.breakdown_chance(t):
+                dur = random.randint(REPAIR_DAYS_MIN, REPAIR_DAYS_MAX)
+                t["broken"] = True
+                t["repair_days"] = dur
+                t["path"] = []
+                t["state"] = "depot"
+                self._release_truck_claims(t)
+                bill = self.repair_bill(t)
+                if eco is not None:
+                    eco.budget -= bill
+                    eco.ledger["repairs"] = eco.ledger.get("repairs", 0.0) + bill
+                notices.append({
+                    "name": "Vehicle Breakdown",
+                    "desc": f"{t.get('nickname', 'L' + str(t['id']))} "
+                            f"({t.get('model_name', 'RCV')}) has broken down with "
+                            f"age-related wear -- out for {dur} day"
+                            f"{'s' if dur != 1 else ''}. Repair bill £{bill:,}.",
+                    "effect": "truckBreakdown",
+                })
+        return notices
 
     # ----------------------------------------------------------------- update
     def update(self, dt):

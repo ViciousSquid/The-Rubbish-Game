@@ -354,6 +354,30 @@ class Renderer:
         tile_y = (iy / (self.tile_h / 2) - ix / (self.tile_w / 2)) / 2
         return {"x": round(tile_x), "y": round(tile_y)}
 
+    def truck_screen_pos(self, truck):
+        """Screen-space (x, y, icon_scale) for a lorry, matching the offsets
+        used by draw_truck() so hit-testing lines up with what's on screen."""
+        cx   = self.screen.get_width() // 2 + self.camera["x"]
+        cy   = 120 + self.camera["y"]
+        zoom = self.camera["zoom"]
+        iso  = self.to_iso(truck["x"], truck["y"])
+        s    = zoom * 1.2
+        return cx + iso[0] * zoom, cy + iso[1] * zoom - 5 * s, s
+
+    def truck_at_screen_pos(self, fleet, screen_x, screen_y):
+        """Hit-test lorries against a screen-space click point. Returns the
+        truck dict nearest the click if within its icon radius, else None."""
+        best, best_d2 = None, None
+        for truck in fleet.trucks:
+            tx, ty, s = self.truck_screen_pos(truck)
+            r  = max(15, 13 * s)
+            dx = screen_x - tx
+            dy = screen_y - ty
+            d2 = dx * dx + dy * dy
+            if d2 <= r * r and (best_d2 is None or d2 < best_d2):
+                best, best_d2 = truck, d2
+        return best
+
     # ─── tile floor ───────────────────────────────────────────────────────────
 
     def draw_tile(self, x, y, tile, is_selected, zoom, city=None, static_only=False):

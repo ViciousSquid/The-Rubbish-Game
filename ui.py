@@ -35,6 +35,50 @@ ROUTE_TYPE_COLORS = {
     "mixed": (220, 200, 120),
 }
 
+# ── Floating windows (Chris Sawyer style) ────────────────────────────────────
+# The old modal TAB planner is replaced by a set of independently openable,
+# draggable, overlapping windows. Each entry: key, short toolbar label, title
+# bar caption, default width, default height. The window CONTENT is rendered by
+# the existing `_tab_<key>` methods, which already draw into an (x,y,w,h) rect.
+WINDOW_DEFS = [
+    ("rounds",  "Rounds",  "Collection Rounds",    764, 462),
+    ("waste",   "Waste",   "Waste Streams",        660, 466),
+    ("fleet",   "Fleet",   "Fleet & Procurement",  800, 548),
+    ("staff",   "Staff",   "Staff & Vehicles",     864, 560),
+    ("finance", "Finance", "Finance",              788, 520),
+    ("charts",  "Charts",  "Financial Charts",     760, 560),
+    ("data",    "Data",    "Data & Plan I/O",      620, 420),
+]
+WINDOW_TITLEBAR_H = 34
+WINDOW_PAD        = 16
+TOOLBAR_H         = 40
+
+
+class FloatingWindow:
+    """A draggable, closable panel. Holds its own click-target lists so clicks
+    resolve against the correct (top-most) window rather than a global frame."""
+
+    def __init__(self, key, title, x, y, w, h):
+        self.key   = key
+        self.title = title
+        self.rect  = pygame.Rect(x, y, w, h)
+        self.widgets = []      # (rect, fn) click targets collected during draw
+        self.cells   = []      # (rect, area_id, day) round-day cells
+        self.close_rect = None
+
+    def titlebar_rect(self):
+        return pygame.Rect(self.rect.x, self.rect.y, self.rect.w, WINDOW_TITLEBAR_H)
+
+    def body_rect(self):
+        r = self.rect
+        return pygame.Rect(
+            r.x + WINDOW_PAD,
+            r.y + WINDOW_TITLEBAR_H + 8,
+            r.w - 2 * WINDOW_PAD,
+            r.h - WINDOW_TITLEBAR_H - 8 - WINDOW_PAD,
+        )
+
+
 
 class ColorSystem:
     """A cohesive, accessible color palette inspired by modern dark-mode games."""
@@ -340,30 +384,236 @@ class UIManager:
         self._staff_fleet_scroll = 0
         self._staff_fleet_max_scroll = 0
         self._staff_fleet_clip = None
+
+        # ── Floating-window system ───────────────────────────────────────────
+        self.windows = []              # open windows, back-to-front (front last)
+        self._win_index = {}           # key -> FloatingWindow (persistent pos)
+        self._win_drag = None          # (window, grab_dx, grab_dy) while dragging
+        self.toolbar_buttons = []      # (rect, action) rebuilt each draw
+        self._screen_size = (1280, 720)
+        self._content_renderers = {
+            "rounds":  self._tab_rounds,
+            "waste":   self._tab_waste,
+            "fleet":   self._tab_fleet,
+            "staff":   self._tab_staff,
+            "finance": self._tab_finance,
+            "charts":  self._tab_charts,
+            "data":    self._tab_data,
+        }
         self._setup_buttons()
 
     def _setup_buttons(self):
-        x = 14
-        inner = HUD_W - 28
-        half = (inner - 8) // 2
-        self.buttons = [
-            {"rect": pygame.Rect(x,            0, half,  34), "label": "Pause",              "action": "pause",     "row_offset": 0},
-            {"rect": pygame.Rect(x + half + 8, 0, half,  34), "label": "1x",                 "action": "speed",     "row_offset": 0},
-            {"rect": pygame.Rect(x,            0, inner, 34), "label": "Procure Vehicle",     "action": "fleet_tab", "row_offset": 42},
-            {"rect": pygame.Rect(x,            0, inner, 34), "label": "Hire Crew", "cost": 2500, "action": "worker",   "row_offset": 80},
-            {"rect": pygame.Rect(x,            0, inner, 34), "label": "MANAGE (TAB)",  "action": "planner",   "row_offset": 118},
-        ]
+        # Toolbar buttons are rebuilt each frame in _draw_toolbar (they depend on
+        # the live window width); nothing to pre-build here. Kept as a method so
+        # the existing VIDEORESIZE hook in main.py stays valid.
+        self.toolbar_buttons = []
 
-    def handle_scroll(self, button, pos):
-        """Route a mousewheel event into the planner when appropriate.
-        Returns True if the event was consumed (caller should skip camera zoom)."""
-        tab = getattr(self.game, 'planner_tab', '')
-        if tab == 'staff' and self._staff_fleet_clip is not None:
+    # =====================================================================
+    #  Floating-window management
+    # =====================================================================
+    def _make_window(self, key):
+        for k, _short, title, ww, hh in WINDOW_DEFS:
+            if k == key:
+                w, h = self._screen_size
+                # Cascade new windows down-right from the top-left of the map
+                # area. A steady 30px step keeps every title bar's top strip
+                # grabbable even when several windows overlap.
+                idx = len(self._win_index)
+                x = HUD_W + 40 + idx * 28
+                y = TOOLBAR_H + 24 + idx * 30
+                x = min(x, max(HUD_W + 4, w - ww - 8))
+                y = min(y, max(TOOLBAR_H + 4, h - hh - 8))
+                return FloatingWindow(key, title, x, y, ww, hh)
+        return None
+
+    def open_window(self, key):
+        win = self._win_index.get(key)
+        if win is None:
+            win = self._make_window(key)
+            if win is None:
+                return
+            self._win_index[key] = win
+        if win in self.windows:
+            self._bring_to_front(win)
+        else:
+            self.windows.append(win)   # appended == front-most
+
+    def close_window(self, win_or_key):
+        win = (win_or_key if isinstance(win_or_key, FloatingWindow)
+               else self._win_index.get(win_or_key))
+        if win in self.windows:
+            self.windows.remove(win)
+
+    def toggle_window(self, key):
+        if any(w.key == key for w in self.windows):
+            self.close_window(key)
+        else:
+            self.open_window(key)
+
+    # ----- per-vehicle inspect windows (opened by clicking a lorry) --------
+    def _truck_window_title(self, truck):
+        nickname = truck.get("nickname", f"L{truck['id']}")
+        return f"{nickname}  —  {truck.get('model_name', 'Lorry')}"
+
+    def open_truck_window(self, truck_id):
+        """Open (or focus) a draggable inspect window for one lorry. Several
+        of these can be open at once, independently of the six fixed
+        planner windows."""
+        key = f"truck_{truck_id}"
+        win = self._win_index.get(key)
+        if win is None:
+            truck = self.game.fleet.get_truck(truck_id)
+            if truck is None:
+                return
+            w, h = self._screen_size
+            ww, hh = 372, 640
+            n = sum(1 for k in self._win_index if k.startswith("truck_"))
+            x = HUD_W + 60 + n * 26
+            y = TOOLBAR_H + 30 + n * 26
+            x = min(x, max(HUD_W + 4, w - ww - 8))
+            y = min(y, max(TOOLBAR_H + 4, h - hh - 8))
+            win = FloatingWindow(key, self._truck_window_title(truck), x, y, ww, hh)
+            self._win_index[key] = win
+        if win in self.windows:
+            self._bring_to_front(win)
+        else:
+            self.windows.append(win)
+
+    def _prune_truck_windows(self):
+        """Drop the cached window for any lorry that's been scrapped, and
+        keep open titles in sync with renames."""
+        fleet = self.game.fleet
+        stale = []
+        for key, win in self._win_index.items():
+            if not key.startswith("truck_"):
+                continue
+            truck = fleet.get_truck(int(key.split("_", 1)[1]))
+            if truck is None:
+                stale.append(key)
+            else:
+                win.title = self._truck_window_title(truck)
+        for key in stale:
+            win = self._win_index.pop(key)
+            if win in self.windows:
+                self.windows.remove(win)
+
+    def _center_on_truck(self, truck_id):
+        truck = self.game.fleet.get_truck(truck_id)
+        if truck:
+            self.game.center_camera_on(truck["x"], truck["y"])
+
+    def _bring_to_front(self, win):
+        if win in self.windows and self.windows[-1] is not win:
+            self.windows.remove(win)
+            self.windows.append(win)
+
+    def any_window_open(self):
+        return bool(self.windows)
+
+    def _clamp_window(self, win):
+        w, h = self._screen_size
+        r = win.rect
+        r.x = max(HUD_W + 4, min(r.x, w - r.w - 4))
+        # keep the title bar reachable below the toolbar and above the bottom
+        r.y = max(TOOLBAR_H + 4, min(r.y, h - WINDOW_TITLEBAR_H - 4))
+
+    def window_at(self, pos):
+        for win in reversed(self.windows):
+            if win.rect.collidepoint(pos):
+                return win
+        return None
+
+    def _in_toolbar(self, pos):
+        return pos[1] < TOOLBAR_H and pos[0] >= HUD_W
+
+    # ----- mouse routing (called from main.py) -----------------------------
+    def on_mouse_down(self, pos):
+        """Press handling. Returns True if the UI consumed the press (so the
+        map must not start a camera drag)."""
+        if self.game.economy.has_lost:
+            return False
+        win = self.window_at(pos)
+        if win is not None:
+            self._bring_to_front(win)
+            # The close box lives inside the title bar — pressing it must not
+            # begin a drag; the actual close happens on mouse-up.
+            if win.close_rect and win.close_rect.collidepoint(pos):
+                return True
+            if win.titlebar_rect().collidepoint(pos):
+                self._win_drag = (win, pos[0] - win.rect.x, pos[1] - win.rect.y)
+            return True
+        if self._in_toolbar(pos) or pos[0] < HUD_W:
+            return True            # consume; act on release
+        return False
+
+    def on_mouse_motion(self, rel, pos):
+        """Returns True while dragging a window (suppresses camera pan)."""
+        if self._win_drag is not None:
+            win, gx, gy = self._win_drag
+            win.rect.x = pos[0] - gx
+            win.rect.y = pos[1] - gy
+            self._clamp_window(win)
+            return True
+        return False
+
+    def on_mouse_up(self, pos, was_click):
+        """Release handling. Returns True if the UI consumed the event."""
+        was_dragging_window = self._win_drag is not None
+        self._win_drag = None
+        if was_dragging_window:
+            return True
+        if self.game.economy.has_lost:
+            return False
+        if not was_click:
+            return False
+        win = self.window_at(pos)
+        if win is not None:
+            self._resolve_window_click(win, pos)
+            return True
+        if self._toolbar_click(pos):
+            return True
+        if pos[0] < HUD_W:
+            return True            # clicked the HUD status panel — no map action
+        return False
+
+    def on_scroll(self, button, pos):
+        """Route a mousewheel into a window (currently only the staff fleet
+        list scrolls). Returns True if consumed."""
+        win = self.window_at(pos)
+        if win is not None and win.key == "staff" and self._staff_fleet_clip is not None:
             delta = -50 if button == 4 else 50
             self._staff_fleet_scroll = max(
                 0, min(self._staff_fleet_max_scroll,
                        self._staff_fleet_scroll + delta))
             return True
+        return False
+
+    def _resolve_window_click(self, win, pos):
+        if win.close_rect and win.close_rect.collidepoint(pos):
+            self.close_window(win)
+            return
+        # Resolve against THIS window's collected click targets.
+        self.planner_widgets = win.widgets
+        self.planner_cells = win.cells
+        for rect, fn in win.widgets:
+            if rect.collidepoint(pos):
+                fn()
+                return
+        for rect, area_id, day in win.cells:
+            if rect.collidepoint(pos):
+                self.game.city.set_area_day(area_id, day)
+                return
+
+    def _toolbar_click(self, pos):
+        for rect, action in self.toolbar_buttons:
+            if rect.collidepoint(pos):
+                if action == "pause":
+                    self.game.running = not self.game.running
+                elif action == "speed":
+                    self.game.speed = {1: 2, 2: 5}.get(self.game.speed, 1)
+                elif isinstance(action, tuple) and action[0] == "win":
+                    self.toggle_window(action[1])
+                return True
         return False
 
     def _pbtn_in_clip(self, screen, rect, label, fn, clip_rect,
@@ -377,44 +627,6 @@ class UIManager:
         ui.button(rect, label, enabled=enabled, accent=accent, hovered=hovered)
         if enabled and clip_rect.colliderect(rect):
             self.planner_widgets.append((rect, fn))
-
-    def handle_click(self, pos):
-        for btn in self.buttons:
-            if btn["rect"].collidepoint(pos):
-                self._do_action(btn["action"])
-                return True
-        return False
-
-    def handle_planner_click(self, pos):
-        if self._planner_close and self._planner_close.collidepoint(pos):
-            self.game.planner_open = False
-            return True
-        for rect, fn in self.planner_widgets:
-            if rect.collidepoint(pos):
-                fn()
-                return True
-        for rect, area_id, day in self.planner_cells:
-            if rect.collidepoint(pos):
-                self.game.city.set_area_day(area_id, day)
-                return True
-        return True
-
-    def _do_action(self, action):
-        eco = self.game.economy
-        if action == "pause":
-            self.game.running = not self.game.running
-        elif action == "speed":
-            self.game.speed = {1: 2, 2: 5}.get(self.game.speed, 1)
-        elif action == "fleet_tab":
-            self.game.open_planner_tab("fleet")
-        elif action == "worker":
-            if eco.budget >= 2500:
-                eco.budget -= 2500
-                self.game.fleet.hire_worker()
-            else:
-                self._flash_insufficient()
-        elif action == "planner":
-            self.game.planner_open = not self.game.planner_open
 
     def show_event(self, event):
         self._current_event = event
@@ -465,37 +677,116 @@ class UIManager:
         self._insufficient_funds_flash = True
         self._flash_timer = 0
 
-    def _draw_button(self, screen, btn, ui):
-        rect = btn["rect"]
-        mouse = pygame.mouse.get_pos()
-        hovered = rect.collidepoint(mouse)
-        affordable = self.game.economy.budget >= btn["cost"] if "cost" in btn else True
-        label = btn["label"]
-        if "cost" in btn:
-            label = f"{btn['label']}  £{btn['cost']:,}"
-        if btn["action"] == "pause":
-            label = "Pause" if self.game.running else "Resume"
-        elif btn["action"] == "speed":
-            label = f"{self.game.speed}x Speed"
-        elif btn["action"] == "planner":
-            label = "Close" if self.game.planner_open else "MANAGE (TAB)"
-        enabled = affordable
-        accent = btn["action"] in ("fleet_tab", "worker")
-        ui.button(rect, label, enabled=enabled, accent=accent, hovered=hovered)
-
     def draw(self, screen):
         self.ui = UIPrimitives(screen, self.fonts)
         w, h = screen.get_size()
+        self._screen_size = (w, h)
         self._draw_hud(screen, w, h)
+        self._draw_toolbar(screen, w, h)
+        self._draw_conditions_strip(screen, w, h)
         self._draw_crisis_banner(screen, w, h)
         self._draw_win_banner(screen, w, h)
         self._draw_inspect_panel(screen, w, h)
-        if self.game.planner_open:
-            self._draw_planner(screen, w, h)
+        # Floating windows sit above the map/HUD but below transient banners.
+        self._draw_windows(screen, w, h)
         self._draw_toast(screen, w, h)
         # Procurement bar drawn before event banner so events always render on top.
         self._draw_procurement_bar(screen, w)
         self._draw_event_banner(screen, w)
+        # Game-over overlay sits on top of everything else.
+        self._draw_game_over(screen, w, h)
+
+    # ----- toolbar & floating windows --------------------------------------
+    def _draw_toolbar(self, screen, w, h):
+        """Persistent top toolbar across the map area: game speed plus a toggle
+        button for each floating window (highlighted while its window is open)."""
+        ui = self.ui
+        c = ui.c
+        if self.game.economy.has_lost:
+            return
+        x0 = HUD_W
+        pygame.draw.rect(screen, c.BG_PANEL, pygame.Rect(x0, 0, w - x0, TOOLBAR_H))
+        pygame.draw.line(screen, c.BORDER_SUBTLE, (x0, TOOLBAR_H), (w, TOOLBAR_H), 1)
+
+        self.toolbar_buttons = []
+        mouse = pygame.mouse.get_pos()
+        bx = x0 + 12
+        by = (TOOLBAR_H - 28) // 2
+        bh = 28
+
+        # Pause / resume
+        pr = pygame.Rect(bx, by, 84, bh)
+        ui.button(pr, "Resume" if not self.game.running else "Pause",
+                  hovered=pr.collidepoint(mouse), accent=not self.game.running)
+        self.toolbar_buttons.append((pr, "pause"))
+        bx = pr.right + 8
+
+        # Speed cycle
+        sr = pygame.Rect(bx, by, 64, bh)
+        ui.button(sr, f"{self.game.speed}x", hovered=sr.collidepoint(mouse))
+        self.toolbar_buttons.append((sr, "speed"))
+        bx = sr.right + 14
+
+        pygame.draw.line(screen, c.BORDER_SUBTLE, (bx - 7, 8), (bx - 7, TOOLBAR_H - 8), 1)
+
+        # One toggle per window
+        for key, short, title, ww, hh in WINDOW_DEFS:
+            tw = ui.fonts.size("body_b", short)[0] + 26
+            rect = pygame.Rect(bx, by, tw, bh)
+            is_open = any(win.key == key for win in self.windows)
+            hovered = rect.collidepoint(mouse)
+            ui.button(rect, short, hovered=hovered, pressed=is_open)
+            self.toolbar_buttons.append((rect, ("win", key)))
+            bx += tw + 6
+
+    def _draw_windows(self, screen, w, h):
+        self._prune_truck_windows()
+        for win in self.windows:
+            self._clamp_window(win)
+            self._draw_window(screen, win)
+
+    def _draw_window(self, screen, win):
+        ui = self.ui
+        c = ui.c
+        r = win.rect
+        focused = self.windows and self.windows[-1] is win
+
+        # Drop shadow + body
+        shadow = pygame.Surface((r.w, r.h), pygame.SRCALPHA)
+        shadow.fill((0, 0, 0, 70))
+        screen.blit(shadow, (r.x + 4, r.y + 5))
+        pygame.draw.rect(screen, c.BG_PANEL, r, border_radius=8)
+        border_col = c.ACCENT_AMBER if focused else c.BORDER
+        pygame.draw.rect(screen, border_col, r, 2 if focused else 1, border_radius=8)
+
+        # Title bar
+        tb = win.titlebar_rect()
+        pygame.draw.rect(screen, c.BG_ACTIVE if focused else c.BG_CARD,
+                         tb, border_radius=8)
+        pygame.draw.rect(screen, c.BG_ACTIVE if focused else c.BG_CARD,
+                         pygame.Rect(tb.x, tb.y + tb.h - 10, tb.w, 10))
+        ui.text("body_b", win.title,
+                c.ACCENT_AMBER if focused else c.TEXT_SECONDARY,
+                tb.x + 14, tb.y + 9)
+
+        # Close box
+        cb = pygame.Rect(tb.right - 30, tb.y + 5, 24, 24)
+        mouse = pygame.mouse.get_pos()
+        ui.icon_button(cb, "X", hovered=cb.collidepoint(mouse))
+        win.close_rect = cb
+
+        # Content — point the shared widget lists at THIS window, then render.
+        win.widgets = []
+        win.cells = []
+        self.planner_widgets = win.widgets
+        self.planner_cells = win.cells
+        body = win.body_rect()
+        renderer = self._content_renderers.get(win.key)
+        if renderer:
+            renderer(screen, body.x, body.y, body.w, body.h)
+        elif win.key.startswith("truck_"):
+            self._truck_window_content(screen, body.x, body.y, body.w, body.h,
+                                       int(win.key.split("_", 1)[1]))
 
     def _draw_toast(self, screen, w, h):
         if not getattr(self.game, "toast", "") or self.game.toast_timer <= 0:
@@ -514,9 +805,65 @@ class UIManager:
         pygame.draw.rect(screen, ui.c.BORDER, pygame.Rect(bx, by, bw, bh), 1, border_radius=6)
         screen.blit(surf, (bx + pad, by + (bh - surf.get_height()) // 2))
 
+    def _draw_conditions_strip(self, screen, w, h):
+        """No-op. Weather and other variables have been relocated to the bottom-right of the screen."""
+        pass
+
+    def _draw_game_over(self, screen, w, h):
+        """Section 114 insolvency screen. The simulation is already frozen by
+        the main loop; this is the overlay explaining what happened and how to
+        start a fresh term (main.py handles the R / Esc keys)."""
+        eco = self.game.economy
+        if not eco.has_lost:
+            return
+        ui = self.ui
+        c = ui.c
+
+        t = min(1.0, getattr(eco, "game_over_timer", 0.0) / 1.2)
+        scrim = pygame.Surface((w, h), pygame.SRCALPHA)
+        scrim.fill((8, 6, 10, int(225 * t)))
+        screen.blit(scrim, (0, 0))
+
+        bw = min(620, w - 80)
+        bh = 300
+        bx = (w - bw) // 2
+        by = (h - bh) // 2
+        pygame.draw.rect(screen, (28, 20, 22), pygame.Rect(bx, by, bw, bh), border_radius=12)
+        pygame.draw.rect(screen, c.STATUS_BAD, pygame.Rect(bx, by, bw, bh), 2, border_radius=12)
+        pygame.draw.rect(screen, c.STATUS_BAD, pygame.Rect(bx, by, bw, 6), border_radius=12)
+
+        title = ui.fonts.render("display", "SECTION 114 NOTICE", c.STATUS_BAD)
+        screen.blit(title, title.get_rect(center=(w // 2, by + 44)))
+        sub = ui.fonts.render("h2", "The borough is bankrupt.", c.TEXT_PRIMARY)
+        screen.blit(sub, sub.get_rect(center=(w // 2, by + 78)))
+
+        reason = (getattr(eco, "lost_reason", "") or
+                  "The council can no longer meet its financial obligations.")
+        self._draw_wrapped_text(screen, reason, bx + 40, by + 104, bw - 80,
+                                ui.fonts.get("body"), c.TEXT_SECONDARY)
+
+        sy = by + 170
+        stats = [
+            ("DAYS IN OFFICE",      str(getattr(eco, "lost_day", eco.day))),
+            ("FINAL SATISFACTION",  f"{int(eco.satisfaction)}%"),
+            ("LIFETIME COMPLAINTS", f"{eco.complaints_total:,}"),
+            ("POPULATION SERVED",   f"{self.game.city.population:,}"),
+        ]
+        col_w = (bw - 80) // 2
+        for i, (label, val) in enumerate(stats):
+            lx = bx + 40 + (i % 2) * col_w
+            ly = sy + (i // 2) * 38
+            ui.label(label, lx, ly)
+            ui.text("h2", val, c.TEXT_PRIMARY, lx, ly + 12)
+
+        prompt = ui.fonts.render(
+            "body_b", "Press  R  to start a new term      ·      Esc  to quit",
+            c.ACCENT_AMBER)
+        screen.blit(prompt, prompt.get_rect(center=(w // 2, by + bh - 24)))
+
 
     def _draw_procurement_bar(self, screen, w):
-        """Show a notification bar at the top for pending vehicle orders."""
+        """Show a notification bar at the bottom for pending vehicle orders."""
         fleet = self.game.fleet
         if not fleet.orders:
             return
@@ -544,16 +891,8 @@ class UIManager:
         bh = 36
         bx = (w - bw) // 2
 
-        # If a critical event banner is visible (strike / breakdown), push the
-        # procurement bar below it so neither obscures the other.
-        active = eco.active_event
-        CRITICAL_EFFECTS = ("crewStrike", "truckBreakdown")
-        critical_showing = (
-            (self._event_visible and self._current_event and
-             self._current_event.get("effect") in CRITICAL_EFFECTS)
-            or (active and active.get("effect") in CRITICAL_EFFECTS)
-        )
-        by = 120 if critical_showing else 10
+        # Anchor to the very bottom of the window with a 10px margin
+        by = screen.get_height() - bh - 10
 
         # Background
         pygame.draw.rect(screen, (0, 0, 0, 80), pygame.Rect(bx + 2, by + 2, bw, bh), border_radius=6)
@@ -586,8 +925,6 @@ class UIManager:
         pygame.draw.rect(screen, c.BG_DEEP, pygame.Rect(0, 0, HUD_W, h))
         pygame.draw.line(screen, c.BORDER_SUBTLE, (HUD_W, 0), (HUD_W, h), 1)
         y = 16
-        #ui.text("display_sub", "Waste Borough", c.ACCENT_AMBER, x, y)
-        y += 32
         ui.text("h2", f"Day {eco.day}", c.TEXT_PRIMARY, x, y)
         ui.text("body", eco.get_day_of_week_name(), c.TEXT_MUTED, x + 80, y + 4)
         trend = eco.budget_trend
@@ -616,19 +953,19 @@ class UIManager:
         ui.text("body_s", eco.satisfaction_label(), c.TEXT_MUTED, right - 12, y + 26, align="right")
         ui.stat_bar(x + 12, y + 44, HUD_W - 52, eco.satisfaction, 100)
         y += 58
+        target = max(1, getattr(eco, "win_streak_target", 14))
         if not eco.has_won:
             ui.card(x, y, HUD_W - 28, 44, selected=False)
             ui.label("PERFECT SERVICE STREAK", x + 12, y + 6)
             streak = eco.perfect_days_streak
-            wp = eco.win_progress()
-            ui.text("body_b", f"{streak}/7", c.STATUS_GOOD, right - 12, y + 6, align="right")
-            ui.progress_bar(x + 12, y + 28, HUD_W - 52, 4, streak, 7, color=c.STATUS_GOOD, show_text=False)
+            ui.text("body_b", f"{streak}/{target}", c.STATUS_GOOD, right - 12, y + 6, align="right")
+            ui.progress_bar(x + 12, y + 28, HUD_W - 52, 4, streak, target, color=c.STATUS_GOOD, show_text=False)
             y += 52
         else:
             ui.card(x, y, HUD_W - 28, 44, selected=True)
             ui.label("STATUS", x + 12, y + 6)
             ui.text("h2", "CHAMPION", c.ACCENT_AMBER, right - 12, y + 6, align="right")
-            ui.progress_bar(x + 12, y + 28, HUD_W - 52, 4, 7, 7, color=c.ACCENT_AMBER, show_text=False)
+            ui.progress_bar(x + 12, y + 28, HUD_W - 52, 4, 1, 1, color=c.ACCENT_AMBER, show_text=False)
             y += 52
         ui.card(x, y, HUD_W - 28, 100)
         stats = [
@@ -649,12 +986,20 @@ class UIManager:
             ui.text("body_s", txt, c.ACCENT_AMBER, x + 12, y + 8)
             y += 40
         y += 6
-        ui.section_header(x, y, "CONTROLS", w=HUD_W - 28)
-        y += 24
-        for btn in self.buttons:
-            btn["rect"].y = y + btn["row_offset"]
-            self._draw_button(screen, btn, ui)
-        y = self.buttons[-1]["rect"].bottom + 16
+        # ── Startup loan status ──────────────────────────────────────────────
+        if not eco.loan_cleared():
+            ui.card(x, y, HUD_W - 28, 50)
+            ui.label("STARTUP LOAN", x + 12, y + 6)
+            bal = eco.loan_balance()
+            ui.text("body_b", f"£{int(bal):,}", c.ACCENT_CORAL, right - 12, y + 4, align="right")
+            ui.text("caption", f"-£{int(eco.loan_daily_payment())}/day", c.TEXT_DIM, x + 12, y + 24)
+            ui.progress_bar(x + 110, y + 30, HUD_W - 150, 5, int(eco.loan_progress() * 100), 100,
+                            color=c.ACCENT_CORAL, show_text=False)
+            y += 58
+        else:
+            ui.card(x, y, HUD_W - 28, 32, selected=True)
+            ui.text("body_s", "Startup loan cleared", c.STATUS_GOOD, x + 12, y + 8)
+            y += 40
         ui.section_header(x, y, "COLLECTIONS", w=HUD_W - 28)
         y += 24
         due = fleet.get_total_full_bins()
@@ -758,13 +1103,14 @@ class UIManager:
         pygame.draw.rect(screen, ui.c.ACCENT_AMBER, pygame.Rect(bx, by, bw, bh), 2, border_radius=10)
         title = ui.fonts.render("display", "BOROUGH CHAMPION", ui.c.ACCENT_AMBER)
         screen.blit(title, title.get_rect(center=(w // 2, by + 40)))
-        sub = ui.fonts.render("h2", f"7 consecutive days with zero complaints! Day {eco.win_day}.", ui.c.TEXT_PRIMARY)
+        sub = ui.fonts.render("h2", f"{eco.win_streak_target} consecutive days at full service! Day {eco.win_day}.", ui.c.TEXT_PRIMARY)
         screen.blit(sub, sub.get_rect(center=(w // 2, by + 75)))
         hint = ui.fonts.render("body_s", "Keep it up to maintain your perfect record!", ui.c.TEXT_MUTED)
         screen.blit(hint, hint.get_rect(center=(w // 2, by + 100)))
 
     def _draw_inspect_panel(self, screen, w, h):
-        if not self.game.selected_tile or self.game.planner_open:
+        if not self.game.selected_tile:
+            self._draw_bottom_right_conditions(screen, w, h)
             return
         ui = self.ui
         c = ui.c
@@ -834,61 +1180,67 @@ class UIManager:
             ui.label("Residents", rx, row)
             ui.value(str(tile.population), rr, row, c.TEXT_SECONDARY, align="right")
             row += lh
-        ui.text("body_xs", "Open planner (Tab) to reschedule.", c.TEXT_DIM, rx, py + ph - 24)
+        ui.text("body_xs", "Open the Rounds window to reschedule.", c.TEXT_DIM, rx, py + ph - 24)
 
-    def _draw_planner(self, screen, w, h):
+    def _draw_bottom_right_conditions(self, screen, w, h):
+        """Alternative readout placed in the bottom-right context when no tile 
+        is actively inspected."""
         ui = self.ui
         c = ui.c
-        scrim = pygame.Surface((w, h), pygame.SRCALPHA)
-        scrim.fill((14, 16, 22, 240))
-        screen.blit(scrim, (0, 0))
-        self.planner_widgets = []
-        self.planner_cells = []
-        tab = getattr(self.game, "planner_tab", "rounds")
-        pw, ph = 800, 580
-        px = (w - pw) // 2
-        py = (h - ph) // 2
-        pygame.draw.rect(screen, (0, 0, 0, 100), pygame.Rect(px + 4, py + 4, pw, ph), border_radius=10)
-        ui.card(px, py, pw, ph, selected=False)
-        ui.text("h1", "Borough Management", c.TEXT_PRIMARY, px + 24, py + 16)
-        self._planner_close = pygame.Rect(px + pw - 44, py + 14, 32, 32)
-        ui.icon_button(self._planner_close, "X", hovered=False)
-        tab_y = py + 56
-        tab_x = px + 24
-        for key, label in PLANNER_TABS:
-            tw = ui.fonts.size("body_b", label)[0] + 32
-            rect = pygame.Rect(tab_x, tab_y, tw, 32)
-            active = (key == tab)
-            if active:
-                pygame.draw.rect(screen, c.BG_ACTIVE, rect, border_radius=6)
-                pygame.draw.rect(screen, c.ACCENT_AMBER, rect, 2, border_radius=6)
-                ui.text("body_b", label, c.ACCENT_AMBER, rect.centerx, tab_y + 8, align="center")
-                pygame.draw.rect(screen, c.ACCENT_AMBER, pygame.Rect(rect.x, rect.bottom - 3, rect.w, 3), border_radius=2)
-            else:
-                mouse = pygame.mouse.get_pos()
-                hover = rect.collidepoint(mouse)
-                bg = c.BG_HOVER if hover else c.BG_CARD
-                pygame.draw.rect(screen, bg, rect, border_radius=6)
-                pygame.draw.rect(screen, c.BORDER_SUBTLE, rect, 1, border_radius=6)
-                ui.text("body_b", label, c.TEXT_MUTED if not hover else c.TEXT_SECONDARY, rect.centerx, tab_y + 8, align="center")
-            self.planner_widgets.append((rect, (lambda k=key: self.game.open_planner_tab(k))))
-            tab_x += tw + 8
-        bx = px + 24
-        by = tab_y + 44
-        bw = pw - 48
-        bh = (py + ph - 20) - by
-        if tab == "rounds":
-            self._tab_rounds(screen, bx, by, bw, bh)
-        elif tab == "waste":
-            self._tab_waste(screen, bx, by, bw, bh)
-        elif tab == "fleet":
-            self._tab_fleet(screen, bx, by, bw, bh)
-        elif tab == "staff":
-            self._tab_staff(screen, bx, by, bw, bh)
-        elif tab == "finance":
-            self._tab_finance(screen, bx, by, bw, bh)
-        elif tab == "data":
-            self._tab_data(screen, bx, by, bw, bh)
+        eco = self.game.economy
+
+        weather_map = {
+            "dry":      ("Dry",      c.TEXT_SECONDARY),
+            "rain":     ("Rain",     c.ACCENT_TEAL),
+            "snow":     ("Snow",     (200, 220, 255)),
+            "overcast": ("Overcast", c.TEXT_DIM),
+        }
+        wlabel, wcol = weather_map.get(eco.weather, ("Dry", c.TEXT_SECONDARY))
+
+        tr = getattr(eco, "fuel_index_trend", 0.0)
+        arrow = "+" if tr > 0.002 else "-" if tr < -0.002 else "="
+        idx = getattr(eco, "fuel_index", 1.0)
+        dcol = (c.STATUS_BAD if idx >= 1.15 else
+                c.STATUS_GOOD if idx <= 0.92 else c.TEXT_SECONDARY)
+
+        morale = eco.worker_morale
+        mcol = (c.STATUS_GOOD if morale >= 65 else
+                c.STATUS_WARN if morale >= 40 else c.STATUS_BAD)
+
+        segs = [
+            ("WEATHER", wlabel, wcol),
+            ("SEASON",  eco.season_name(), c.ACCENT_SAGE),
+            ("DIESEL",  f"£{eco.fuel_price():.2f}/L {arrow}", dcol),
+            ("MORALE",  f"{int(morale)}%", mcol),
+        ]
+
+        pad, gap = 12, 18
+        seg_surfs = []
+        total_w = pad
+        for label, val, col in segs:
+            lsurf = ui.fonts.render("caption", label, c.TEXT_DIM)
+            vsurf = ui.fonts.render("body_b", val, col)
+            sw = max(lsurf.get_width(), vsurf.get_width())
+            seg_surfs.append((lsurf, vsurf, sw))
+            total_w += sw + gap
+        total_w += pad - gap
+
+        bh = 46
+        bx = w - total_w - 20
+        by = h - bh - 20
+        pygame.draw.rect(screen, (0, 0, 0, 70), pygame.Rect(bx + 2, by + 2, total_w, bh), border_radius=8)
+        pygame.draw.rect(screen, c.BG_CARD, pygame.Rect(bx, by, total_w, bh), border_radius=8)
+        pygame.draw.rect(screen, c.BORDER, pygame.Rect(bx, by, total_w, bh), 1, border_radius=8)
+
+        cxp = bx + pad
+        for i, (lsurf, vsurf, sw) in enumerate(seg_surfs):
+            screen.blit(lsurf, (cxp, by + 8))
+            screen.blit(vsurf, (cxp, by + 22))
+            cxp += sw + gap
+            if i < len(seg_surfs) - 1:
+                dxp = cxp - gap // 2
+                pygame.draw.line(screen, c.BORDER_SUBTLE,
+                                 (dxp, by + 8), (dxp, by + bh - 8), 1)
 
     def _pbtn(self, screen, rect, label, fn, enabled=True, fkey="body_b", fill=None, accent=False):
         ui = self.ui
@@ -1387,6 +1739,17 @@ class UIManager:
             # Model name (muted, below nickname)
             ui.text("caption", vb["name"], c.TEXT_DIM, col2_x + 34, card_top + 26)
 
+            # Condition / age readout (right side, under the daily cost)
+            truck_for_cond = fleet.get_truck(vb["id"])
+            if truck_for_cond is not None:
+                cpct = fleet.condition_pct(truck_for_cond)
+                clabel = fleet.condition_label(truck_for_cond)
+                ccol = (c.STATUS_GOOD if cpct >= 60 else
+                        c.STATUS_WARN if cpct >= 35 else c.STATUS_BAD)
+                yrs = truck_for_cond.get("age_days", 0) / 112.0
+                ui.text("caption", f"{clabel} · {yrs:.1f}y",
+                        ccol, col2_x + list_w - 10, card_top + 26, align="right")
+
             # Daily cost (top-right)
             ui.text("mono_b", f"£{vb['daily']:.0f}/day",
                     c.TEXT_PRIMARY, col2_x + list_w - 10, card_top + 8,
@@ -1521,9 +1884,65 @@ class UIManager:
                            (lambda: self._adjust_tax(-0.10)), (lambda: self._adjust_tax(0.10)), label_w=240)
         ui.text("caption", "Higher tax raises revenue but dents satisfaction.", c.TEXT_DIM, lx, ty2)
         ty = ty2 + 14
-        self._stepper(screen, lx, ty, "Business rates (£/commercial/day)", f"£{eco.business_rates:.2f}",
+        ty = self._stepper(screen, lx, ty, "Business rates (£/commercial/day)", f"£{eco.business_rates:.2f}",
                       (lambda: self._adjust_business_rates(-0.10)), (lambda: self._adjust_business_rates(0.10)),
                       label_w=240)
+        # ── Diesel market readout ────────────────────────────────────────────
+        ty += 12
+        ui.section_header(lx, ty, "DIESEL MARKET", 300)
+        ty += 22
+        idx = getattr(eco, "fuel_index", 1.0)
+        tr = getattr(eco, "fuel_index_trend", 0.0)
+        arrow = "rising" if tr > 0.002 else "falling" if tr < -0.002 else "steady"
+        dcol = (c.STATUS_BAD if idx >= 1.15 else
+                c.STATUS_GOOD if idx <= 0.92 else c.TEXT_SECONDARY)
+        ui.label("Pump price (£/litre)", lx, ty)
+        ui.text("mono_b", f"£{eco.fuel_price():.2f}", dcol, lx + 320, ty, align="right")
+        ty += 20
+        ui.label("Market", lx, ty)
+        ui.text("body_s", f"{eco.fuel_index_label()} — {arrow}", dcol, lx + 320, ty, align="right")
+        ty += 20
+        ui.text("caption",
+                "Diesel RCV running costs track this. Electric eRCVs are immune.",
+                c.TEXT_DIM, lx, ty)
+        ty += 26
+
+        # ── Debt & statutory obligations ─────────────────────────────────────
+        ui.section_header(lx, ty, "DEBT & STATUTORY", 300)
+        ty += 22
+        if not eco.loan_cleared():
+            ui.label("Startup loan outstanding", lx, ty)
+            ui.text("mono_b", f"£{int(eco.loan_balance()):,}", c.ACCENT_CORAL,
+                    lx + 320, ty, align="right")
+            ty += 20
+            ui.label("Daily repayment", lx, ty)
+            ui.text("mono", f"£{eco.loan_daily_payment():.0f}/day", c.TEXT_SECONDARY,
+                    lx + 320, ty, align="right")
+            ty += 20
+        else:
+            ui.label("Startup loan", lx, ty)
+            ui.text("body_s", "Cleared", c.STATUS_GOOD, lx + 320, ty, align="right")
+            ty += 20
+
+        ui.label("Landfill tax escalator", lx, ty)
+        lt = eco.landfill_tax_pct_increase()
+        ui.text("mono", f"+{lt:.0f}% vs yr 1", c.STATUS_WARN if lt > 0 else c.TEXT_DIM,
+                lx + 320, ty, align="right")
+        ty += 20
+
+        div = eco.current_diversion_pct()
+        tgt = eco.diversion_target * 100.0
+        ui.label("Recycling diversion (yr)", lx, ty)
+        if div is None:
+            ui.text("body_s", "no data yet", c.TEXT_DIM, lx + 320, ty, align="right")
+        else:
+            dcol2 = c.STATUS_GOOD if div >= tgt else c.STATUS_BAD
+            ui.text("mono", f"{div:.0f}% / {tgt:.0f}%", dcol2, lx + 320, ty, align="right")
+        ty += 18
+        ui.text("caption",
+                f"Miss the {tgt:.0f}% statutory target at year-end for a DEFRA fine.",
+                c.TEXT_DIM, lx, ty)
+
         gx = x + 360
         gw = w - 360
         ui.text("h3", "Net trend (14 days)", c.TEXT_PRIMARY, gx, y + 26)
@@ -1587,6 +2006,115 @@ class UIManager:
                 ui.text("caption", "Lower day length = faster game pace.",
                         c.TEXT_DIM, gx, cfg_y)
 
+    # ── Financial charts ──────────────────────────────────────────────────
+    def _tab_charts(self, screen, x, y, w, h):
+        ui = self.ui
+        c = ui.c
+        eco = self.game.economy
+
+        ui.text("body_s", "Trend of the council's daily finances over time.",
+                c.TEXT_MUTED, x, y)
+        ty = y + 24
+
+        ui.section_header(x, ty, "BUDGET TREND", w)
+        ty += 22
+        hist = list(eco.budget_history)
+        if not hist or hist[-1] != eco.budget:
+            hist = hist + [eco.budget]
+        chart_h = 160
+        self._line_chart(screen, x, ty, w, chart_h, hist, c.ACCENT_TEAL, prefix="£")
+        ty += chart_h + 22
+
+        ui.section_header(x, ty, "INCOME / EXPENDITURE — YESTERDAY", w)
+        ty += 22
+        snap = eco.ledger_snapshot()
+        rows = [(label, snap.get(key, 0.0), key in eco.REVENUE_KEYS)
+                for key, label in eco.LEDGER_LABELS
+                if abs(snap.get(key, 0.0)) > 0.5]
+        rows.sort(key=lambda r: -abs(r[1]))
+        max_rows = max(1, (y + h - ty - 56) // 20)
+        ty = self._finance_breakdown(screen, x, ty, w, rows[:max_rows])
+        if len(rows) > max_rows:
+            ui.text("caption", f"+{len(rows) - max_rows} smaller line item(s) not shown",
+                    c.TEXT_DIM, x, ty)
+            ty += 18
+
+        ui.h_line(x, ty + 4, w)
+        ty += 16
+        net = snap.get("net", 0.0)
+        ui.text("body_b", "Net / day", c.TEXT_PRIMARY, x, ty)
+        net_color = c.STATUS_GOOD if net >= 0 else c.STATUS_BAD
+        ui.text("mono_b", f"{'+' if net >= 0 else ''}£{abs(net):,.0f}",
+                net_color, x + w, ty, align="right")
+
+    def _line_chart(self, screen, x, y, w, h, values, color, prefix=""):
+        """A small axis + gridline line graph for a series of daily values."""
+        ui = self.ui
+        c = ui.c
+        ui.inset_panel(x, y, w, h)
+        pad = 10
+        plot = pygame.Rect(x + pad, y + pad, w - 2 * pad, h - 2 * pad - 16)
+
+        if len(values) < 2:
+            ui.text("body_s", "Need a few more days of data…", c.TEXT_DIM,
+                    plot.centerx, plot.centery, align="center")
+            return
+
+        lo, hi = min(values), max(values)
+        if hi == lo:
+            hi = lo + 1.0
+        span = hi - lo
+
+        for i in range(5):
+            gy = plot.y + plot.h * i // 4
+            pygame.draw.line(screen, c.BORDER_SUBTLE, (plot.x, gy), (plot.right, gy), 1)
+            v = hi - span * i / 4.0
+            ui.text("caption", f"{prefix}{v:,.0f}", c.TEXT_DIM, plot.x + 2, gy - 12)
+
+        if lo < 0 < hi:
+            zy = plot.y + plot.h - (0 - lo) / span * plot.h
+            pygame.draw.line(screen, c.TEXT_DIM, (plot.x, zy), (plot.right, zy), 1)
+
+        n = len(values)
+        step = plot.w / max(1, n - 1)
+        pts = [(plot.x + i * step,
+                plot.y + plot.h - (v - lo) / span * plot.h) for i, v in enumerate(values)]
+        pygame.draw.lines(screen, color, False, pts, 2)
+        for px, py in pts:
+            pygame.draw.circle(screen, color, (int(px), int(py)), 3)
+
+        ui.text("mono_b", f"{prefix}{values[-1]:,.0f}", color,
+                plot.right, plot.y - 2, align="right")
+
+        eco = self.game.economy
+        first_day = max(1, eco.day - len(values))
+        ui.text("caption", f"Day {first_day}", c.TEXT_DIM, plot.x, plot.bottom + 2)
+        ui.text("caption", f"Day {eco.day}", c.TEXT_DIM, plot.right, plot.bottom + 2, align="right")
+
+    def _finance_breakdown(self, screen, x, y, w, rows):
+        """rows: [(label, value, is_revenue), ...]. Draws a horizontal-bar
+        breakdown and returns the y position after the last row."""
+        ui = self.ui
+        c = ui.c
+        if not rows:
+            ui.text("body_s", "No transactions recorded yet.", c.TEXT_DIM, x, y)
+            return y + 20
+        peak = max(abs(v) for _, v, _ in rows) or 1.0
+        bar_x = x + 200
+        bar_w = max(20, w - 200 - 90)
+        ty = y
+        for label, val, is_rev in rows:
+            ui.text("body_s", label, c.TEXT_SECONDARY, x, ty + 2)
+            bw = int(bar_w * min(1.0, abs(val) / peak))
+            color = c.STATUS_GOOD if is_rev else c.STATUS_BAD
+            pygame.draw.rect(screen, c.BG_DEEP, (bar_x, ty, bar_w, 14), border_radius=4)
+            if bw > 0:
+                pygame.draw.rect(screen, color, (bar_x, ty, bw, 14), border_radius=4)
+            sign = "+" if is_rev else "-"
+            ui.text("mono", f"{sign}£{abs(val):,.0f}", color, x + w, ty, align="right")
+            ty += 20
+        return ty
+
     def _tab_data(self, screen, x, y, w, h):
         ui = self.ui
         c = ui.c 
@@ -1616,6 +2144,170 @@ class UIManager:
             color = c.TEXT_MUTED if ln.strip() else c.TEXT_DIM
             ui.text("body_s", ln, color, x, ty)
             ty += 20
+
+    # ── Per-vehicle inspect window (click a lorry on the map) ──────────────
+    def _truck_window_content(self, screen, x, y, w, h, truck_id):
+        ui = self.ui
+        c = ui.c
+        game = self.game
+        fleet = game.fleet
+        truck = fleet.get_truck(truck_id)
+        if truck is None:
+            ui.text("body_s", "This vehicle has been scrapped.", c.TEXT_DIM, x, y)
+            return
+
+        clip = pygame.Rect(x - 4, y - 4, w + 8, h + 8)
+        old_clip = screen.get_clip()
+        screen.set_clip(clip)
+
+        # ── Vehicle preview ───────────────────────────────────────────────
+        prev_r = pygame.Rect(x, y, w, 84)
+        ui.inset_panel(prev_r.x, prev_r.y, prev_r.w, prev_r.h)
+        screen.set_clip(prev_r)
+        game.renderer.draw_truck(prev_r.centerx, prev_r.centery + 12, truck, 2.3)
+        screen.set_clip(clip)
+        ty = prev_r.bottom + 10
+
+        # ── Nickname (editable) + model ─────────────────────────────────────
+        is_renaming = (self._renaming_truck_id == truck_id)
+        nickname = truck.get("nickname", f"L{truck['id']}")
+        if is_renaming:
+            inp_r = pygame.Rect(x, ty, w - 88, 26)
+            ui.inset_panel(inp_r.x, inp_r.y, inp_r.w, inp_r.h)
+            ui.text("mono_b", self._rename_buffer + "|", c.ACCENT_AMBER,
+                    inp_r.x + 8, inp_r.y + 5)
+            ok_r = pygame.Rect(x + w - 84, ty, 40, 26)
+            cancel_r = pygame.Rect(x + w - 40, ty, 40, 26)
+            self._pbtn(screen, ok_r, "OK", self._commit_rename, fkey="body_s", accent=True)
+            self._pbtn(screen, cancel_r, "X", self._cancel_rename, fkey="body_s")
+        else:
+            ui.text("h3", nickname, c.TEXT_PRIMARY, x, ty)
+            rename_r = pygame.Rect(x + w - 84, ty - 2, 84, 24)
+            self._pbtn(screen, rename_r, "Rename",
+                      lambda tid=truck_id, nn=nickname: self._start_rename(tid, nn),
+                      fkey="body_s")
+        ty += 26
+        ui.text("body_s", truck.get("model_name", "?"), c.TEXT_MUTED, x, ty)
+        ty += 22
+
+        # ── Status pill + ownership ─────────────────────────────────────────
+        broken = truck.get("broken", False)
+        state = truck.get("state", "depot")
+        if broken:
+            status_text = f"Repair bay — {truck.get('repair_days', 0)}d left"
+            status_type = "bad"
+        else:
+            status_labels = {
+                "depot":     "At depot",
+                "to_stop":   "En route to round",
+                "servicing": "Collecting bins",
+                "to_depot":  "Returning to depot",
+            }
+            status_text = status_labels.get(state, state.replace("_", " ").title())
+            status_type = "good" if state in ("to_stop", "servicing") else "neutral"
+        ui.status_pill(x, ty, status_text, status_type)
+        own_lbl = ("Leased" if truck.get("leased") else
+                   "Rental" if truck.get("tier_id") == "rental" else "Owned")
+        ui.text("caption", own_lbl, c.TEXT_DIM, x + w, ty + 3, align="right")
+        ty += 28
+        ui.h_line(x, ty, w)
+        ty += 12
+
+        # ── Current job ───────────────────────────────────────────────────
+        ui.section_header(x, ty, "CURRENT JOB", w)
+        ty += 20
+        area_id = truck.get("area_id", -1)
+        pref = truck.get("preferred_area", -1)
+        if area_id >= 0:
+            area_obj = game.city.get_area(area_id)
+            route_name = area_obj.name if area_obj else f"Round {area_id}"
+        else:
+            route_name = "Unassigned"
+        ui.label("Route / round", x, ty)
+        ui.text("body_b", route_name, c.ACCENT_TEAL, x + w, ty, align="right")
+        ty += 20
+        ui.label("Assignment", x, ty)
+        pin_lbl = "Auto-assigned" if pref < 0 else "Pinned"
+        pin_r = pygame.Rect(x + w - 110, ty - 3, 110, 22)
+        self._pbtn(screen, pin_r, pin_lbl,
+                  lambda tid=truck_id: self._cycle_truck_area(tid),
+                  fkey="caption", accent=(pref >= 0))
+        ty += 24
+        queued = len(truck.get("bin_queue", [])) + len(truck.get("service_bins", []))
+        ui.label("Bins on this stop", x, ty)
+        ui.text("mono", str(queued), c.TEXT_SECONDARY, x + w, ty, align="right")
+        ty += 24
+
+        # ── Crew complement ───────────────────────────────────────────────
+        ui.section_header(x, ty, "CREW COMPLEMENT", w)
+        ty += 20
+        crew = truck.get("crew", 0)
+        crew_cap = truck.get("crew_cap", 0)
+        out = len(truck.get("out_workers", []))
+        onboard = max(0, crew - out)
+        ui.label("Assigned / capacity", x, ty)
+        ui.text("mono", f"{crew} / {crew_cap}", c.TEXT_SECONDARY, x + w, ty, align="right")
+        ty += 18
+        ui.label("On board / out collecting", x, ty)
+        ui.text("mono", f"{onboard} / {out}", c.TEXT_SECONDARY, x + w, ty, align="right")
+        ty += 22
+        minus_r = pygame.Rect(x, ty, 32, 26)
+        val_r = pygame.Rect(x + 38, ty, 36, 26)
+        plus_r = pygame.Rect(x + 80, ty, 32, 26)
+        idle = fleet.workers - sum(t.get("crew", 0) for t in fleet.trucks)
+        ui.icon_button(minus_r, "-", enabled=crew > 0)
+        ui.inset_panel(val_r.x, val_r.y, val_r.w, val_r.h)
+        ui.text("mono_b", str(crew), c.TEXT_PRIMARY, val_r.centerx, val_r.y + 5, align="center")
+        ui.icon_button(plus_r, "+", enabled=(crew < crew_cap and idle > 0))
+        self.planner_widgets.append((minus_r, lambda tid=truck_id: self._adjust_truck_crew(tid, -1)))
+        self.planner_widgets.append((plus_r, lambda tid=truck_id: self._adjust_truck_crew(tid, +1)))
+        ty += 34
+
+        # ── Load ─────────────────────────────────────────────────────────
+        ui.section_header(x, ty, "LOAD", w)
+        ty += 20
+        load = truck.get("load", 0.0)
+        cap = truck.get("capacity", 1.0) or 1.0
+        bar_w = w - 52
+        ui.progress_bar(x, ty, bar_w, 14, load, cap, show_text=False)
+        pct = load / cap * 100.0
+        ui.text("mono", f"{pct:.0f}%", c.TEXT_SECONDARY, x + w, ty - 1, align="right")
+        ty += 18
+        ui.text("caption", f"{load:,.0f} / {cap:,.0f} fill units", c.TEXT_DIM, x, ty)
+        ty += 24
+
+        # ── Shift & condition ──────────────────────────────────────────────
+        ui.section_header(x, ty, "SHIFT & CONDITION", w)
+        ty += 20
+        ui.label("Working hours", x, ty)
+        ui.text("body_s", "06:00 – 14:00 (8h shift)", c.TEXT_SECONDARY, x + w, ty, align="right")
+        ty += 18
+        cpct = fleet.condition_pct(truck)
+        clabel = fleet.condition_label(truck)
+        ccol = (c.STATUS_GOOD if cpct >= 60 else
+                c.STATUS_WARN if cpct >= 35 else c.STATUS_BAD)
+        ui.label("Condition", x, ty)
+        ui.text("body_b", f"{clabel} ({cpct:.0f}%)", ccol, x + w, ty, align="right")
+        ty += 18
+        yrs = truck.get("age_days", 0) / 112.0
+        ui.label("Age in service", x, ty)
+        ui.text("mono", f"{yrs:.1f} yrs", c.TEXT_SECONDARY, x + w, ty, align="right")
+        ty += 18
+        daily_cost = (truck.get("lease_weekly", 0) / 7.0 if truck.get("leased")
+                      else truck.get("running_cost", 0))
+        ui.label("Daily cost", x, ty)
+        ui.text("mono_b", f"£{daily_cost:.0f}/day", c.TEXT_PRIMARY, x + w, ty, align="right")
+        ty += 30
+
+        # ── Actions ──────────────────────────────────────────────────────
+        center_r = pygame.Rect(x, ty, w // 2 - 6, 30)
+        scrap_r = pygame.Rect(x + w // 2 + 6, ty, w // 2 - 6, 30)
+        self._pbtn(screen, center_r, "Centre view",
+                  lambda tid=truck_id: self._center_on_truck(tid), accent=True)
+        self._pbtn(screen, scrap_r, "Scrap vehicle",
+                  lambda tid=truck_id: self._scrap_truck(tid))
+
+        screen.set_clip(old_clip)
 
     def _cycle_round_freq(self, area_id):
         self.game.city.cycle_area_frequency(area_id)

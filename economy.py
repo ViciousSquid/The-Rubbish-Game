@@ -8,6 +8,24 @@ MORALE_NLW       = 11.44   # National Living Wage floor — workers are very unh
 MORALE_FAIR_WAGE = 18.00   # Above this, morale is fully satisfied (100 %)
 MORALE_DEFAULT   = 16.50   # Starting wage → starting morale ≈ 77 %
 
+# ── Diesel fuel market ───────────────────────────────────────────────────────
+# Running costs for diesel RCVs track a volatile pump price. The index is a
+# bounded random walk around 1.0 (≈ £1.50/L baseline at index 1.0), so a bad
+# spell at the pumps quietly erodes the budget — and makes the electric eRCV's
+# low running cost genuinely pay off when prices spike.
+FUEL_INDEX_MIN  = 0.78
+FUEL_INDEX_MAX  = 1.55
+FUEL_BASE_PRICE = 1.50     # £/litre forecourt diesel at index 1.0 (UK 2025/26)
+
+# ── Seasonal waste cycle ─────────────────────────────────────────────────────
+# A compressed council year of four seasons, SEASON_LENGTH in-game days each.
+# Garden and food waste swell through summer and peak in autumn (leaf fall);
+# a mild festive bump lands in winter. The multiplier feeds the kerbside fill
+# rate so a full collection plan has to flex with the calendar.
+SEASON_LENGTH    = 28
+SEASON_NAMES     = ["Spring", "Summer", "Autumn", "Winter"]
+SEASON_FILL_MULT = {"Spring": 1.00, "Summer": 1.12, "Autumn": 1.18, "Winter": 1.06}
+
 # One in-game "day" is `day_duration` seconds of accumulated dt. Daily figures
 # below are quoted per in-game day and metered out each frame by the fraction of
 # a day that elapsed, so the live ledger always sums to the per-day totals.
@@ -21,12 +39,99 @@ HOURS_PER_DAY = 8.0          # paid hours per crew member per day
 OVERDRAFT_FLOOR       = -150000   # absolute hard floor; reaching it = instant bust
 INSOLVENCY_GRACE_DAYS = 5         # consecutive days at/below £0 before a Section 114
 
+# ── Council calendar ─────────────────────────────────────────────────────────
+# A council "year" is the four-season cycle (SEASON_LENGTH * 4 days). Several
+# yearly systems hang off this: the landfill-tax escalator and the statutory
+# recycling-diversion review.
+COUNCIL_YEAR_DAYS = SEASON_LENGTH * 4     # 112 in-game days
+
+# ── Starting position & startup loan ─────────────────────────────────────────
+# The borough no longer starts with a free fleet. The four starter RCVs are
+# financed by a startup loan that must be repaid daily, with interest, over six
+# council years. Early game is therefore a balancing act: loan repayment plus
+# fixed overheads and maintenance against the revenue from good service.
+STARTING_CASH            = 220000
+STARTUP_LOAN_PRINCIPAL   = 620000         # ~4 financed 26t RCVs
+STARTUP_LOAN_ANNUAL_RATE = 0.075          # 7.5% APR
+STARTUP_LOAN_TERM_DAYS   = COUNCIL_YEAR_DAYS * 6
+
+# ── Recurring fixed overheads ────────────────────────────────────────────────
+DEPOT_RENT_DAILY     = 220.0              # depot site rent (~£80k/yr)
+INSURANCE_BASE_DAILY = 55.0               # base liability cover
+INSURANCE_PER_VEH    = 22.0               # added per vehicle on the fleet
+# UK landfill tax rises every year. The residual gate fee escalates by this
+# fraction each council year.
+LANDFILL_TAX_ANNUAL_RISE = 0.06
+
+# ── Win bar (tightened) ──────────────────────────────────────────────────────
+# A flawless streak alone is no longer enough: satisfaction must hold above a
+# floor for a perfect day to count, and the streak target is longer.
+WIN_STREAK_DEFAULT = 14
+WIN_SAT_FLOOR      = 75.0
+
+# ── Statutory recycling diversion ────────────────────────────────────────────
+# Each council year, diversion (recycling+food+garden as a share of all waste)
+# is reviewed. Missing the statutory target levies a DEFRA fine scaled to the
+# shortfall — strong pressure to run the recycling/food/garden streams.
+STATUTORY_DIVERSION_TARGET = 0.50         # 50% diverted from landfill
+DIVERSION_FINE_PER_PCT     = 2600         # £ per percentage point short
+DIVERSION_FINE_CAP         = 150000
+
+
+class StartupLoan:
+    """A fixed-term amortising loan financing the starter fleet. A constant
+    daily payment is charged; interest accrues daily on the outstanding
+    balance, and the remainder pays down principal until the loan clears."""
+
+    def __init__(self, principal, annual_rate, term_days):
+        self.principal   = float(principal)
+        self.balance     = float(principal)
+        self.annual_rate = annual_rate
+        self.daily_rate  = annual_rate / 365.0
+        self.term_days   = term_days
+        self.cleared     = principal <= 0
+        self.total_paid  = 0.0
+        r, n = self.daily_rate, term_days
+        if r <= 0 or n <= 0:
+            self.daily_payment = principal / max(1, n)
+        else:
+            self.daily_payment = principal * r / (1.0 - (1.0 + r) ** (-n))
+
+    def current_payment(self):
+        """The cash leaving the budget today (smaller on the final payment)."""
+        if self.cleared or self.balance <= 0:
+            return 0.0
+        interest = self.balance * self.daily_rate
+        return min(self.daily_payment, self.balance + interest)
+
+    def accrue_day(self):
+        """Apply one day of interest and principal reduction. Returns True on
+        the day the loan is finally cleared."""
+        if self.cleared:
+            return False
+        interest = self.balance * self.daily_rate
+        pay = min(self.daily_payment, self.balance + interest)
+        self.balance = max(0.0, self.balance + interest - pay)
+        self.total_paid += pay
+        if self.balance <= 0.005:
+            self.balance = 0.0
+            self.cleared = True
+            return True
+        return False
+
+    def progress(self):
+        if self.principal <= 0:
+            return 1.0
+        return max(0.0, min(1.0, 1.0 - self.balance / self.principal))
+
 
 class Economy:
     # ----- profit & loss ledger schema ------------------------------------
     REVENUE_KEYS = {"council_tax", "business_rates", "recycling_credit",
                     "garden_charges", "grants"}
-    EXPENSE_KEYS = {"wages", "oncosts", "vehicles", "gate_fees", "rental_costs"}
+    EXPENSE_KEYS = {"wages", "oncosts", "vehicles", "gate_fees", "rental_costs",
+                    "loan_repayment", "depot_rent", "insurance", "repairs",
+                    "diversion_fines"}
     LEDGER_LABELS = [
         ("council_tax",      "Council tax receipts"),
         ("business_rates",   "Business rates"),
@@ -37,15 +142,30 @@ class Economy:
         ("oncosts",          "Staff on-costs (NI / pension / PPE)"),
         ("vehicles",         "Vehicle running / lease"),
         ("rental_costs",     "Emergency vehicle rentals"),
+        ("repairs",          "Vehicle repairs"),
         ("gate_fees",        "Disposal gate fees"),
+        ("loan_repayment",   "Startup loan repayment"),
+        ("depot_rent",       "Depot rent"),
+        ("insurance",        "Fleet & liability insurance"),
+        ("diversion_fines",  "Recycling diversion fines"),
     ]
 
     def __init__(self):
-        self.budget = 500000
+        self.budget = STARTING_CASH
         self.council_tax_rate = 0.45
         self.business_rates = 2.20
         self.hourly_wage_rate = 16.50
         self.truck_maintenance = 45.00
+
+        # ── Startup loan financing the initial fleet ─────────────────────────
+        self.loan = StartupLoan(STARTUP_LOAN_PRINCIPAL,
+                                STARTUP_LOAN_ANNUAL_RATE,
+                                STARTUP_LOAN_TERM_DAYS)
+
+        # ── Recurring fixed overheads ────────────────────────────────────────
+        self.depot_rent_daily = DEPOT_RENT_DAILY
+        self.insurance_base   = INSURANCE_BASE_DAILY
+        self.insurance_per_veh = INSURANCE_PER_VEH
 
         # ── Staff on-cost rates (editable via Staff tab) ─────────────────────
         # Employer secondary NI rate — HMRC 2025/26 (13.8 %)
@@ -68,16 +188,22 @@ class Economy:
         self.week_index = 0
 
         self.budget_trend = 0
-        self.last_day_budget = 500000
+        self.last_day_budget = STARTING_CASH
         self.daily_revenue = 0
         self.daily_expenses = 0
 
         self.ledger = self._blank_ledger()
         self.history = []
+        self.budget_history = []   # daily closing budget snapshots (charts window)
 
         self.satisfaction = 88.0
         self.complaints_total = 0
         self.complaints_today = 0
+        # Baseline "you can't please everyone" gripes — a trickle of complaints
+        # that never fully stops and rises as satisfaction falls. Tallied and
+        # displayed separately from genuine overflow complaints so they never
+        # break the perfect-service streak.
+        self.karen_complaints_today = 0
 
         self.active_event = None
         self.pending_event = None
@@ -86,7 +212,19 @@ class Economy:
 
         # Editable difficulty levers
         self.event_chance = 0.30
-        self.win_streak_target = 7
+        self.win_streak_target = WIN_STREAK_DEFAULT
+        self.win_sat_floor = WIN_SAT_FLOOR
+
+        # Notices raised during a day-rollover (loan cleared, diversion fines),
+        # drained by the game loop and shown in the event banner.
+        self.day_notices = []
+
+        # ── Statutory recycling diversion tracking ───────────────────────────
+        self.diversion_target       = STATUTORY_DIVERSION_TARGET
+        self.residual_volume_year   = 0.0
+        self.diverted_volume_year   = 0.0
+        self._diversion_year_index  = 0
+        self.last_diversion_pct     = None   # previous year's reviewed result
 
         # Win condition
         self.perfect_days_streak = 0
@@ -104,9 +242,13 @@ class Economy:
         # Procurement notifications
         self.procurement_events = []
 
-        # Ambient weather: "dry" | "rain" | "snow"
+        # Ambient weather: "dry" | "rain" | "snow" | "overcast"
         self.weather = "dry"
         self._weather_timer = 0           # days remaining for current weather spell
+
+        # ── Diesel fuel market (bounded random walk around 1.0) ──────────────
+        self.fuel_index = 1.0
+        self.fuel_index_trend = 0.0       # yesterday→today delta, for the UI arrow
 
         # Road-works events — independent of active_event, up to 3 concurrent.
         # Each entry: {"tiles": set, "remaining_days": int}
@@ -253,23 +395,37 @@ class Economy:
         oncosts      = (fleet.workers * _ni_ph
                         + base_wages * self.pension_rate
                         + fleet.workers * self.ppe_daily)
-        vehicles     = fleet.daily_vehicle_cost()
+        vehicles     = fleet.daily_vehicle_cost(self.fuel_index, self.fuel_fraction)
         rental_costs = fleet.get_rental_costs()
         self.ledger["wages"]        += base_wages   * frac
         self.ledger["oncosts"]      += oncosts      * frac
         self.ledger["vehicles"]     += vehicles     * frac
         self.ledger["rental_costs"] += rental_costs * frac
 
+        # ── Recurring fixed overheads (per in-game day, metered per frame) ────
+        depot_rent = self.depot_rent_daily
+        insurance  = self.insurance_estimate(len(fleet.trucks))
+        loan_pay   = self.loan.current_payment()
+        self.ledger["depot_rent"]     += depot_rent * frac
+        self.ledger["insurance"]      += insurance  * frac
+        self.ledger["loan_repayment"] += loan_pay   * frac
+
         volume = fleet.take_pending_volume()
         if volume > 0:
-            gate, recycle, garden = waste.disposal_economics(volume)
+            gate, recycle, garden = waste.disposal_economics(
+                volume, self.landfill_tax_multiplier())
             recycle *= self._recycling_multiplier
             self.ledger["gate_fees"]        += gate
             self.ledger["recycling_credit"] += recycle
             self.ledger["garden_charges"]   += garden
+            # Track residual vs diverted tonnage for the statutory annual review.
+            res_u, div_u = waste.diversion_split(volume)
+            self.residual_volume_year += res_u
+            self.diverted_volume_year += div_u
 
         revenue  = (council + business) * frac
-        expenses = (base_wages + oncosts + vehicles + rental_costs) * frac
+        expenses = (base_wages + oncosts + vehicles + rental_costs
+                    + depot_rent + insurance + loan_pay) * frac
         self.daily_revenue  += revenue
         self.daily_expenses += expenses
         self.budget += (revenue - expenses)
@@ -291,6 +447,7 @@ class Economy:
         if len(self.history) > 30:
             self.history.pop(0)
         self.ledger = self._blank_ledger()
+        self.day_notices = []
 
         self.budget_trend    = self.budget - self.last_day_budget
         self.last_day_budget = self.budget
@@ -299,6 +456,21 @@ class Economy:
         self.complaints_today = 0
         self.day        += 1
         self.week_index  = (self.day - 1) // 7
+
+        # ---- startup loan: accrue a day of interest / repayment --------------
+        if self.loan.accrue_day():
+            self.day_notices.append({
+                "name": "Loan Cleared",
+                "desc": "The startup fleet loan is fully repaid. That daily "
+                        "repayment is gone for good — the books just got easier.",
+                "effect": "loanCleared",
+            })
+
+        # ---- statutory recycling-diversion annual review --------------------
+        year = (self.day - 1) // COUNCIL_YEAR_DAYS
+        if year != self._diversion_year_index:
+            self._review_diversion()
+            self._diversion_year_index = year
 
         # ---- insolvency watch (Section 114 fail condition) -------------------
         # Count consecutive days finishing at/below £0. Sustained insolvency
@@ -324,6 +496,9 @@ class Economy:
 
         # ---- ambient weather transitions -------------------------------------
         self._tick_weather()
+
+        # ---- diesel pump price drifts each day -------------------------------
+        self._tick_fuel_index()
 
         # ---- worker morale (wage-to-strike pipeline) -------------------------
         # Update morale BEFORE the event check so fresh morale affects today.
@@ -386,6 +561,11 @@ class Economy:
 
                 self.active_event = evt
                 self.pending_event = evt
+
+        # ---- snapshot the closing budget for the trend graph ------------------
+        self.budget_history.append(self.budget)
+        if len(self.budget_history) > 30:
+            self.budget_history.pop(0)
 
     # ----- road-works management -------------------------------------------
     def _update_road_works(self, city, fleet):
@@ -536,12 +716,13 @@ class Economy:
     def _apply_truck_breakdown(self, fleet, event=None):
         """Mark one active truck as broken. Records the broken truck id on the
         supplied event dict (the about-to-be-activated event, which is not yet
-        stored in self.active_event). Returns the truck name or None."""
-        active = [t for t in fleet.trucks
-                  if t["crew"] >= 1 and not t.get("broken")]
-        if not active:
+        stored in self.active_event). Returns the truck name or None.
+
+        The victim is chosen biased toward the least-reliable (oldest) lorries,
+        so wear shows up as failures on the vehicles you've run into the ground."""
+        truck = fleet.weighted_breakdown_target()
+        if truck is None:
             return None
-        truck = random.choice(active)
         truck["broken"] = True
         truck["path"]   = []
         truck["state"]  = "depot"
@@ -564,18 +745,124 @@ class Economy:
 
     # ----- ambient weather -------------------------------------------------
     def _tick_weather(self):
-        """Randomly change weather each day for ambient visuals."""
+        """Randomly change weather each day for ambient visuals. Winter swaps
+        wet spells for snow, so the seasons read on the map as well as the HUD."""
         if self._weather_timer > 0:
             self._weather_timer -= 1
             return
+        winter = self.season_name() == "Winter"
         r = random.random()
         if r < 0.60:
             self.weather = "dry"
         elif r < 0.85:
-            self.weather = "rain"
+            # Wet weather — falls as snow in winter, rain otherwise.
+            self.weather = "snow" if winter else "rain"
             self._weather_timer = random.randint(1, 3)
         else:
             self.weather = "overcast"
+
+    # ----- diesel fuel market ----------------------------------------------
+    def _tick_fuel_index(self):
+        """Drift the diesel price index as a bounded random walk. Most days
+        move a little; the occasional shock jolts it (refinery outage, duty
+        change, sterling wobble)."""
+        prev = self.fuel_index
+        step = random.gauss(0.0, 0.03)
+        if random.random() < 0.08:               # rare price shock
+            step += random.choice((-1, 1)) * random.uniform(0.06, 0.12)
+        # Gentle pull back toward 1.0 so it never runs away for long.
+        step += (1.0 - prev) * 0.05
+        self.fuel_index = max(FUEL_INDEX_MIN,
+                              min(FUEL_INDEX_MAX, round(prev + step, 4)))
+        self.fuel_index_trend = self.fuel_index - prev
+
+    def fuel_price(self):
+        """Pump price in £/litre implied by the current index."""
+        return FUEL_BASE_PRICE * self.fuel_index
+
+    def fuel_index_label(self):
+        idx = self.fuel_index
+        if idx >= 1.30:   return "High"
+        if idx >= 1.10:   return "Dear"
+        if idx >= 0.92:   return "Steady"
+        if idx >= 0.82:   return "Cheap"
+        return "Low"
+
+    # ----- seasonal calendar -----------------------------------------------
+    def season_index(self):
+        """0=Spring, 1=Summer, 2=Autumn, 3=Winter for the current day."""
+        return ((self.day - 1) // SEASON_LENGTH) % 4
+
+    def season_name(self):
+        return SEASON_NAMES[self.season_index()]
+
+    def season_day(self):
+        """Which day (1-based) of the current season we're on."""
+        return ((self.day - 1) % SEASON_LENGTH) + 1
+
+    def seasonal_fill_mult(self):
+        """How much faster bins fill this season (garden/food swing)."""
+        return SEASON_FILL_MULT.get(self.season_name(), 1.0)
+
+    # ----- fixed overheads & escalators ------------------------------------
+    def insurance_estimate(self, n_vehicles):
+        """Daily fleet & liability insurance for a given fleet size."""
+        return self.insurance_base + self.insurance_per_veh * max(0, n_vehicles)
+
+    def landfill_tax_multiplier(self):
+        """Escalator applied to the residual gate fee. Landfill tax rises each
+        council year; year 0 = 1.0, compounding by LANDFILL_TAX_ANNUAL_RISE."""
+        year = (self.day - 1) // COUNCIL_YEAR_DAYS
+        return (1.0 + LANDFILL_TAX_ANNUAL_RISE) ** year
+
+    def landfill_tax_pct_increase(self):
+        """How much dearer landfill is now vs year one, as a percentage."""
+        return (self.landfill_tax_multiplier() - 1.0) * 100.0
+
+    # ----- statutory recycling diversion -----------------------------------
+    def current_diversion_pct(self):
+        """Running diversion rate (%) for the council year so far, or None."""
+        tot = self.residual_volume_year + self.diverted_volume_year
+        if tot <= 0:
+            return None
+        return self.diverted_volume_year / tot * 100.0
+
+    def _review_diversion(self):
+        """End-of-year statutory review: fine the borough if it diverted less
+        than the target share of waste from landfill. Resets the accumulators."""
+        tot = self.residual_volume_year + self.diverted_volume_year
+        if tot > 0:
+            rate = self.diverted_volume_year / tot
+            self.last_diversion_pct = rate * 100.0
+            if rate < self.diversion_target:
+                short_pp = (self.diversion_target - rate) * 100.0
+                fine = int(min(DIVERSION_FINE_CAP, short_pp * DIVERSION_FINE_PER_PCT))
+                if fine > 0:
+                    self.budget -= fine
+                    self.ledger["diversion_fines"] += fine
+                    self.day_notices.append({
+                        "name": "Statutory Recycling Fine",
+                        "desc": (f"Last year diverted only {rate * 100:.0f}% from "
+                                 f"landfill against a {self.diversion_target * 100:.0f}% "
+                                 f"statutory target. DEFRA penalty: £{fine:,}. "
+                                 f"Enable more recycling streams to comply."),
+                        "effect": "money",
+                    })
+        self.residual_volume_year = 0.0
+        self.diverted_volume_year = 0.0
+
+    # ----- startup loan queries --------------------------------------------
+    def loan_balance(self):
+        return self.loan.balance if self.loan else 0.0
+
+    def loan_daily_payment(self):
+        return self.loan.current_payment() if self.loan else 0.0
+
+    def loan_progress(self):
+        return self.loan.progress() if self.loan else 1.0
+
+    def loan_cleared(self):
+        return (not self.loan) or self.loan.cleared
 
     # ----- service quality -------------------------------------------------
     def register_day_quality(self, city, service_ceiling=100.0):
@@ -601,15 +888,41 @@ class Economy:
         self.complaints_today  = daily_complaints
         self.complaints_total += daily_complaints
 
+        # ── "Karen" baseline gripes ──────────────────────────────────────────
+        # A residual trickle of complaints that never stops entirely: a small
+        # share of residents will always grumble, and that share grows as
+        # satisfaction falls. These are tallied and shown separately and apply
+        # only a gentle satisfaction drag — they never count toward the genuine
+        # overflow complaints that drive the perfect-service streak, so the win
+        # condition stays reachable.
+        karen = 0
+        if city.property_count > 0:
+            dissat = (100.0 - self.satisfaction) / 100.0
+            base_rate = 0.0009 * (0.45 + dissat)        # per property per day
+            expected = city.property_count * base_rate
+            karen = int(expected + random.random())     # stochastic rounding
+        self.karen_complaints_today = karen
+        self.complaints_total += karen
+
         if city.property_count > 0:
             overflow_ratio = daily_complaints / city.property_count
             if overflow_ratio <= 0.02:
-                self.satisfaction = min(100.0, self.satisfaction + 3.0)
+                # Recovery is deliberately slow: a clean day nudges satisfaction
+                # up only a little, so clawing back from a bad week takes
+                # sustained good service rather than a single tidy day.
+                self.satisfaction = min(100.0, self.satisfaction + 1.25)
             else:
-                drop = min(22.0, overflow_ratio * 140.0)
+                # Decay bites harder than recovery heals — one bad day can undo
+                # a week of clean ones.
+                drop = min(32.0, overflow_ratio * 185.0)
                 self.satisfaction = max(0.0, self.satisfaction - drop)
 
-        if daily_complaints == 0:
+        # A perfect day only counts toward the win if satisfaction is also
+        # holding above the statutory floor — residents won't reward a borough
+        # that's merely scraping by, even on a complaint-free day.
+        perfect_day = (daily_complaints == 0
+                       and self.satisfaction >= self.win_sat_floor)
+        if perfect_day:
             self.perfect_days_streak += 1
         else:
             self.perfect_days_streak = 0
@@ -620,7 +933,17 @@ class Economy:
             self.win_day      = self.day
             self.win_celebration_timer = 10.0
 
-        self.satisfaction += (service_ceiling - self.satisfaction) * 0.10
+        # A gentle drag from baseline gripes — small enough that good service
+        # still climbs, but it stops satisfaction sitting pinned at a flawless
+        # 100% (there's always *someone* with a grievance).
+        if city.property_count > 0 and karen > 0:
+            karen_drag = min(1.0, karen / city.property_count * 28.0)
+            self.satisfaction = max(0.0, self.satisfaction - karen_drag)
+
+        # Drift toward the service ceiling, but slowly — this is the passive
+        # pull that used to snap satisfaction back to the ceiling at 10%/day.
+        # At 4%/day a bad week genuinely lingers and has to be worked off.
+        self.satisfaction += (service_ceiling - self.satisfaction) * 0.04
         self.satisfaction  = max(0.0, min(100.0, self.satisfaction))
 
     # ----- queries ---------------------------------------------------------

@@ -137,9 +137,13 @@ class WastePolicy:
         total = sum(s.fill_share for s in streams) or 1.0
         return {s.id: volume * s.fill_share / total for s in streams}
 
-    def disposal_economics(self, volume):
+    def disposal_economics(self, volume, landfill_tax_mult=1.0):
         """Return ledger lines for disposing `volume` units of mixed kerbside
         collection under the current policy.
+
+        `landfill_tax_mult` escalates the residual gate fee to model the annual
+        rise in UK landfill tax (the residual stream's gate fee *is* landfill
+        tax); recycling/garden gate fees are unaffected.
 
         Returns (gate_fees, recycling_credit, garden_charges) in GBP.
         gate_fees is a positive cost; the other two are positive income."""
@@ -148,12 +152,28 @@ class WastePolicy:
         garden = 0.0
         for sid, units in self.split_volume(volume).items():
             s = self.get(sid)
-            gate += units * s.gate_fee
+            unit_gate = s.gate_fee
+            if sid == "residual":
+                unit_gate *= landfill_tax_mult
+            gate += units * unit_gate
             if sid == "garden":
                 garden += units * s.credit
             else:
                 recycle += units * s.credit
         return gate, recycle, garden
+
+    def diversion_split(self, volume):
+        """Apportion `volume` into (residual_units, diverted_units), where
+        diverted = recycling + food + garden. Drives the statutory recycling
+        diversion target / fine system in the economy."""
+        residual = 0.0
+        diverted = 0.0
+        for sid, units in self.split_volume(volume).items():
+            if sid == "residual":
+                residual += units
+            else:
+                diverted += units
+        return residual, diverted
 
     # ----------------------------------------------------------------- XML io
     def to_rows(self):

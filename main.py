@@ -16,6 +16,15 @@ class WasteCityGame:
     def __init__(self):
         pygame.init()
         pygame.display.set_caption("The Rubbish Game")
+        
+        # Load and set the application icon
+        try:
+            icon = pygame.image.load("root/icon.ico")
+            pygame.display.set_icon(icon)
+        except pygame.error:
+            # Fallback if the icon asset path isn't ready yet during development
+            pass
+
         self.screen = pygame.display.set_mode((1280, 720), pygame.RESIZABLE)
         self.clock = pygame.time.Clock()
 
@@ -26,12 +35,11 @@ class WasteCityGame:
         self.camera = {"x": 0, "y": 0, "zoom": 1}
         self.dragging = False
         self.drag_moved = False
+        self._ui_press = False     # True when a left-press started on the UI
         self.mouse = {"x": 0, "y": 0}
 
         self.selected_tile = None
         self.hovered_tile = None
-        self.planner_open = False
-        self.planner_tab = "rounds"      # rounds | waste | fleet | finance | data
         self.show_areas = True
 
         # Transient status line (XML import/export, deliveries, etc.)
@@ -52,9 +60,6 @@ class WasteCityGame:
         self._center_camera()
 
     # ---------------------------------------------------------------- actions
-    def _toggle_planner(self):
-        self.planner_open = not self.planner_open
-
     def _toggle_areas(self):
         self.show_areas = not self.show_areas
 
@@ -66,6 +71,9 @@ class WasteCityGame:
         self.city.generate()
         self.fleet.setup_initial_fleet()
         self.ambient = AmbientState()
+        # Reset any open floating windows for a clean fresh term.
+        self.ui.windows.clear()
+        self.ui._win_drag = None
         self.clear_selection()
         self._center_camera()
 
@@ -74,17 +82,22 @@ class WasteCityGame:
         self.toast_timer = 4.0
 
     def open_planner_tab(self, tab):
-        self.planner_tab = tab
-        self.planner_open = True
+        # Back-compat shim: opens the corresponding floating window.
+        self.ui.open_window(tab)
 
     def _center_camera(self):
         """Frame the camera on the landfill site at start (falls back to the
         depot if no landfill exists)."""
         lf = getattr(self.city, "landfill", None)
         if lf:
-            target = self.renderer.to_iso(lf["cx"], lf["cy"])
+            self.center_camera_on(lf["cx"], lf["cy"])
         else:
-            target = self.renderer.to_iso(self.fleet.depot_x, self.fleet.depot_y)
+            self.center_camera_on(self.fleet.depot_x, self.fleet.depot_y)
+
+    def center_camera_on(self, wx, wy):
+        """Pan/centre the camera so world tile-space point (wx, wy) sits at
+        screen centre (used on startup and from the vehicle inspect window)."""
+        target = self.renderer.to_iso(wx, wy)
         sw, sh = self.screen.get_size()
         zoom = self.camera["zoom"]
         # Solve render()'s mapping so the target sits at screen centre:
@@ -120,18 +133,16 @@ class WasteCityGame:
                                min(cy_for(min_iy) + margin, self.camera["y"]))
 
     # ----------------------------------------------------------------- clicks
-    def handle_click(self, screen_x, screen_y):
-        # No board interaction once the game is over.
+    def handle_map_click(self, screen_x, screen_y):
+        """A genuine click on the map (UI windows/toolbar/HUD already had their
+        chance to consume it). A click on a lorry opens its inspect window;
+        otherwise select or deselect a tile."""
         if self.economy.has_lost:
             return
 
-        # Planner is modal — it takes all clicks until closed.
-        if self.planner_open:
-            self.ui.handle_planner_click((screen_x, screen_y))
-            return
-
-        if screen_x < 252:
-            self.ui.handle_click((screen_x, screen_y))
+        truck = self.renderer.truck_at_screen_pos(self.fleet, screen_x, screen_y)
+        if truck is not None:
+            self.ui.open_truck_window(truck["id"])
             return
 
         coord = self.renderer.screen_to_tile(screen_x, screen_y,
@@ -157,15 +168,15 @@ class WasteCityGame:
         # game-over overlay remains, awaiting a restart.
         if self.economy.has_lost:
             self.economy.game_over_timer += dt
-            self.planner_open = False
             self.ui.update(dt)
             return
 
         # Simulation dt is scaled by game speed; UI/camera use real dt
         sim_dt = dt * self.speed
 
-        # Camera movement from held keys
-        if not self.planner_open:
+        # Camera movement from held keys (the map stays live with windows open;
+        # suppressed only while typing a truck rename).
+        if self.ui._renaming_truck_id is None:
             keys = pygame.key.get_pressed()
             speed = 35 / self.camera["zoom"] * self.speed
             if keys[pygame.K_w]:
@@ -187,16 +198,33 @@ class WasteCityGame:
         else:
             self.hovered_tile = None
 
-        bin_mult = self.economy.get_bin_rate_multiplier() * self.waste.fill_multiplier()
+        bin_mult = (self.economy.get_bin_rate_multiplier()
+                    * self.waste.fill_multiplier()
+                    * self.economy.seasonal_fill_mult())
         self.city.update(sim_dt, bin_mult)
         self.fleet.update(sim_dt)
         new_day = self.economy.update(sim_dt, self.city, self.fleet, self.waste)
 
         if new_day:
-            # Deliver any vehicles that have arrived.
-            delivered = self.fleet.process_deliveries(self.economy.day)
+            # Deliver any vehicles that have arrived. process_deliveries returns
+            # both the delivered vehicles and any procurement events (O-licence
+            # delays, pre-delivery faults) that fired while we waited.
+            delivered, proc_events = self.fleet.process_deliveries(self.economy.day)
             if delivered:
                 self.set_toast("Delivered: " + ", ".join(str(d) for d in delivered))
+            for ev in proc_events:
+                self.ui.show_event({
+                    "name": ev.get("name", "Procurement notice"),
+                    "desc": ev.get("message", ev.get("description", "")),
+                    "effect": "procurement",
+                })
+            # Age the fleet: ticks vehicle age, progresses repairs, and rolls
+            # age-related breakdowns (charging repair bills to the economy).
+            for ev in self.fleet.age_fleet():
+                self.ui.show_event(ev)
+            # Surface any day-rollover notices (loan cleared, statutory fines).
+            for ev in self.economy.day_notices:
+                self.ui.show_event(ev)
             # Once-per-day service-quality snapshot (one scan, not per frame).
             self.economy.register_day_quality(
             self.city, self.waste.satisfaction_ceiling())
@@ -215,7 +243,7 @@ class WasteCityGame:
         self.ui.update(dt)
         self._clamp_camera()
 
-    # ----------------------------------------------------------------- render
+    # ---------------------------------------------------------------- render
     def render(self):
         self.screen.fill((22, 24, 30))
         w, h = self.screen.get_size()
@@ -231,73 +259,87 @@ class WasteCityGame:
         pygame.display.flip()
 
     # ------------------------------------------------------------------- loop
+    def _process_event(self, event):
+        if event.type == pygame.QUIT:
+            pygame.quit()
+            sys.exit()
+
+        elif event.type == pygame.VIDEORESIZE:
+            self.screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
+            self.ui._setup_buttons()
+
+        elif event.type == pygame.KEYDOWN:
+            # Game over: only restart (R) or quit (Esc/Q) are accepted.
+            if self.economy.has_lost:
+                if event.key == pygame.K_r:
+                    self._clear_and_regenerate()
+                elif event.key in (pygame.K_ESCAPE, pygame.K_q):
+                    pygame.quit()
+                    sys.exit()
+            # If a truck rename is in progress, all keys go to the UI.
+            elif self.ui._renaming_truck_id is None:
+                self.ui.handle_key(event)
+            else:
+                # Number keys toggle the floating windows directly.
+                win_keys = {pygame.K_1: "rounds", pygame.K_2: "waste",
+                            pygame.K_3: "fleet",   pygame.K_4: "staff",
+                            pygame.K_5: "finance", pygame.K_6: "data"}
+                if event.key in win_keys:
+                    self.ui.toggle_window(win_keys[event.key])
+                elif event.key == pygame.K_TAB:
+                    # Tab toggles the most-used management window.
+                    self.ui.toggle_window("rounds")
+                elif event.key == pygame.K_g:
+                    self.show_areas = not self.show_areas
+                elif event.key == pygame.K_ESCAPE:
+                    # Esc closes the focused (top) window, else clears
+                    # the tile selection.
+                    if self.ui.windows:
+                        self.ui.close_window(self.ui.windows[-1])
+                    else:
+                        self.clear_selection()
+
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button == 1:
+                # Always treat the press as a potential click; the UI gets first
+                # refusal. If the UI takes it, suppress the camera pan but still
+                # let the click resolve on release.
+                self._ui_press = self.ui.on_mouse_down(event.pos)
+                self.dragging = True
+                self.drag_moved = False
+            elif event.button == 4:
+                if not self.ui.on_scroll(4, event.pos):
+                    self.camera["zoom"] = min(4, self.camera["zoom"] * 1.1)
+            elif event.button == 5:
+                if not self.ui.on_scroll(5, event.pos):
+                    self.camera["zoom"] = max(0.3, self.camera["zoom"] * 0.9)
+
+        elif event.type == pygame.MOUSEBUTTONUP:
+            if event.button == 1:
+                was_click = self.dragging and not self.drag_moved
+                consumed = self.ui.on_mouse_up(event.pos, was_click)
+                if was_click and not consumed:
+                    self.handle_map_click(event.pos[0], event.pos[1])
+                self.dragging = False
+                self._ui_press = False
+
+        elif event.type == pygame.MOUSEMOTION:
+            # A window being dragged takes priority over a camera pan.
+            if self.ui.on_mouse_motion(event.rel, event.pos):
+                self.drag_moved = True
+            elif self.dragging and not self._ui_press:
+                self.camera["x"] += event.rel[0] / self.camera["zoom"]
+                self.camera["y"] += event.rel[1] / self.camera["zoom"]
+                if abs(event.rel[0]) > 2 or abs(event.rel[1]) > 2:
+                    self.drag_moved = True
+            self.mouse["x"] = event.pos[0]
+            self.mouse["y"] = event.pos[1]
+
     def run(self):
         while True:
             dt = self.clock.tick(60) / 1000.0
-
             for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit()
-                    sys.exit()
-
-                elif event.type == pygame.VIDEORESIZE:
-                    self.screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
-                    self.ui._setup_buttons()
-
-                elif event.type == pygame.KEYDOWN:
-                    # Game over: only restart (R) or quit (Esc/Q) are accepted.
-                    if self.economy.has_lost:
-                        if event.key == pygame.K_r:
-                            self._clear_and_regenerate()
-                        elif event.key in (pygame.K_ESCAPE, pygame.K_q):
-                            pygame.quit()
-                            sys.exit()
-                    # If a truck rename is in progress, all keys go to the UI.
-                    elif self.ui._renaming_truck_id is not None:
-                        self.ui.handle_key(event)
-                    else:
-                        tab_keys = {pygame.K_1: "rounds", pygame.K_2: "waste",
-                                    pygame.K_3: "fleet", pygame.K_4: "finance",
-                                    pygame.K_5: "data"}
-                        if self.planner_open and event.key in tab_keys:
-                            self.planner_tab = tab_keys[event.key]
-                        elif event.key == pygame.K_TAB:
-                            self.planner_open = not self.planner_open
-                        elif event.key == pygame.K_g:
-                            self.show_areas = not self.show_areas
-                        elif event.key == pygame.K_ESCAPE:
-                            if self.planner_open:
-                                self.planner_open = False
-                            else:
-                                self.clear_selection()
-
-                elif event.type == pygame.MOUSEBUTTONDOWN:
-                    if event.button == 1:
-                        self.dragging = True
-                        self.drag_moved = False
-                    elif event.button == 4:
-                        if not (self.planner_open and
-                                self.ui.handle_scroll(4, event.pos)):
-                            self.camera["zoom"] = min(4, self.camera["zoom"] * 1.1)
-                    elif event.button == 5:
-                        if not (self.planner_open and
-                                self.ui.handle_scroll(5, event.pos)):
-                            self.camera["zoom"] = max(0.3, self.camera["zoom"] * 0.9)
-
-                elif event.type == pygame.MOUSEBUTTONUP:
-                    if event.button == 1 and self.dragging and not self.drag_moved:
-                        self.handle_click(event.pos[0], event.pos[1])
-                    self.dragging = False
-
-                elif event.type == pygame.MOUSEMOTION:
-                    if self.dragging and not self.planner_open:
-                        self.camera["x"] += event.rel[0] / self.camera["zoom"]
-                        self.camera["y"] += event.rel[1] / self.camera["zoom"]
-                        if abs(event.rel[0]) > 2 or abs(event.rel[1]) > 2:
-                            self.drag_moved = True
-                    self.mouse["x"] = event.pos[0]
-                    self.mouse["y"] = event.pos[1]
-
+                self._process_event(event)
             if self.running:
                 self.update(dt)
             self.render()
