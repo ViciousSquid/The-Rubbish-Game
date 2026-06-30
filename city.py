@@ -25,7 +25,7 @@ AREA_NAMES = [
 ]
 
 # ---------------------------------------------------------------------------
-#  Building styles  (gives Transport-Tycoon-style variety)
+#  Building styles
 # ---------------------------------------------------------------------------
 # Each style carries its own silhouette (drawn in renderer.py), a palette set,
 # a height band, a resident band and a per-second bin fill rate. Flats, towers
@@ -51,8 +51,7 @@ COM_STYLE_WEIGHTS = {
 # Fill rates are tuned so that the *worst-case* building (tower) reaches
 # ~97 % full after a full 7-day collection cycle at the default waste-stream
 # multiplier (~1.58×).  That leaves a small buffer for weather/event spikes
-# without overflowing in a normal week.  Prior values were ~25 % higher and
-# caused unavoidable weekend overflow on weekly rounds.
+# without overflowing in a normal week.
 STYLE_DATA = {
     "bungalow": {"h": (12, 17),   "pop": (1, 2),   "fill": 0.068},
     "terrace":  {"h": (22, 27),   "pop": (2, 4),   "fill": 0.090},
@@ -211,6 +210,8 @@ class CityGenerator:
         self.metrics = {"residential": 0, "commercial": 0, "roads": 0, "green": 0}
         self.landfill = None         # set by _place_landfill() during generate()
         self.road_works_tiles = set()   # (x, y) tiles blocked by road works event
+        self.version = 0             # bumped on every edit -- lets the renderer's
+                                      # static cache know the geometry changed
 
     # ------------------------------------------------------------------ areas
     def _area_index(self, x, y):
@@ -257,6 +258,7 @@ class CityGenerator:
         self.property_count = 0
         self.landfill = None
         self.road_works_tiles = set()
+        self.version = 0
         self.metrics = {"residential": 0, "commercial": 0, "roads": 0, "green": 0}
         self._build_areas()
 
@@ -511,3 +513,186 @@ class CityGenerator:
 
     def is_inside(self, x, y):
         return 0 <= x < self.width and 0 <= y < self.height
+
+    # ============================================================ map editor
+    # Backs the in-game debug Editor tab (Ctrl+Shift+D). All edits keep the
+    # area/global bookkeeping (population, property counts, metrics) in sync
+    # the same way the generator itself does, and bump `version` so the
+    # renderer's static cache knows to rebuild.
+
+    def _unwind_tile(self, x, y):
+        """Remove tile (x, y) from area/global bookkeeping ahead of
+        converting it to something else. Mirrors _convert_to_landfill's
+        unwind step but is reusable for any conversion."""
+        t = self.tiles[y][x]
+        if t.type in ("residential", "commercial"):
+            area = self.get_area(t.area_id)
+            if area and (x, y) in area.building_tiles:
+                area.building_tiles.remove((x, y))
+                area.property_count = max(0, area.property_count - 1)
+                area.population = max(0, area.population - t.population)
+            self.population = max(0, self.population - t.population)
+            self.property_count = max(0, self.property_count - 1)
+            key = "residential" if t.type == "residential" else "commercial"
+            self.metrics[key] = max(0, self.metrics.get(key, 0) - 1)
+        elif t.type == "green":
+            self.metrics["green"] = max(0, self.metrics.get("green", 0) - 1)
+
+    def _register_area_tile(self, x, y, tile):
+        """Add a freshly-built tile to its round's bookkeeping (the
+        counterpart to _unwind_tile)."""
+        area = self.get_area(tile.area_id)
+        if area and (x, y) not in area.building_tiles:
+            area.building_tiles.append((x, y))
+            area.property_count += 1
+            area.population += tile.population
+        tile.collection_due = area.collection_day if area else 0
+
+    def _build_tile(self, kind, area_id, style):
+        """Construct a fresh building Tile of `kind` pinned to a specific
+        `style` (no random style pick), updating global metrics/population.
+        Area-level bookkeeping is the caller's job via _register_area_tile."""
+        tile = Tile(kind)
+        tile.area_id = area_id
+        tile.building_style = style
+        data = STYLE_DATA[style]
+        h_min, h_max = data["h"]
+        tile.building_height = random.randint(h_min, h_max)
+        tile.population = random.randint(data["pop"][0], data["pop"][1])
+        tile.fill_rate = data["fill"]
+        palettes = STYLE_PALETTES[style]
+        tile.building_variant = random.randint(0, len(palettes) - 1)
+        pal = palettes[tile.building_variant]
+        tile.wall_color_light = pal["light"]
+        tile.wall_color_dark = pal["dark"]
+        tile.roof_color = pal["roof"]
+        self.metrics[kind] = self.metrics.get(kind, 0) + 1
+        self.population += tile.population
+        self.property_count += 1
+        return tile
+
+    def editor_place_building(self, x, y, style):
+        """Place a specific building style at (x, y). Residential/commercial
+        is inferred from the style itself. Returns True on success."""
+        if not self.is_inside(x, y):
+            return False
+        if style in RES_STYLE_WEIGHTS:
+            kind = "residential"
+        elif style in COM_STYLE_WEIGHTS:
+            kind = "commercial"
+        else:
+            return False
+        old = self.tiles[y][x]
+        if old.type in ("landfill", "road"):
+            return False
+        area_id = old.area_id
+        self._unwind_tile(x, y)
+        tile = self._build_tile(kind, area_id, style)
+        self.tiles[y][x] = tile
+        self._register_area_tile(x, y, tile)
+        self.version += 1
+        return True
+
+    def editor_place_green(self, x, y):
+        """Paint a green square over (x, y) -- the editor's green-space
+        brush. Returns True on success."""
+        if not self.is_inside(x, y):
+            return False
+        old = self.tiles[y][x]
+        if old.type in ("green", "landfill", "road"):
+            return False
+        area_id = old.area_id
+        self._unwind_tile(x, y)
+        tile = Tile("green")
+        tile.area_id = area_id
+        tile.bin_fill = 0.0
+        self.tiles[y][x] = tile
+        self.metrics["green"] = self.metrics.get("green", 0) + 1
+        self.version += 1
+        return True
+
+    def editor_clear_green(self, x, y, kind="residential"):
+        """Redevelop a green tile back into a building of `kind` -- the
+        editor's 'remove green square' brush. Returns True on success."""
+        if not self.is_inside(x, y):
+            return False
+        old = self.tiles[y][x]
+        if old.type != "green":
+            return False
+        if kind not in ("residential", "commercial"):
+            kind = "residential"
+        area_id = old.area_id
+        self._unwind_tile(x, y)
+        weights = RES_STYLE_WEIGHTS if kind == "residential" else COM_STYLE_WEIGHTS
+        style = _weighted_choice(weights)
+        tile = self._build_tile(kind, area_id, style)
+        self.tiles[y][x] = tile
+        self._register_area_tile(x, y, tile)
+        self.version += 1
+        return True
+
+    def editor_bulldoze(self, x, y):
+        """Delete tool: clear an existing building back to a green square."""
+        if not self.is_inside(x, y):
+            return False
+        if self.tiles[y][x].type not in ("residential", "commercial"):
+            return False
+        return self.editor_place_green(x, y)
+
+    def regenerate_area(self, area_id):
+        """District tool: re-roll every building in a round to a fresh style,
+        keeping each tile's existing residential/commercial split. Returns
+        the number of buildings changed."""
+        area = self.get_area(area_id)
+        if not area:
+            return 0
+        count = 0
+        for (x, y) in list(area.building_tiles):
+            old = self.tiles[y][x]
+            kind = old.type
+            if kind not in ("residential", "commercial"):
+                continue
+            weights = RES_STYLE_WEIGHTS if kind == "residential" else COM_STYLE_WEIGHTS
+            style = _weighted_choice(weights)
+            self._unwind_tile(x, y)
+            tile = self._build_tile(kind, area_id, style)
+            self.tiles[y][x] = tile
+            self._register_area_tile(x, y, tile)
+            count += 1
+        if count:
+            self.version += 1
+        return count
+
+    def set_area_type(self, area_id, kind):
+        """District tool: convert every building tile in a round to a single
+        `kind` ('residential' or 'commercial'). Returns the tile count changed."""
+        area = self.get_area(area_id)
+        if not area or kind not in ("residential", "commercial"):
+            return 0
+        count = 0
+        weights = RES_STYLE_WEIGHTS if kind == "residential" else COM_STYLE_WEIGHTS
+        for (x, y) in list(area.building_tiles):
+            old = self.tiles[y][x]
+            if old.type not in ("residential", "commercial"):
+                continue
+            style = _weighted_choice(weights)
+            self._unwind_tile(x, y)
+            tile = self._build_tile(kind, area_id, style)
+            self.tiles[y][x] = tile
+            self._register_area_tile(x, y, tile)
+            count += 1
+        if count:
+            self.version += 1
+        return count
+
+    def set_area_green(self, area_id):
+        """District tool: clear every building tile in a round to green
+        space. Returns the tile count changed."""
+        area = self.get_area(area_id)
+        if not area:
+            return 0
+        count = 0
+        for (x, y) in list(area.building_tiles):
+            if self.editor_place_green(x, y):
+                count += 1
+        return count

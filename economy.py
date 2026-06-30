@@ -63,6 +63,16 @@ INSURANCE_PER_VEH    = 22.0               # added per vehicle on the fleet
 # fraction each council year.
 LANDFILL_TAX_ANNUAL_RISE = 0.06
 
+# ── Tax / rate pressure baselines ────────────────────────────────────────────
+# Realistic-pressure model for the two rate levers. Both start "at baseline"
+# (matching the Economy defaults below), where there's no penalty at all.
+# Rates pushed above baseline start to bite: council tax annoys residents
+# directly (the satisfaction ceiling falls), and steep business rates push
+# marginal firms to close or relocate, quietly eroding the commercial tax base
+# the rate is levied on.
+BASELINE_COUNCIL_TAX   = 0.45      # £/resident/day
+BASELINE_BUSINESS_RATE = 2.20      # £/commercial property/day
+
 # ── Win bar (tightened) ──────────────────────────────────────────────────────
 # A flawless streak alone is no longer enough: satisfaction must hold above a
 # floor for a perfect day to count, and the streak target is longer.
@@ -218,6 +228,13 @@ class Economy:
         # Notices raised during a day-rollover (loan cleared, diversion fines),
         # drained by the game loop and shown in the event banner.
         self.day_notices = []
+
+        # ── Achievements ──────────────────────────────────────────────────────
+        # Minimal, idempotent unlock tracking: id -> {"name", "desc", "day"}.
+        # Unlocking pushes a one-off banner via day_notices or pending_event
+        # (see _unlock_achievement) -- there's no separate achievements UI tab,
+        # this just records that it happened and shows the player once.
+        self.achievements = {}
 
         # ── Statutory recycling diversion tracking ───────────────────────────
         self.diversion_target       = STATUTORY_DIVERSION_TARGET
@@ -384,7 +401,8 @@ class Economy:
         sat_mult = 0.65 + 0.35 * (self.satisfaction / 100.0)
 
         council  = city.population * self.council_tax_rate * tax_mult * sat_mult
-        business = city.metrics["commercial"] * self.business_rates * business_mult
+        business = (city.metrics["commercial"] * self.business_rates * business_mult
+                    * self.business_rate_elasticity())
         self.ledger["council_tax"]    += council  * frac
         self.ledger["business_rates"] += business * frac
 
@@ -459,12 +477,12 @@ class Economy:
 
         # ---- startup loan: accrue a day of interest / repayment --------------
         if self.loan.accrue_day():
-            self.day_notices.append({
-                "name": "Loan Cleared",
-                "desc": "The startup fleet loan is fully repaid. That daily "
-                        "repayment is gone for good — the books just got easier.",
-                "effect": "loanCleared",
-            })
+            notice = self._unlock_achievement(
+                "debt_free", "Achievement Unlocked: Debt Free",
+                "The startup fleet loan is fully repaid. That daily "
+                "repayment is gone for good — the books just got easier.")
+            if notice:
+                self.day_notices.append(notice)
 
         # ---- statutory recycling-diversion annual review --------------------
         year = (self.day - 1) // COUNCIL_YEAR_DAYS
@@ -743,6 +761,53 @@ class Economy:
         elif effect == "crewStrike" and fleet:
             fleet.on_strike = False
 
+    # ----- debug helper ------------------------------------------------------
+    def force_event(self, event_id, fleet=None):
+        """Debug tool: immediately fire a specific event template by id,
+        bypassing the normal random weighted selection. Mirrors the firing
+        logic in update(). Returns True if the event was found and fired."""
+        template = next((e for e in self.events if e["id"] == event_id), None)
+        if template is None:
+            return False
+        evt = {**template, "remaining_days": template["duration"]}
+        effect = template["effect"]
+
+        if effect == "truckBreakdown" and fleet:
+            days = random.randint(1, 7)
+            evt["remaining_days"] = days
+            evt["duration"]       = days
+            bd_name = self._apply_truck_breakdown(fleet, evt)
+            if bd_name:
+                evt["desc"] = (f"{bd_name} has broken down and will be out of "
+                               f"action for {days} day{'s' if days != 1 else ''}.")
+        elif effect == "money":
+            self.budget += template["value"]
+            if template["value"] > 0:
+                self.ledger["grants"] += template["value"]
+        elif effect == "crewStrike" and fleet:
+            fleet.on_strike = True
+        elif effect == "councilInspection":
+            if self.satisfaction >= 70:
+                bonus = 22000
+                self.budget += bonus
+                self.ledger["grants"] += bonus
+                evt["desc"] = (f"Inspection passed! Performance rated "
+                               f"\"{self.satisfaction_label()}\". "
+                               f"GBP {bonus:,} bonus grant awarded.")
+            else:
+                fine = 18000
+                self.budget -= fine
+                evt["desc"] = (f"Inspection failed! Service rated "
+                               f"\"{self.satisfaction_label()}\". "
+                               f"GBP {fine:,} penalty issued.")
+        elif effect == "heavy_rain" or (effect == "binRate" and template["id"] == "heavy_rain"):
+            self.weather = "rain"
+            self._weather_timer = 1
+
+        self.active_event = evt
+        self.pending_event = evt
+        return True
+
     # ----- ambient weather -------------------------------------------------
     def _tick_weather(self):
         """Randomly change weather each day for ambient visuals. Winter swaps
@@ -864,6 +929,80 @@ class Economy:
     def loan_cleared(self):
         return (not self.loan) or self.loan.cleared
 
+    def can_pay_off_loan(self):
+        """Whether there's enough in the bank to settle the loan in full
+        right now."""
+        return (not self.loan_cleared()) and self.budget >= self.loan_balance()
+
+    def pay_off_loan(self):
+        """Settle the entire outstanding startup loan balance today, in one
+        lump sum. No early-repayment penalty is modelled (this is a council
+        loan, not an FCA-regulated personal one) -- you simply stop accruing
+        interest from this point on. Returns (ok, message) for the caller to
+        relay to the player."""
+        if self.loan_cleared():
+            return False, "The startup loan is already cleared."
+        amount = self.loan_balance()
+        if self.budget < amount:
+            short = amount - self.budget
+            return False, f"Not enough in the bank — £{short:,.0f} short of the £{amount:,.0f} owed."
+        self.budget -= amount
+        self.loan.balance = 0.0
+        self.loan.cleared = True
+        notice = self._unlock_achievement(
+            "debt_free", "Achievement Unlocked: Debt Free",
+            f"Paid off the remaining £{amount:,.0f} on the startup loan in "
+            f"one go. No more daily repayments eating into the budget.")
+        if notice:
+            # Fires immediately rather than waiting for the next day-rollover
+            # (pending_event is drained every frame; see main.py update()).
+            self.pending_event = notice
+        return True, f"Loan paid off in full — £{amount:,.0f} cleared."
+
+    # ----- achievements ------------------------------------------------------
+    def _unlock_achievement(self, aid, name, desc):
+        """Record an achievement once, idempotently. Returns a banner-ready
+        notice dict on first unlock, or None if already unlocked."""
+        if aid in self.achievements:
+            return None
+        self.achievements[aid] = {"name": name, "desc": desc, "day": self.day}
+        return {"name": name, "desc": desc, "effect": "achievement"}
+
+    # ----- tax & business-rate pressure --------------------------------------
+    # Both council tax and business rates start "free" at their baseline
+    # value (the Economy defaults) and only start costing the borough once
+    # pushed above it -- a player who never touches the sliders sees none of
+    # this.
+    def council_tax_pressure(self):
+        """How far council tax sits above baseline, as a ratio (0 = at or
+        below baseline, 1.0 = double baseline)."""
+        if BASELINE_COUNCIL_TAX <= 0:
+            return 0.0
+        return max(0.0, self.council_tax_rate / BASELINE_COUNCIL_TAX - 1.0)
+
+    def business_rate_pressure(self):
+        if BASELINE_BUSINESS_RATE <= 0:
+            return 0.0
+        return max(0.0, self.business_rates / BASELINE_BUSINESS_RATE - 1.0)
+
+    def business_rate_elasticity(self):
+        """Steep business rates push marginal firms to close their doors or
+        relocate, eroding the commercial tax base the rate is levied on.
+        Modelled as a softening multiplier on business-rate revenue -- about
+        35% lost at double the baseline rate, floored so the line never
+        collapses to nothing."""
+        return max(0.55, 1.0 - self.business_rate_pressure() * 0.35)
+
+    def tax_satisfaction_penalty(self):
+        """Combined drag on the satisfaction ceiling from rate pressure:
+        residents grumble directly about a high council tax bill, and a
+        visibly thinning high street (empty units from rate-driven closures)
+        costs a bit more on top. Each capped well short of wiping the
+        ceiling out entirely."""
+        council_hit  = min(45.0, self.council_tax_pressure() * 80.0)
+        business_hit = min(20.0, self.business_rate_pressure() * 22.0)
+        return council_hit + business_hit
+
     # ----- service quality -------------------------------------------------
     def register_day_quality(self, city, service_ceiling=100.0):
         daily_complaints = 0
@@ -943,7 +1082,11 @@ class Economy:
         # Drift toward the service ceiling, but slowly — this is the passive
         # pull that used to snap satisfaction back to the ceiling at 10%/day.
         # At 4%/day a bad week genuinely lingers and has to be worked off.
-        self.satisfaction += (service_ceiling - self.satisfaction) * 0.04
+        # Rate pressure (council tax / business rates pushed above baseline)
+        # pulls the ceiling itself down, so a high-tax borough settles at a
+        # permanently lower satisfaction even on otherwise-perfect days.
+        effective_ceiling = max(20.0, service_ceiling - self.tax_satisfaction_penalty())
+        self.satisfaction += (effective_ceiling - self.satisfaction) * 0.04
         self.satisfaction  = max(0.0, min(100.0, self.satisfaction))
 
     # ----- queries ---------------------------------------------------------

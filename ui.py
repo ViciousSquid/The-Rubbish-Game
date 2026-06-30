@@ -1,6 +1,6 @@
 import pygame
 import math
-from city import AREA_COLS, AREA_ROWS
+from city import AREA_COLS, AREA_ROWS, RES_STYLE_WEIGHTS, COM_STYLE_WEIGHTS
 import xmlio
 from procurement import VEHICLE_CATALOGUE
 
@@ -52,6 +52,7 @@ WINDOW_DEFS = [
 WINDOW_TITLEBAR_H = 34
 WINDOW_PAD        = 16
 TOOLBAR_H         = 40
+EDITOR_BAR_H      = 64  # height of the bottom editor toolbar when active
 
 
 class FloatingWindow:
@@ -210,7 +211,7 @@ class UIPrimitives:
         return self.text("label", text, color or self.c.TEXT_MUTED, x, y)
     def value(self, text, x, y, color=None, align="left"):
         return self.text("body_b", text, color or self.c.TEXT_PRIMARY, x, y, align)
-    def button(self, rect, label, enabled=True, accent=False, hovered=False, pressed=False, icon=None):
+    def button(self, rect, label, enabled=True, accent=False, hovered=False, pressed=False, icon=None, color=None):
         if not enabled:
             fill = self.c.BG_PANEL
             border = self.c.BORDER_SUBTLE
@@ -219,10 +220,23 @@ class UIPrimitives:
             fill = self.c.BG_ACTIVE
             border = self.c.ACCENT_AMBER
             text_color = self.c.ACCENT_AMBER
+        elif accent and color:
+            # Selected state with custom colour — brighten it and add amber border
+            fill = tuple(min(255, int(c * 1.3)) for c in color)
+            border = self.c.ACCENT_AMBER
+            text_color = self.c.BG_DEEP
         elif accent:
             fill = self.c.ACCENT_AMBER_DIM if hovered else (220, 165, 70)
             border = self.c.ACCENT_AMBER
             text_color = self.c.BG_DEEP
+        elif color:
+            if hovered:
+                fill = tuple(min(255, int(c * 1.15)) for c in color)
+                border = tuple(min(255, int(c * 1.35)) for c in color)
+            else:
+                fill = color
+                border = tuple(min(255, int(c * 1.25)) for c in color)
+            text_color = self.c.TEXT_PRIMARY
         elif hovered:
             fill = self.c.BG_HOVER
             border = self.c.BORDER_BRIGHT
@@ -385,6 +399,15 @@ class UIManager:
         self._staff_fleet_max_scroll = 0
         self._staff_fleet_clip = None
 
+        # ── Debug tools (Ctrl+Shift+D) ───────────────────────────────────────
+        self._debug_tab = "tools"        # "tools" | "editor" (editor only shown in bar)
+        self.editor_tool = None          # current map-editor brush, or None
+        self.editor_selected_area = None # round targeted by district tools
+        self._debug_status = ""          # short feedback line in the debug window
+        # Bottom-bar editor mode: replaces the old floating editor sub-tab.
+        self._editor_mode = False        # True while the editor bar is visible
+        self._editor_bar_widgets = []    # (rect, fn) rebuilt each draw
+
         # ── Floating-window system ───────────────────────────────────────────
         self.windows = []              # open windows, back-to-front (front last)
         self._win_index = {}           # key -> FloatingWindow (persistent pos)
@@ -399,6 +422,7 @@ class UIManager:
             "finance": self._tab_finance,
             "charts":  self._tab_charts,
             "data":    self._tab_data,
+            "debug":   self._tab_debug,
         }
         self._setup_buttons()
 
@@ -449,6 +473,59 @@ class UIManager:
             self.close_window(key)
         else:
             self.open_window(key)
+
+    # ----- debug window (Ctrl+Shift+D) --------------------------------------
+    def toggle_debug_window(self):
+        if any(w.key == "debug" for w in self.windows):
+            self.close_window("debug")
+            return
+        win = self._win_index.get("debug")
+        if win is None:
+            w, h = self._screen_size
+            ww, hh = 760, 580
+            x = min(HUD_W + 80, max(HUD_W + 4, w - ww - 8))
+            y = min(TOOLBAR_H + 40, max(TOOLBAR_H + 4, h - hh - 8))
+            win = FloatingWindow("debug", "Debug Tools (Ctrl+Shift+D)", x, y, ww, hh)
+            self._win_index["debug"] = win
+        if win in self.windows:
+            self._bring_to_front(win)
+        else:
+            self.windows.append(win)
+
+    def editor_active(self):
+        """True while the bottom editor bar is visible. main.py routes map
+        clicks to the editor brush instead of normal tile selection."""
+        return self._editor_mode
+
+    def apply_editor_brush(self, tx, ty):
+        """Apply the current editor brush to map tile (tx, ty). Called from
+        main.py's handle_map_click. Returns True if a tile was changed."""
+        tool = self.editor_tool
+        if not tool:
+            return False
+        city = self.game.city
+        mode = tool.get("mode")
+        changed = False
+        if mode == "bulldoze":
+            changed = city.editor_bulldoze(tx, ty)
+            if changed:
+                self._debug_status = f"Bulldozed ({tx},{ty})."
+        elif mode == "green":
+            changed = city.editor_place_green(tx, ty)
+            if changed:
+                self._debug_status = f"Placed green square at ({tx},{ty})."
+        elif mode == "clear_green":
+            changed = city.editor_clear_green(tx, ty, tool.get("kind", "residential"))
+            if changed:
+                self._debug_status = f"Redeveloped green square at ({tx},{ty})."
+        elif mode == "build":
+            style = tool.get("style")
+            changed = city.editor_place_building(tx, ty, style)
+            if changed:
+                self._debug_status = f"Built {STYLE_LABELS.get(style, style)} at ({tx},{ty})."
+        if not changed:
+            self._debug_status = "Can't apply that tool there."
+        return changed
 
     # ----- per-vehicle inspect windows (opened by clicking a lorry) --------
     def _truck_window_title(self, truck):
@@ -514,8 +591,10 @@ class UIManager:
         w, h = self._screen_size
         r = win.rect
         r.x = max(HUD_W + 4, min(r.x, w - r.w - 4))
-        # keep the title bar reachable below the toolbar and above the bottom
-        r.y = max(TOOLBAR_H + 4, min(r.y, h - WINDOW_TITLEBAR_H - 4))
+        # keep the title bar reachable below the toolbar and above the bottom;
+        # if the editor bar is visible, leave room for it too.
+        bottom_margin = (EDITOR_BAR_H + 4) if self._editor_mode else 4
+        r.y = max(TOOLBAR_H + 4, min(r.y, h - WINDOW_TITLEBAR_H - bottom_margin))
 
     def window_at(self, pos):
         for win in reversed(self.windows):
@@ -542,6 +621,8 @@ class UIManager:
             if win.titlebar_rect().collidepoint(pos):
                 self._win_drag = (win, pos[0] - win.rect.x, pos[1] - win.rect.y)
             return True
+        if self._in_editor_bar(pos):
+            return True            # consume so it doesn't start a camera drag
         if self._in_toolbar(pos) or pos[0] < HUD_W:
             return True            # consume; act on release
         return False
@@ -569,6 +650,9 @@ class UIManager:
         win = self.window_at(pos)
         if win is not None:
             self._resolve_window_click(win, pos)
+            return True
+        if self._in_editor_bar(pos):
+            self._editor_bar_resolve(pos)
             return True
         if self._toolbar_click(pos):
             return True
@@ -689,6 +773,9 @@ class UIManager:
         self._draw_inspect_panel(screen, w, h)
         # Floating windows sit above the map/HUD but below transient banners.
         self._draw_windows(screen, w, h)
+        # Editor bar sits below windows but above toasts/banners.
+        if self._editor_mode:
+            self._draw_editor_bar(screen, w, h)
         self._draw_toast(screen, w, h)
         # Procurement bar drawn before event banner so events always render on top.
         self._draw_procurement_bar(screen, w)
@@ -1043,6 +1130,8 @@ class UIManager:
             accent = c.STATUS_BAD          # red  — most severe
         elif effect == "truckBreakdown":
             accent = c.STATUS_WARN         # orange — serious
+        elif effect == "achievement":
+            accent = c.ACCENT_SAGE         # green — celebratory
         else:
             accent = c.ACCENT_AMBER        # amber  — standard
 
@@ -1882,11 +1971,30 @@ class UIManager:
         ty += 32
         ty2 = self._stepper(screen, lx, ty, "Council tax (£/resident/day)", f"{eco.council_tax_rate:.2f}",
                            (lambda: self._adjust_tax(-0.10)), (lambda: self._adjust_tax(0.10)), label_w=240)
-        ui.text("caption", "Higher tax raises revenue but dents satisfaction.", c.TEXT_DIM, lx, ty2)
+        tax_pressure = eco.council_tax_pressure()
+        if tax_pressure > 0:
+            ui.text("caption",
+                    f"+{tax_pressure*100:.0f}% above baseline — satisfaction ceiling down "
+                    f"{min(45.0, tax_pressure*80.0):.0f} pts. Residents notice.",
+                    c.STATUS_WARN, lx, ty2)
+        else:
+            ui.text("caption", "At or below the baseline rate — no satisfaction penalty.",
+                    c.TEXT_DIM, lx, ty2)
         ty = ty2 + 14
         ty = self._stepper(screen, lx, ty, "Business rates (£/commercial/day)", f"£{eco.business_rates:.2f}",
                       (lambda: self._adjust_business_rates(-0.10)), (lambda: self._adjust_business_rates(0.10)),
                       label_w=240)
+        biz_pressure = eco.business_rate_pressure()
+        if biz_pressure > 0:
+            lost_pct = (1.0 - eco.business_rate_elasticity()) * 100.0
+            ui.text("caption",
+                    f"+{biz_pressure*100:.0f}% above baseline — ~{lost_pct:.0f}% of that revenue "
+                    f"lost as marginal firms close or relocate.",
+                    c.STATUS_WARN, lx, ty)
+        else:
+            ui.text("caption", "At or below the baseline rate — the high street stays put.",
+                    c.TEXT_DIM, lx, ty)
+        ty += 14
         # ── Diesel market readout ────────────────────────────────────────────
         ty += 12
         ui.section_header(lx, ty, "DIESEL MARKET", 300)
@@ -1918,7 +2026,14 @@ class UIManager:
             ui.label("Daily repayment", lx, ty)
             ui.text("mono", f"£{eco.loan_daily_payment():.0f}/day", c.TEXT_SECONDARY,
                     lx + 320, ty, align="right")
-            ty += 20
+            ty += 26
+            can_pay = eco.can_pay_off_loan()
+            pay_label = (f"Pay off loan now (£{int(eco.loan_balance()):,})" if can_pay
+                        else f"Pay off loan (need £{int(eco.loan_balance()):,})")
+            pay_rect = pygame.Rect(lx, ty, 280, 28)
+            self._pbtn(screen, pay_rect, pay_label, self._pay_off_loan,
+                      enabled=can_pay, accent=can_pay)
+            ty += 36
         else:
             ui.label("Startup loan", lx, ty)
             ui.text("body_s", "Cleared", c.STATUS_GOOD, lx + 320, ty, align="right")
@@ -1942,6 +2057,15 @@ class UIManager:
         ui.text("caption",
                 f"Miss the {tgt:.0f}% statutory target at year-end for a DEFRA fine.",
                 c.TEXT_DIM, lx, ty)
+
+        if eco.achievements:
+            ty += 30
+            ui.section_header(lx, ty, "ACHIEVEMENTS", 300)
+            ty += 22
+            for ach in eco.achievements.values():
+                short_name = ach["name"].replace("Achievement Unlocked: ", "")
+                ui.text("body_s", f"{short_name} — Day {ach['day']}", c.ACCENT_SAGE, lx, ty)
+                ty += 18
 
         gx = x + 360
         gw = w - 360
@@ -2144,6 +2268,388 @@ class UIManager:
             color = c.TEXT_MUTED if ln.strip() else c.TEXT_DIM
             ui.text("body_s", ln, color, x, ty)
             ty += 20
+
+    # ── Debug Tools window (Ctrl+Shift+D) ───────────────────────────────────
+    def _tab_debug(self, screen, x, y, w, h):
+        ui = self.ui
+        c = ui.c
+        sub_tabs = [("tools", "Weather & Events"), ("editor", "Edit City")]
+        tx = x
+        for key, label in sub_tabs:
+            bw = ui.fonts.size("body_b", label)[0] + 28
+            rect = pygame.Rect(tx, y, bw, 30)
+            self._pbtn(screen, rect, label, (lambda k=key: self._set_debug_tab(k)),
+                      accent=(self._debug_tab == key))
+            tx += bw + 8
+        ty = y + 42
+        # "Editor" tab transitions to bottom-bar mode and closes this window,
+        # so only "tools" content is ever shown here.
+        self._debug_tools_tab(screen, x, ty, w, h - 42)
+
+    def _set_debug_tab(self, key):
+        if key == "editor":
+            # Clicking the Editor tab closes the debug window and switches to
+            # the non-obscuring bottom editor bar instead.
+            self._editor_mode = True
+            self.editor_tool = None
+            self._debug_status = ""
+            self.close_window("debug")
+        else:
+            self._debug_tab = key
+
+    # ── Bottom editor bar helpers ────────────────────────────────────────────
+    def _in_editor_bar(self, pos):
+        """True if `pos` is inside the editor bar region."""
+        if not self._editor_mode:
+            return False
+        w, h = self._screen_size
+        return pos[0] >= HUD_W and pos[1] >= h - EDITOR_BAR_H
+
+    def _exit_editor_mode(self):
+        self._editor_mode = False
+        self.editor_tool = None
+        self._debug_status = ""
+
+    def _editor_bar_resolve(self, pos):
+        for rect, fn in self._editor_bar_widgets:
+            if rect.collidepoint(pos):
+                fn()
+                return
+
+    def _draw_editor_bar(self, screen, w, h):
+        """A slim two-row toolbar fixed to the bottom of the screen.  All
+        map-editor brush and build-style buttons live here so the city is
+        fully visible while painting tiles."""
+        ui = self.ui
+        c = ui.c
+        tool = self.editor_tool
+        mouse = pygame.mouse.get_pos()
+
+        bar_x = HUD_W
+        bar_y = h - EDITOR_BAR_H
+        bar_w = w - HUD_W
+
+        # Background + amber top border to signal editor mode
+        pygame.draw.rect(screen, c.BG_PANEL, pygame.Rect(bar_x, bar_y, bar_w, EDITOR_BAR_H))
+        pygame.draw.line(screen, c.ACCENT_AMBER, (bar_x, bar_y), (w, bar_y), 2)
+
+        self._editor_bar_widgets = []
+        GAP   = 4
+        BTN_H = 26
+
+        r1_y = bar_y + 4         # row 1: action tools
+        r2_y = bar_y + 34        # row 2: build-style chips
+
+        # ── Row 1: EDITOR label + action tools + status + exit ───────────────
+        bx = bar_x + 10
+
+        lsurf = ui.fonts.render("body_s", "EDITOR", c.ACCENT_AMBER)
+        screen.blit(lsurf, (bx, r1_y + (BTN_H - lsurf.get_height()) // 2))
+        bx += lsurf.get_width() + 8
+        pygame.draw.line(screen, c.BORDER_SUBTLE, (bx, bar_y + 6), (bx, bar_y + 32))
+        bx += 10
+
+        action_tools = [
+            ("Bulldoze",
+             self._set_tool_bulldoze,
+             bool(tool and tool.get("mode") == "bulldoze")),
+            ("Green sq.",
+             self._set_tool_green,
+             bool(tool and tool.get("mode") == "green")),
+            ("→Res",
+             lambda: self._set_tool_clear_green("residential"),
+             bool(tool and tool.get("mode") == "clear_green"
+                  and tool.get("kind") == "residential")),
+            ("→Com",
+             lambda: self._set_tool_clear_green("commercial"),
+             bool(tool and tool.get("mode") == "clear_green"
+                  and tool.get("kind") == "commercial")),
+        ]
+        for label, fn, active in action_tools:
+            tw = ui.fonts.size("body_b", label)[0] + 16
+            rect = pygame.Rect(bx, r1_y, tw, BTN_H)
+            ui.button(rect, label, accent=active, hovered=rect.collidepoint(mouse))
+            self._editor_bar_widgets.append((rect, fn))
+            bx += tw + GAP
+
+        # Status text
+        bx += 6
+        if tool:
+            status_text = f"Tool: {self._editor_tool_label(tool)}"
+            status_col  = c.ACCENT_TEAL
+        else:
+            status_text = "Select a brush then click the map  ·  ESC to exit"
+            status_col  = c.TEXT_DIM
+        ssurf = ui.fonts.render("body_s", status_text, status_col)
+        screen.blit(ssurf, (bx, r1_y + (BTN_H - ssurf.get_height()) // 2))
+
+        # Exit button (right-aligned)
+        ex_label = "✕ Exit Editor"
+        etw = ui.fonts.size("body_b", ex_label)[0] + 16
+        exit_rect = pygame.Rect(w - etw - 8, r1_y, etw, BTN_H)
+        ui.button(exit_rect, ex_label, hovered=exit_rect.collidepoint(mouse))
+        self._editor_bar_widgets.append((exit_rect, self._exit_editor_mode))
+
+        # ── Row 2: build-style chips ─────────────────────────────────────────
+        SHORT = {
+            "terrace":   "Terrace",  "semi":      "Semi",
+            "detached":  "Detach",   "bungalow":  "Bungalow",
+            "flats":     "Flats",    "tower":     "Tower",
+            "shop":      "Shop",     "office":    "Office",
+            "warehouse": "Whouse",   "highrise":  "Hi-rise",
+        }
+        bx = bar_x + 10
+
+        rl = ui.fonts.render("body_s", "Res:", c.TEXT_MUTED)
+        screen.blit(rl, (bx, r2_y + (BTN_H - rl.get_height()) // 2))
+        bx += rl.get_width() + 4
+
+        for sid in RES_STYLE_WEIGHTS.keys():
+            lbl  = SHORT.get(sid, sid)
+            tw   = ui.fonts.size("body_b", lbl)[0] + 14
+            rect = pygame.Rect(bx, r2_y, tw, BTN_H)
+            active = bool(tool and tool.get("mode") == "build"
+                          and tool.get("style") == sid)
+            ui.button(rect, lbl, accent=active, hovered=rect.collidepoint(mouse),
+                      color=(50, 140, 70))
+            self._editor_bar_widgets.append((rect, lambda s=sid: self._set_tool_build(s)))
+            bx += tw + GAP
+
+        # Divider between Res and Com
+        bx += 4
+        pygame.draw.line(screen, c.BORDER_SUBTLE,
+                         (bx, bar_y + 35), (bx, bar_y + EDITOR_BAR_H - 5))
+        bx += 8
+
+        cl = ui.fonts.render("body_s", "Com:", c.TEXT_MUTED)
+        screen.blit(cl, (bx, r2_y + (BTN_H - cl.get_height()) // 2))
+        bx += cl.get_width() + 4
+
+        for sid in COM_STYLE_WEIGHTS.keys():
+            lbl  = SHORT.get(sid, sid)
+            tw   = ui.fonts.size("body_b", lbl)[0] + 14
+            rect = pygame.Rect(bx, r2_y, tw, BTN_H)
+            active = bool(tool and tool.get("mode") == "build"
+                          and tool.get("style") == sid)
+            ui.button(rect, lbl, accent=active, hovered=rect.collidepoint(mouse),
+                      color=(50, 110, 170))
+            self._editor_bar_widgets.append((rect, lambda s=sid: self._set_tool_build(s)))
+            bx += tw + GAP
+
+    def _debug_tools_tab(self, screen, x, y, w, h):
+        ui = self.ui
+        c = ui.c
+        economy = self.game.economy
+
+        ui.section_header(x, y, "Force weather", w)
+        ty = y + 26
+        weathers = [("dry", "Dry"), ("rain", "Rain"), ("snow", "Snow"), ("overcast", "Overcast")]
+        bx = x
+        for wid, label in weathers:
+            rect = pygame.Rect(bx, ty, 110, 32)
+            self._pbtn(screen, rect, label, (lambda w_id=wid: self._force_weather(w_id)),
+                      accent=(economy.weather == wid))
+            bx += 120
+        ty += 46
+        ui.text("body_s",
+                f"Current: {economy.weather}  |  Season: {economy.season_name()}  |  Day {economy.day}",
+                c.TEXT_MUTED, x, ty)
+        ty += 30
+        ui.h_line(x, ty, w)
+        ty += 16
+
+        ui.section_header(x, ty, "Force event", w)
+        ty += 26
+        cols = 2
+        col_w = (w - 16) // cols
+        for i, ev in enumerate(economy.events):
+            col = i % cols
+            row = i // cols
+            rect = pygame.Rect(x + col * (col_w + 16), ty + row * 38, col_w, 32)
+            self._pbtn(screen, rect, ev["name"], (lambda eid=ev["id"]: self._force_event(eid)),
+                      enabled=(economy.active_event is None), fkey="body_s")
+        rows_used = (len(economy.events) + cols - 1) // cols
+        ty += rows_used * 38 + 12
+        ui.h_line(x, ty, w)
+        ty += 16
+
+        clear_rect = pygame.Rect(x, ty, 170, 32)
+        self._pbtn(screen, clear_rect, "Clear active event", self._clear_event,
+                  enabled=(economy.active_event is not None))
+        if economy.active_event:
+            ui.text("body_s", f"Active: {economy.active_event['name']}", c.TEXT_MUTED,
+                    clear_rect.right + 16, ty + 8)
+        ty += 46
+        if self._debug_status:
+            ui.text("body_s", self._debug_status, c.ACCENT_TEAL, x, ty)
+
+    def _force_weather(self, weather_id):
+        economy = self.game.economy
+        economy.weather = weather_id
+        economy._weather_timer = 2 if weather_id in ("rain", "snow") else 0
+        self._debug_status = f"Weather forced to {weather_id}."
+
+    def _force_event(self, event_id):
+        if self.game.economy.force_event(event_id, fleet=self.game.fleet):
+            self._debug_status = f"Forced event: {event_id}"
+        else:
+            self._debug_status = f"Could not force event: {event_id}"
+
+    def _clear_event(self):
+        economy = self.game.economy
+        if economy.active_event:
+            economy._clear_event_effects(economy.active_event, self.game.city, self.game.fleet)
+            economy.active_event = None
+            self._debug_status = "Active event cleared."
+
+    # ── Editor sub-tab: place/delete buildings, green squares, districts ───
+    def _debug_editor_tab(self, screen, x, y, w, h):
+        ui = self.ui
+        c = ui.c
+        city = self.game.city
+        col1_w = int(w * 0.46)
+        col2_x = x + col1_w + 20
+        col2_w = w - col1_w - 20
+        tool = self.editor_tool
+
+        # ---- Brush tools (left column) ----
+        ty = y
+        ui.section_header(x, ty, "Brush", col1_w)
+        ty += 24
+        bull = pygame.Rect(x, ty, col1_w, 30)
+        self._pbtn(screen, bull, "Bulldoze (-> green)", self._set_tool_bulldoze,
+                  accent=bool(tool and tool.get("mode") == "bulldoze"))
+        ty += 36
+        green = pygame.Rect(x, ty, col1_w, 30)
+        self._pbtn(screen, green, "Place green square", self._set_tool_green,
+                  accent=bool(tool and tool.get("mode") == "green"))
+        ty += 36
+        half = (col1_w - 8) // 2
+        cgr = pygame.Rect(x, ty, half, 30)
+        cgc = pygame.Rect(x + half + 8, ty, half, 30)
+        self._pbtn(screen, cgr, "Remove green -> Res",
+                  (lambda: self._set_tool_clear_green("residential")), fkey="body_s",
+                  accent=bool(tool and tool.get("mode") == "clear_green" and tool.get("kind") == "residential"))
+        self._pbtn(screen, cgc, "Remove green -> Com",
+                  (lambda: self._set_tool_clear_green("commercial")), fkey="body_s",
+                  accent=bool(tool and tool.get("mode") == "clear_green" and tool.get("kind") == "commercial"))
+        ty += 40
+        ui.h_line(x, ty, col1_w)
+        ty += 12
+
+        ui.text("body_s", "Residential", c.TEXT_MUTED, x, ty)
+        ty += 20
+        ty = self._editor_style_grid(screen, x, ty, col1_w, list(RES_STYLE_WEIGHTS.keys()))
+        ty += 8
+        ui.text("body_s", "Commercial", c.TEXT_MUTED, x, ty)
+        ty += 20
+        ty = self._editor_style_grid(screen, x, ty, col1_w, list(COM_STYLE_WEIGHTS.keys()))
+        ty += 12
+
+        status = self._editor_tool_label(tool) if tool else "None"
+        ui.text("body_s", f"Tool: {status}", c.ACCENT_TEAL, x, ty)
+        ty += 18
+        ui.text("caption", "Click a tile on the map to apply. Esc clears the tool.",
+                c.TEXT_DIM, x, ty)
+
+        # ---- District tools (right column) ----
+        ty2 = y
+        ui.section_header(col2_x, ty2, "Districts", col2_w)
+        ty2 += 24
+        ui.text("body_s", "Select a round, then apply:", c.TEXT_MUTED, col2_x, ty2)
+        ty2 += 22
+        cols = 2
+        chip_w = (col2_w - 8) // cols
+        for i, area in enumerate(city.areas):
+            col = i % cols
+            row = i // cols
+            rect = pygame.Rect(col2_x + col * (chip_w + 8), ty2 + row * 30, chip_w, 26)
+            self._pbtn(screen, rect, area.name, (lambda aid=area.id: self._select_editor_area(aid)),
+                      accent=(self.editor_selected_area == area.id), fkey="body_s")
+        rows = (len(city.areas) + cols - 1) // cols
+        ty2 += rows * 30 + 10
+        ui.h_line(col2_x, ty2, col2_w)
+        ty2 += 12
+
+        sel = self.editor_selected_area
+        sel_name = next((a.name for a in city.areas if a.id == sel), None)
+        ui.text("body_s", f"Selected: {sel_name or '(none)'}", c.TEXT_PRIMARY, col2_x, ty2)
+        ty2 += 26
+
+        actions = [
+            ("Make residential", lambda: self._district_action("residential")),
+            ("Make commercial",  lambda: self._district_action("commercial")),
+            ("Clear to green",   lambda: self._district_action("green")),
+            ("Regenerate round", lambda: self._district_action("regen")),
+        ]
+        for label, fn in actions:
+            rect = pygame.Rect(col2_x, ty2, col2_w, 30)
+            self._pbtn(screen, rect, label, fn, enabled=(sel is not None))
+            ty2 += 36
+        ty2 += 8
+        if self._debug_status:
+            ui.text("body_s", self._debug_status, c.ACCENT_TEAL, col2_x, ty2)
+
+    def _editor_style_grid(self, screen, x, y, w, style_ids, cols=2):
+        gap = 6
+        cw = (w - gap * (cols - 1)) // cols
+        ch = 28
+        tool = self.editor_tool
+        for i, sid in enumerate(style_ids):
+            col = i % cols
+            row = i // cols
+            rect = pygame.Rect(x + col * (cw + gap), y + row * (ch + gap), cw, ch)
+            label = STYLE_LABELS.get(sid, sid)
+            active = bool(tool and tool.get("mode") == "build" and tool.get("style") == sid)
+            self._pbtn(screen, rect, label, (lambda s=sid: self._set_tool_build(s)),
+                      accent=active, fkey="body_s")
+        rows = (len(style_ids) + cols - 1) // cols
+        return y + rows * (ch + gap)
+
+    def _set_tool_bulldoze(self):
+        self.editor_tool = {"mode": "bulldoze"}
+
+    def _set_tool_green(self):
+        self.editor_tool = {"mode": "green"}
+
+    def _set_tool_clear_green(self, kind):
+        self.editor_tool = {"mode": "clear_green", "kind": kind}
+
+    def _set_tool_build(self, style):
+        self.editor_tool = {"mode": "build", "style": style}
+
+    def _editor_tool_label(self, tool):
+        mode = tool.get("mode")
+        if mode == "bulldoze":
+            return "Bulldoze"
+        if mode == "green":
+            return "Place green square"
+        if mode == "clear_green":
+            return f"Remove green -> {tool.get('kind')}"
+        if mode == "build":
+            return f"Build: {STYLE_LABELS.get(tool.get('style'), tool.get('style'))}"
+        return "None"
+
+    def _select_editor_area(self, area_id):
+        self.editor_selected_area = area_id
+
+    def _district_action(self, action):
+        city = self.game.city
+        aid = self.editor_selected_area
+        if aid is None:
+            return
+        if action == "residential":
+            n = city.set_area_type(aid, "residential")
+            self._debug_status = f"Set {n} tiles to residential."
+        elif action == "commercial":
+            n = city.set_area_type(aid, "commercial")
+            self._debug_status = f"Set {n} tiles to commercial."
+        elif action == "green":
+            n = city.set_area_green(aid)
+            self._debug_status = f"Cleared {n} tiles to green."
+        elif action == "regen":
+            n = city.regenerate_area(aid)
+            self._debug_status = f"Regenerated {n} buildings."
 
     # ── Per-vehicle inspect window (click a lorry on the map) ──────────────
     def _truck_window_content(self, screen, x, y, w, h, truck_id):
@@ -2371,6 +2877,10 @@ class UIManager:
     def _adjust_business_rates(self, delta):
         eco = self.game.economy
         eco.business_rates = round(max(0.0, min(20.0, eco.business_rates + delta)), 2)
+
+    def _pay_off_loan(self):
+        ok, msg = self.game.economy.pay_off_loan()
+        self.game.set_toast(msg)
 
     def _adjust_event_chance(self, delta):
         eco = self.game.economy

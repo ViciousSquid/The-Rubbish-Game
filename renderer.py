@@ -36,6 +36,57 @@ def _shade(color, f):
     )
 
 
+def _blend(c1, c2, t):
+    """Linear-interpolate two (r,g,b) colours; t clamped to 0..1."""
+    t = max(0.0, min(1.0, t))
+    return (
+        int(c1[0] + (c2[0] - c1[0]) * t),
+        int(c1[1] + (c2[1] - c1[1]) * t),
+        int(c1[2] + (c2[2] - c1[2]) * t),
+    )
+
+
+# ─── snow settling ─────────────────────────────────────────────────────────
+# `snow` is the ambient snow-coverage level (0..1, see AmbientState.snow_level).
+# Ground/road/roof colours are blended toward this white-blue at draw time so
+# the whole city visibly whitens during a snow spell and thaws afterwards.
+SNOW_WHITE = (236, 240, 246)
+
+
+def _snow_ground(color, snow, strength=1.0):
+    if snow <= 0.01:
+        return color
+    return _blend(color, SNOW_WHITE, min(1.0, snow * strength))
+
+
+def _snow_cc(cc, snow):
+    """Blend a building's cached wall/roof colours toward snow-white. Returns
+    a new dict -- the cached original (tile._ccache) is left untouched so it
+    is still correct once the snow melts."""
+    if snow <= 0.01:
+        return cc
+    out = dict(cc)
+    out["roof"]    = _blend(cc["roof"],    SNOW_WHITE, min(1.0, snow * 1.15))
+    out["roof_l"]  = _blend(cc["roof_l"],  SNOW_WHITE, min(1.0, snow * 1.15))
+    out["roof_h"]  = _blend(cc["roof_h"],  SNOW_WHITE, min(1.0, snow * 1.05))
+    out["roof_d"]  = _blend(cc["roof_d"],  _shade(SNOW_WHITE, 0.82), min(1.0, snow * 0.95))
+    out["parapet"] = _blend(cc["parapet"], _shade(SNOW_WHITE, 0.75), min(1.0, snow * 0.9))
+    out["wr"]      = _blend(cc["wr"], SNOW_WHITE, snow * 0.28)
+    out["wl"]      = _blend(cc["wl"], SNOW_WHITE, snow * 0.28)
+    return out
+
+
+# ─── day / night cycle ─────────────────────────────────────────────────────
+
+def _daylight_brightness(day_progress):
+    """0 (midnight) .. 1 (noon) brightness curve. `day_progress` (0..1) is the
+    fraction of the current in-game day elapsed; collections nominally start
+    around dawn, so day_progress=0 is mapped to 06:00 and the cycle runs
+    forward 24h over one in-game day."""
+    clock_hour = (6.0 + day_progress * 24.0) % 24.0
+    return 0.5 + 0.5 * math.cos((clock_hour - 12.0) / 12.0 * math.pi)
+
+
 def _face_pt(corners, u, v):
     """Bilinear point on a quad face.
     corners = (bl, br, tr, tl): bl=near-base, br=far-base, tr=far-top, tl=near-top."""
@@ -147,9 +198,13 @@ class Renderer:
         zoom = self.camera["zoom"]
         sw, sh = self.screen.get_size()
 
+        snow = ambient.snow_level if ambient is not None else 0.0
+        day_progress = economy.get_day_progress() if economy is not None else 0.25
+        is_night = _daylight_brightness(day_progress) < 0.4
+
         # Build or reuse the static cache
-        if self._static_cache is None or self._needs_static_cache_update(city, zoom):
-            self._static_cache = self._render_static(city, zoom)
+        if self._static_cache is None or self._needs_static_cache_update(city, zoom, snow, is_night):
+            self._static_cache = self._render_static(city, zoom, snow, is_night)
 
         use_cache = self._static_cache is not None
         if use_cache:
@@ -182,9 +237,10 @@ class Renderer:
                 hovered  = hov_pos == (x, y)
 
                 if not use_cache:
-                    self.draw_tile(ix, iy, tile, selected, zoom, city)
+                    self.draw_tile(ix, iy, tile, selected, zoom, city, snow=snow)
                     if tile.type not in ("road", "green", "landfill"):
-                        self.draw_building(ix, iy, tile, zoom, today, hovered, selected)
+                        self.draw_building(ix, iy, tile, zoom, today, hovered, selected,
+                                           snow=snow, night=is_night)
                 else:
                     if tile.type not in ("road", "green", "landfill"):
                         # Skip the dynamic pass entirely when there is nothing to
@@ -210,10 +266,19 @@ class Renderer:
                                         max(2, int(2 * zoom)))
 
         # Landfill site (large refuse mound in a corner)
-        self.draw_landfill(cx, cy, city, zoom)
+        self.draw_landfill(cx, cy, city, zoom, snow=snow)
 
         # Road works barriers (drawn before trucks so trucks appear on top)
         self.draw_road_works(cx, cy, city, zoom)
+
+        # Red phone & post boxes -- sparse British street furniture
+        if ambient:
+            for box in ambient.phone_boxes.boxes:
+                biso = self.to_iso(box["x"], box["y"])
+                self.draw_phone_box(cx + biso[0] * zoom, cy + biso[1] * zoom, zoom)
+            for box in ambient.post_boxes.boxes:
+                biso = self.to_iso(box["x"], box["y"])
+                self.draw_post_box(cx + biso[0] * zoom, cy + biso[1] * zoom, zoom)
 
         # Ambient pedestrians
         if ambient:
@@ -245,8 +310,15 @@ class Renderer:
         if ambient:
             self.draw_birds(cx, cy, ambient.birds, zoom)
 
+        # Rare high-altitude aircraft crossing the map
+        if ambient:
+            self.draw_aircraft(cx, cy, ambient.aircraft, zoom)
+
         if show_areas:
             self.draw_area_overlay(cx, cy, city, zoom, today)
+
+        # Day/night tint -- warm dusk/dawn, deep blue at night, clear at midday
+        self.draw_daynight(day_progress)
 
         # Weather overlay (rain / snow)
         if economy:
@@ -258,14 +330,15 @@ class Renderer:
 
     # ─── static cache ─────────────────────────────────────────────────────────
 
-    def _needs_static_cache_update(self, city, zoom):
-        key = (id(city), round(zoom, 2))
+    def _needs_static_cache_update(self, city, zoom, snow=0.0, night=False):
+        key = (id(city), getattr(city, "version", 0), round(zoom, 2),
+               round(snow, 1), bool(night))
         if self._cache_key != key:
             self._cache_key = key
             return True
         return False
 
-    def _render_static(self, city, zoom):
+    def _render_static(self, city, zoom, snow=0.0, night=False):
         """Render all static city geometry (ground tiles + buildings) to an
         off-screen surface.  Returns None if the cache would be too large."""
         corners = [
@@ -302,10 +375,10 @@ class Renderer:
                     ix  = offset_x + iso[0] * zoom
                     iy  = offset_y + iso[1] * zoom
                     tile = city.get_tile(x, y)
-                    self.draw_tile(ix, iy, tile, False, zoom, city, static_only=True)
+                    self.draw_tile(ix, iy, tile, False, zoom, city, static_only=True, snow=snow)
                     if tile.type not in ("road", "green", "landfill"):
                         self.draw_building(ix, iy, tile, zoom, 0, False, False,
-                                           static_only=True)
+                                           static_only=True, snow=snow, night=night)
         finally:
             self.screen = old_screen
 
@@ -380,14 +453,14 @@ class Renderer:
 
     # ─── tile floor ───────────────────────────────────────────────────────────
 
-    def draw_tile(self, x, y, tile, is_selected, zoom, city=None, static_only=False):
+    def draw_tile(self, x, y, tile, is_selected, zoom, city=None, static_only=False, snow=0.0):
         hw     = (self.tile_w / 2) * zoom
         hh     = (self.tile_h / 2) * zoom
         points = [(x, y), (x + hw, y + hh), (x, y + 2 * hh), (x - hw, y + hh)]
 
         # ── ROAD ──
         if tile.type == "road":
-            pygame.draw.polygon(self.screen, ROAD_COLOR, points)
+            pygame.draw.polygon(self.screen, _snow_ground(ROAD_COLOR, snow, 0.8), points)
             if is_selected and not static_only:
                 pygame.draw.polygon(self.screen, (245, 245, 245), points,
                                     max(2, int(2 * zoom)))
@@ -395,7 +468,7 @@ class Renderer:
 
         # ── GREEN SPACE ──
         if tile.type == "green":
-            pygame.draw.polygon(self.screen, GREEN_ZONE, points)
+            pygame.draw.polygon(self.screen, _snow_ground(GREEN_ZONE, snow, 0.55), points)
             if is_selected and not static_only:
                 pygame.draw.polygon(self.screen, (245, 245, 245), points,
                                     max(2, int(2 * zoom)))
@@ -403,7 +476,7 @@ class Renderer:
 
         # ── LANDFILL ──
         if tile.type == "landfill":
-            pygame.draw.polygon(self.screen, (74, 64, 48), points)
+            pygame.draw.polygon(self.screen, _snow_ground((74, 64, 48), snow, 0.75), points)
             if zoom >= 0.7 and not static_only:
                 seed = ((int(x) * 73856093) ^ (int(y) * 19349663)) & 0xffff
                 for k in range(3):
@@ -419,7 +492,7 @@ class Renderer:
 
         # ── RESIDENTIAL / COMMERCIAL ──
         base = COMMERCIAL_ZONE if tile.type == "commercial" else RESIDENTIAL_ZONE
-        pygame.draw.polygon(self.screen, base, points)
+        pygame.draw.polygon(self.screen, _snow_ground(base, snow, 0.35), points)
 
         if zoom >= 0.8 and not static_only:
             indicator = (120, 145, 110) if tile.type == "commercial" else (130, 175, 110)
@@ -489,7 +562,7 @@ class Renderer:
         }
 
     def draw_building(self, x, y, tile, zoom, today, is_hovered=False,
-                      is_selected=False, static_only=False):
+                      is_selected=False, static_only=False, snow=0.0, night=False):
         if tile.type in ("road", "green"):
             return
 
@@ -505,6 +578,9 @@ class Renderer:
         if cc is None:
             cc = self._color_cache(tile)
             tile._ccache = cc
+        # Snow-blended colours for this draw only -- the cached original is
+        # left untouched so it's still correct once the snow melts.
+        cc_draw = _snow_cc(cc, snow) if snow > 0.01 else cc
 
         detail = zoom >= 1.55
         shadow = zoom >= 1.15
@@ -582,39 +658,39 @@ class Renderer:
                 self.screen.blit(hover_surf, (int(x - hw * 1.3), int(y - hh * 1.3)))
 
         # Walls
-        pygame.draw.polygon(self.screen, cc["wr"], list(b["right"]))
-        pygame.draw.polygon(self.screen, cc["wl"], list(b["left"]))
+        pygame.draw.polygon(self.screen, cc_draw["wr"], list(b["right"]))
+        pygame.draw.polygon(self.screen, cc_draw["wl"], list(b["left"]))
         if shadow:
-            pygame.draw.line(self.screen, cc["seam"], b["B_bot"], b["R_bot"],
+            pygame.draw.line(self.screen, cc_draw["seam"], b["B_bot"], b["R_bot"],
                              max(1, int(zoom)))
 
         # Style-specific top + detailing
         if style in ("detached", "bungalow"):
-            self._roof_hip(b, cc, zoom)
+            self._roof_hip(b, cc_draw, zoom)
             if detail:
-                self._house_details(tile, b, zoom, chimney=(style == "detached"))
+                self._house_details(tile, b, zoom, chimney=(style == "detached"), night=night)
         elif style in ("terrace", "semi"):
-            self._roof_gable(b, cc, zoom)
+            self._roof_gable(b, cc_draw, zoom)
             if detail:
-                self._house_details(tile, b, zoom, chimney=(style == "semi"))
+                self._house_details(tile, b, zoom, chimney=(style == "semi"), night=night)
         elif style in ("flats", "tower"):
-            self._roof_flat(b, cc, zoom)
+            self._roof_flat(b, cc_draw, zoom)
             if detail:
-                self._block_details(tile, b, zoom, tower=(style == "tower"))
+                self._block_details(tile, b, zoom, tower=(style == "tower"), night=night)
             if style == "tower":
                 self._rooftop_kit(b, zoom)
         elif style == "shop":
-            self._roof_flat(b, cc, zoom)
+            self._roof_flat(b, cc_draw, zoom)
             if detail:
-                self._shop_details(tile, b, zoom)
+                self._shop_details(tile, b, zoom, night=night)
         elif style == "warehouse":
-            self._roof_mono(b, cc, zoom)
+            self._roof_mono(b, cc_draw, zoom)
             if detail:
                 self._warehouse_details(tile, b, zoom)
         else:   # office / highrise
-            self._roof_flat(b, cc, zoom)
+            self._roof_flat(b, cc_draw, zoom)
             if detail:
-                self._glass_details(tile, b, zoom)
+                self._glass_details(tile, b, zoom, night=night)
             if style == "highrise":
                 self._rooftop_kit(b, zoom, mast=True)
 
@@ -809,7 +885,7 @@ class Renderer:
 
     # ─── detailing ────────────────────────────────────────────────────────────
 
-    def _house_details(self, tile, b, zoom, chimney):
+    def _house_details(self, tile, b, zoom, chimney, night=False):
         right, left = b["right"], b["left"]
         apex = b.get("_apex")
         if chimney and apex and zoom > 0.45:
@@ -823,35 +899,47 @@ class Renderer:
                              pygame.Rect(int(chx - 1), int(chy - 11 * zoom),
                                          int(ch_w + 2), int(2.5 * zoom)))
 
-        glass = (150, 196, 230)
-        frame = (238, 238, 238)
+        glass     = (150, 196, 230)
+        lit_glass = (255, 214, 120)
+        frame     = (238, 238, 238)
+        seed      = int(tile.seed * 997)
+        win_idx   = 0
         for u in (0.28, 0.66):
             q = _face_quad(right, u, 0.42, 0.16, 0.32)
             pygame.draw.polygon(self.screen, frame, self._grow(q, 1.3 * zoom))
-            pygame.draw.polygon(self.screen, glass, q)
+            lit = night and ((seed + win_idx * 31) % 5 < 2)   # ~40% of windows lit
+            pygame.draw.polygon(self.screen, lit_glass if lit else glass, q)
+            win_idx += 1
         door = _face_quad(right, 0.06, 0.0, 0.16, 0.40)
         pygame.draw.polygon(self.screen, (70, 48, 38), door)
         q = _face_quad(left, 0.5, 0.48, 0.18, 0.30)
         pygame.draw.polygon(self.screen, frame, self._grow(q, 1.3 * zoom))
-        pygame.draw.polygon(self.screen, _shade(glass, 0.85), q)
+        lit = night and ((seed + win_idx * 31) % 5 < 2)
+        pygame.draw.polygon(self.screen, lit_glass if lit else _shade(glass, 0.85), q)
 
-    def _block_details(self, tile, b, zoom, tower):
-        glass = (158, 196, 224)
+    def _block_details(self, tile, b, zoom, tower, night=False):
+        glass     = (158, 196, 224)
+        lit_glass = (255, 213, 125)
         rows  = max(3, int(tile.building_height // (9 if tower else 12)))
         cols  = 4 if tower else 3
+        # Per-building occupancy: roughly 28-83% of windows lit at night,
+        # varied by the tile's seed so blocks don't all light identically.
+        occ_pct = int(28 + (tile.seed * 997 % 1.0) * 55)
         for face, tone in ((b["right"], 1.0), (b["left"], 0.8)):
             for r in range(rows):
                 v = 0.1 + r * (0.82 / rows)
                 for c in range(cols):
                     u   = 0.12 + c * (0.78 / cols)
-                    lit = ((r * 7 + c * 3 + int(tile.seed * 100)) % 5 == 0)
-                    col = (250, 240, 180) if lit else _shade(glass, tone)
+                    lit = night and (((r * 13 + c * 7 + int(tile.seed * 1000)) % 100) < occ_pct)
+                    col = lit_glass if lit else _shade(glass, tone)
                     q   = _face_quad(face, u, v, 0.78 / cols * 0.62, 0.82 / rows * 0.55)
                     pygame.draw.polygon(self.screen, col, q)
         ent = _face_quad(b["right"], 0.34, 0.0, 0.30, 0.08)
         pygame.draw.polygon(self.screen, (60, 64, 72), ent)
 
-    def _shop_details(self, tile, b, zoom):
+    def _shop_details(self, tile, b, zoom, night=False):
+        # A minority of shops stay lit into the evening (chippy, off-licence).
+        shop_lit = night and (int(tile.seed * 733) % 100 < 25)
         for face, tone in ((b["right"], 1.0), (b["left"], 0.82)):
             fascia = [
                 _face_pt(face, 0.04, 0.30), _face_pt(face, 0.96, 0.30),
@@ -862,7 +950,8 @@ class Renderer:
                 _face_pt(face, 0.06, 0.02), _face_pt(face, 0.94, 0.02),
                 _face_pt(face, 0.94, 0.28), _face_pt(face, 0.06, 0.28),
             ]
-            pygame.draw.polygon(self.screen, _shade((150, 196, 220), tone), front)
+            front_col = (255, 200, 110) if shop_lit else (150, 196, 220)
+            pygame.draw.polygon(self.screen, _shade(front_col, tone), front)
             for i in range(4):
                 u      = 0.08 + i * 0.21
                 stripe = [
@@ -886,17 +975,21 @@ class Renderer:
         win = _face_quad(b["left"], 0.4, 0.5, 0.3, 0.18)
         pygame.draw.polygon(self.screen, (150, 190, 214), win)
 
-    def _glass_details(self, tile, b, zoom):
-        glass = (150, 198, 236)
+    def _glass_details(self, tile, b, zoom, night=False):
+        glass     = (150, 198, 236)
+        lit_glass = (255, 210, 120)
         rows  = max(3, int(tile.building_height // 14))
         cols  = 3
+        # Offices: most are dark at night bar cleaners / late workers.
+        occ_pct = int(6 + (tile.seed * 853 % 1.0) * 22)
         for face, tone in ((b["right"], 1.0), (b["left"], 0.82)):
             for r in range(rows):
                 v = 0.14 + r * (0.78 / rows)
                 for c in range(cols):
                     u = 0.14 + c * (0.74 / cols)
+                    lit = night and (((r * 11 + c * 5 + int(tile.seed * 1500)) % 100) < occ_pct)
                     q = _face_quad(face, u, v, 0.66 / cols * 0.7, 0.78 / rows * 0.55)
-                    pygame.draw.polygon(self.screen, _shade(glass, tone), q)
+                    pygame.draw.polygon(self.screen, lit_glass if lit else _shade(glass, tone), q)
             band = [
                 _face_pt(face, 0.06, 0.0), _face_pt(face, 0.94, 0.0),
                 _face_pt(face, 0.94, 0.12), _face_pt(face, 0.06, 0.12),
@@ -970,7 +1063,7 @@ class Renderer:
 
     # ─── landfill ─────────────────────────────────────────────────────────────
 
-    def draw_landfill(self, cx, cy, city, zoom):
+    def draw_landfill(self, cx, cy, city, zoom, snow=0.0):
         lf = getattr(city, "landfill", None)
         if not lf:
             return
@@ -985,7 +1078,7 @@ class Renderer:
         for i, (f, col) in enumerate([(1.0, (58, 52, 40)), (0.74, (78, 70, 52)),
                                        (0.48, (98, 88, 64)), (0.24, (120, 110, 78))]):
             ry = y - i * 7 * zoom
-            pygame.draw.ellipse(self.screen, col, pygame.Rect(
+            pygame.draw.ellipse(self.screen, _snow_ground(col, snow, 0.85), pygame.Rect(
                 int(x - base_w * f), int(ry - base_h * f * 0.5),
                 int(base_w * 2 * f), int(base_h * f)))
 
@@ -1372,6 +1465,112 @@ class Renderer:
                              (bx - ws, by - wh), (bx, by), max(1, int(zoom)))
             pygame.draw.line(self.screen, (220, 220, 220),
                              (bx + ws, by - wh), (bx, by), max(1, int(zoom)))
+
+    # ─── aircraft ─────────────────────────────────────────────────────────────
+
+    def draw_aircraft(self, cx, cy, aircraft_sys, zoom):
+        """A rare, distant airliner crossing high above the borough, with a
+        short fading contrail. Pure scenery."""
+        for p in aircraft_sys.planes:
+            sx, sy = p["start"]
+            ex, ey = p["end"]
+            t = p["t"]
+            wx = sx + (ex - sx) * t
+            wy = sy + (ey - sy) * t
+            iso = self.to_iso(wx, wy)
+            alt = 230 * zoom
+            px = cx + iso[0] * zoom
+            py = cy + iso[1] * zoom - alt
+            dirx = 1 if ex >= sx else -1
+
+            # Fading contrail behind the aircraft
+            for i in range(1, 8):
+                tt = t - i * 0.012
+                if tt < 0:
+                    break
+                twx = sx + (ex - sx) * tt
+                twy = sy + (ey - sy) * tt
+                tiso = self.to_iso(twx, twy)
+                tx = cx + tiso[0] * zoom
+                ty = cy + tiso[1] * zoom - alt
+                r = max(1, int((4 - i * 0.4) * zoom * 0.5))
+                shade = max(55, 215 - i * 20)
+                pygame.draw.circle(self.screen, (shade, shade, shade + 6), (int(tx), int(ty)), r)
+
+            s = max(2.0, 3.2 * zoom)
+            body_col = (28, 30, 36)
+            pts = [
+                (px - 6 * s * dirx, py),
+                (px + 6 * s * dirx, py),
+                (px + 2 * s * dirx, py - 1.4 * s),
+                (px - 2 * s * dirx, py - 1.4 * s),
+            ]
+            pygame.draw.polygon(self.screen, body_col, pts)
+            pygame.draw.line(self.screen, body_col,
+                             (px, py + 4 * s), (px, py - 1 * s), max(1, int(s * 0.7)))
+            if math.sin(pygame.time.get_ticks() / 250.0 + p["blink"]) > 0.6:
+                pygame.draw.circle(self.screen, (235, 60, 60),
+                                   (int(px + 6 * s * dirx), int(py)), max(1, int(s * 0.5)))
+
+    # ─── British street furniture ──────────────────────────────────────────────
+
+    def draw_phone_box(self, x, y, zoom):
+        """An iconic K6 red telephone kiosk."""
+        s = max(1.0, 2.0 * zoom)
+        w, h = 5 * s, 11 * s
+        body = pygame.Rect(int(x - w / 2), int(y - h), int(w), int(h))
+        pygame.draw.rect(self.screen, (190, 30, 30), body, border_radius=max(1, int(s * 0.4)))
+        pygame.draw.rect(self.screen, (230, 230, 230), body,
+                         max(1, int(s * 0.25)), border_radius=max(1, int(s * 0.4)))
+        pygame.draw.rect(self.screen, (150, 20, 20),
+                         pygame.Rect(body.x - int(s * 0.6), body.y - int(s * 1.4),
+                                     int(w + s * 1.2), int(s * 1.4)))
+        if zoom > 0.7:
+            for i in range(3):
+                wy = body.y + int(h * 0.18) + i * int(h * 0.22)
+                pygame.draw.line(self.screen, (230, 230, 230),
+                                 (body.x + 1, wy), (body.right - 1, wy), max(1, int(s * 0.18)))
+        shadow_r = max(1, int(2.4 * s))
+        pygame.draw.ellipse(self.screen, (15, 16, 20),
+                            pygame.Rect(int(x - shadow_r), int(y + 1),
+                                        shadow_r * 2, max(1, int(shadow_r * 0.5))))
+
+    def draw_post_box(self, x, y, zoom):
+        """A red Royal Mail pillar post box."""
+        s = max(1.0, 2.0 * zoom)
+        r = 3.2 * s
+        h = 9 * s
+        body = pygame.Rect(int(x - r), int(y - h), int(r * 2), int(h))
+        pygame.draw.rect(self.screen, (175, 25, 25), body, border_radius=int(r))
+        pygame.draw.ellipse(self.screen, (140, 18, 18),
+                            pygame.Rect(body.x, body.y - int(s), int(r * 2), int(s * 2)))
+        if zoom > 0.7:
+            slot_y = body.y + int(h * 0.28)
+            pygame.draw.rect(self.screen, (40, 40, 44),
+                             pygame.Rect(body.centerx - int(r * 0.6), slot_y,
+                                         int(r * 1.2), max(1, int(s * 0.35))))
+        shadow_r = max(1, int(2.0 * s))
+        pygame.draw.ellipse(self.screen, (15, 16, 20),
+                            pygame.Rect(int(x - shadow_r), int(y + 1),
+                                        shadow_r * 2, max(1, int(shadow_r * 0.5))))
+
+    # ─── day / night ──────────────────────────────────────────────────────────
+
+    def draw_daynight(self, day_progress):
+        """Full-screen day/night tint: warm at dusk/dawn, deep blue by night,
+        nothing at midday. A single cheap alpha blit, same trick as the
+        weather overlay."""
+        darkness = 1.0 - _daylight_brightness(day_progress)
+        if darkness <= 0.02:
+            return
+        alpha = min(165, int((darkness ** 1.4) * 170))
+        dusk_col  = (235, 130, 70)
+        night_col = (8, 14, 38)
+        col = _blend(dusk_col, night_col, min(1.0, darkness * 1.3))
+        sw, sh = self.screen.get_size()
+        overlay = self._get_alpha_surf(sw, sh)
+        overlay.fill((col[0], col[1], col[2], alpha))
+        self.screen.blit(overlay, (0, 0))
 
     # ─── weather ──────────────────────────────────────────────────────────────
 

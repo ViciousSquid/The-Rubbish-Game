@@ -405,21 +405,135 @@ class AmbientPhoneBoxes:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+#  Red Pillar Post Boxes
+# ────────────────────────────────────────────────────────────────────────────
+
+class AmbientPostBoxes:
+    """Royal Mail-red pillar post boxes. Sparser than phone boxes and set
+    along straight kerbside runs rather than junctions, so the two props
+    don't cluster on top of each other."""
+
+    def __init__(self):
+        self.boxes      = []
+        self._built_for = None
+
+    def _rebuild(self, city):
+        self.boxes = []
+        road_list = _road_list_from(city)
+        road_set = set(road_list)
+        midstreet = []
+
+        for (x, y) in road_list:
+            neighbors = [(dx, dy) for dx, dy in ADJ if (x + dx, y + dy) in road_set]
+            # A straight kerbside run has exactly two road neighbours running
+            # in opposite directions -- not a junction, not a corner.
+            if len(neighbors) == 2:
+                (dx1, dy1), (dx2, dy2) = neighbors
+                if dx1 == -dx2 and dy1 == -dy2:
+                    midstreet.append((x, y))
+
+        # Keep them rarer than phone boxes still: roughly 1 in every 140
+        # eligible kerbside tiles.
+        if midstreet:
+            num_boxes = max(1, len(midstreet) // 140)
+            chosen = random.sample(midstreet, min(len(midstreet), num_boxes))
+            for (cx, cy) in chosen:
+                self.boxes.append({
+                    "x":     float(cx),
+                    "y":     float(cy),
+                    "color": (175, 25, 25),
+                })
+        self._built_for = city
+
+    def update(self, dt, city):
+        if self._built_for is not city:
+            self._rebuild(city)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  Aircraft
+# ────────────────────────────────────────────────────────────────────────────
+
+class AmbientAircraft:
+    """A rare, distant airliner that crosses the sky above the borough from
+    one side of the map to the opposite side, then disappears. Pure scenery
+    -- no gameplay effect, just makes the city feel alive."""
+
+    MIN_GAP = 70.0       # seconds of quiet between flights, minimum
+    MAX_GAP = 190.0      # maximum
+
+    def __init__(self):
+        self.planes = []
+        self._timer = random.uniform(25.0, self.MIN_GAP)
+
+    def update(self, dt, city):
+        self._timer -= dt
+        if self._timer <= 0 and not self.planes:
+            self._spawn(city)
+            self._timer = random.uniform(self.MIN_GAP, self.MAX_GAP)
+
+        for p in list(self.planes):
+            p["t"] += dt / p["duration"]
+            if p["t"] >= 1.0:
+                self.planes.remove(p)
+
+    def _spawn(self, city):
+        w, h = city.width, city.height
+        margin = 14
+        axis = random.choice(("ns", "ew"))
+        if axis == "ns":
+            x = random.uniform(w * 0.15, w * 0.85)
+            sy, ey = -margin, h + margin
+            if random.random() < 0.5:
+                sy, ey = ey, sy
+            start, end = (x, sy), (x + random.uniform(-8, 8), ey)
+        else:
+            y = random.uniform(h * 0.15, h * 0.85)
+            sx, ex = -margin, w + margin
+            if random.random() < 0.5:
+                sx, ex = ex, sx
+            start, end = (sx, y), (ex, y + random.uniform(-8, 8))
+        self.planes.append({
+            "start":    start,
+            "end":      end,
+            "t":        0.0,
+            "duration": random.uniform(24.0, 36.0),
+            "blink":    random.uniform(0, math.tau),
+        })
+
+
+# ────────────────────────────────────────────────────────────────────────────
 #  Container
 # ────────────────────────────────────────────────────────────────────────────
 
 class AmbientState:
     """Single object wired into main.py update/render loops."""
 
+    SNOW_BUILD_SECONDS = 40.0   # seconds of snowfall to reach full settle
+    SNOW_MELT_SECONDS  = 90.0   # seconds (no snow) to fully clear again
+
     def __init__(self):
         self.traffic     = AmbientTraffic()
         self.birds       = AmbientBirds()
         self.peds        = AmbientPeds()
         self.phone_boxes = AmbientPhoneBoxes()
+        self.post_boxes  = AmbientPostBoxes()
+        self.aircraft    = AmbientAircraft()
+        self.snow_level  = 0.0   # 0..1, how deeply snow has settled on the city
 
-    def update(self, dt, city, fleet=None):
+    def update(self, dt, city, fleet=None, economy=None):
         on_strike = getattr(fleet, "on_strike", False) if fleet else False
         self.traffic.update(dt, city)
         self.birds.update(dt, city)
         self.peds.update(dt, city, on_strike=on_strike)
         self.phone_boxes.update(dt, city)
+        self.post_boxes.update(dt, city)
+        self.aircraft.update(dt, city)
+        self._update_snow(dt, economy)
+
+    def _update_snow(self, dt, economy):
+        weather = getattr(economy, "weather", None) if economy else None
+        if weather == "snow":
+            self.snow_level = min(1.0, self.snow_level + dt / self.SNOW_BUILD_SECONDS)
+        else:
+            self.snow_level = max(0.0, self.snow_level - dt / self.SNOW_MELT_SECONDS)

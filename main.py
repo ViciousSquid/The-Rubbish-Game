@@ -19,7 +19,7 @@ class WasteCityGame:
         
         # Load and set the application icon
         try:
-            icon = pygame.image.load("root/icon.ico")
+            icon = pygame.image.load("icon.ico")
             pygame.display.set_icon(icon)
         except pygame.error:
             # Fallback if the icon asset path isn't ready yet during development
@@ -148,6 +148,11 @@ class WasteCityGame:
         coord = self.renderer.screen_to_tile(screen_x, screen_y,
                                                self.screen.get_width(),
                                                self.screen.get_height())
+
+        if self.ui.editor_active():
+            self.ui.apply_editor_brush(coord["x"], coord["y"])
+            return
+
         tile = self.city.get_tile(coord["x"], coord["y"])
         if not tile:
             self.clear_selection()
@@ -233,7 +238,7 @@ class WasteCityGame:
             self.ui.show_event(self.economy.pending_event)
             self.economy.pending_event = None
 
-        self.ambient.update(sim_dt, self.city, self.fleet)
+        self.ambient.update(sim_dt, self.city, self.fleet, self.economy)
 
         if self.toast_timer > 0:
             self.toast_timer -= dt
@@ -269,15 +274,20 @@ class WasteCityGame:
             self.ui._setup_buttons()
 
         elif event.type == pygame.KEYDOWN:
+            mods = pygame.key.get_mods()
+            # Global debug-window toggle -- works in every game state.
+            if (event.key == pygame.K_d and (mods & pygame.KMOD_CTRL)
+                    and (mods & pygame.KMOD_SHIFT)):
+                self.ui.toggle_debug_window()
             # Game over: only restart (R) or quit (Esc/Q) are accepted.
-            if self.economy.has_lost:
+            elif self.economy.has_lost:
                 if event.key == pygame.K_r:
                     self._clear_and_regenerate()
                 elif event.key in (pygame.K_ESCAPE, pygame.K_q):
                     pygame.quit()
                     sys.exit()
-            # If a truck rename is in progress, all keys go to the UI.
-            elif self.ui._renaming_truck_id is None:
+            # If a truck rename is in progress, all keys go to the rename field.
+            elif self.ui._renaming_truck_id is not None:
                 self.ui.handle_key(event)
             else:
                 # Number keys toggle the floating windows directly.
@@ -292,9 +302,11 @@ class WasteCityGame:
                 elif event.key == pygame.K_g:
                     self.show_areas = not self.show_areas
                 elif event.key == pygame.K_ESCAPE:
-                    # Esc closes the focused (top) window, else clears
-                    # the tile selection.
-                    if self.ui.windows:
+                    # Esc exits editor mode in one press (no two-step).
+                    # If no editor mode, close the focused window; else clear selection.
+                    if self.ui._editor_mode:
+                        self.ui._exit_editor_mode()
+                    elif self.ui.windows:
                         self.ui.close_window(self.ui.windows[-1])
                     else:
                         self.clear_selection()
