@@ -1,5 +1,6 @@
 import pygame
 import sys
+import math
 from city import CityGenerator
 from renderer import Renderer
 from economy import Economy
@@ -22,7 +23,7 @@ class WasteCityGame:
         try:
             icon = pygame.image.load("icon.ico")
             pygame.display.set_icon(icon)
-        except pygame.error:
+        except (pygame.error, FileNotFoundError):
             # Fallback if the icon asset path isn't ready yet during development
             pass
 
@@ -60,6 +61,16 @@ class WasteCityGame:
 
         self._center_camera()
 
+        # ── Game state / start menu ──────────────────────────────────────────
+        # The city generated above becomes the living backdrop behind the menu.
+        self.state = "menu"            # "menu" | "playing"
+        self._menu_cam_t = 0.0         # drives the slow cinematic backdrop pan
+        self.settings = {
+            "day_length": "normal",    # short | normal | long
+            "events": "normal",        # calm | normal | chaotic
+            "show_areas": True,
+        }
+
     # ---------------------------------------------------------------- actions
     def _toggle_areas(self):
         self.show_areas = not self.show_areas
@@ -81,6 +92,87 @@ class WasteCityGame:
     def set_toast(self, message):
         self.toast = message
         self.toast_timer = 4.0
+
+    # -------------------------------------------------------------- main menu
+    def _apply_settings(self):
+        """Push the menu settings onto the freshly-created game objects."""
+        self.show_areas = self.settings.get("show_areas", True)
+        day = {"short": 38, "normal": 55, "long": 78}
+        self.economy.day_duration = day.get(self.settings.get("day_length"), 55)
+        ev = {"calm": 0.16, "normal": 0.30, "chaotic": 0.48}
+        self.economy.event_chance = ev.get(self.settings.get("events"), 0.30)
+
+    def _start_new_game(self):
+        self._clear_and_regenerate()
+        self._apply_settings()
+        self.toast = ""
+        self.toast_timer = 0.0
+        self.state = "playing"
+
+    def _menu_load(self):
+        ok, msg = savegame.load_game(self)
+        self.set_toast(msg)
+        if ok:
+            self.show_areas = self.settings.get("show_areas", self.show_areas)
+            self.state = "playing"
+
+    def _menu_dispatch(self, action):
+        if action == "new":
+            self._start_new_game()
+        elif action == "load":
+            self._menu_load()
+        elif action == "settings":
+            self.ui._menu_settings_open = True
+        elif action == "quit":
+            pygame.quit()
+            sys.exit()
+        elif action == "menu_back":
+            self.ui._menu_settings_open = False
+        elif action == "set_day_length":
+            order = ["short", "normal", "long"]
+            cur = self.settings.get("day_length", "normal")
+            self.settings["day_length"] = order[(order.index(cur) + 1) % len(order)]
+        elif action == "set_events":
+            order = ["calm", "normal", "chaotic"]
+            cur = self.settings.get("events", "normal")
+            self.settings["events"] = order[(order.index(cur) + 1) % len(order)]
+        elif action == "set_areas":
+            self.settings["show_areas"] = not self.settings.get("show_areas", True)
+
+    def _handle_menu_event(self, event):
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            action = self.ui.menu_resolve(event.pos)
+            if action:
+                self._menu_dispatch(action)
+        elif event.type == pygame.KEYDOWN:
+            if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                if self.ui._menu_settings_open:
+                    self.ui._menu_settings_open = False
+                else:
+                    pygame.quit()
+                    sys.exit()
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                if not self.ui._menu_settings_open:
+                    self._start_new_game()
+
+    def _step_backdrop(self, dt):
+        """Keep the city alive behind the menu: ambient life, driving lorries
+        and bin fill, plus a slow cinematic pan. The economy, day count and
+        lose condition are deliberately left frozen."""
+        self._menu_cam_t += dt
+        cx = self.city.width * 0.5 + math.sin(self._menu_cam_t * 0.10) * self.city.width * 0.30
+        cy = self.city.height * 0.5 + math.cos(self._menu_cam_t * 0.07) * self.city.height * 0.22
+        self.center_camera_on(cx, cy)
+
+        self.city.update(dt, self.waste.fill_multiplier())
+        self.fleet.update(dt)
+        self.ambient.update(dt, self.city, self.fleet, self.economy)
+
+        if self.toast_timer > 0:
+            self.toast_timer -= dt
+            if self.toast_timer <= 0:
+                self.toast = ""
+        self.ui.update(dt)
 
     def open_planner_tab(self, tab):
         # Back-compat shim: opens the corresponding floating window.
@@ -261,10 +353,17 @@ class WasteCityGame:
             g = int(40 + (22 - 40) * t)
             pygame.draw.line(self.screen, (g, g, int(g * 1.1)), (0, i), (w, i), 2)
 
-        self.renderer.render(self.city, self.fleet, self.selected_tile,
-                             self.economy.get_day_of_week(), self.show_areas,
-                             self.hovered_tile, self.economy, self.ambient)
-        self.ui.draw(self.screen)
+        menu = self.state == "menu"
+        sel = None if menu else self.selected_tile
+        hov = None if menu else self.hovered_tile
+        areas = self.show_areas and not menu
+        self.renderer.render(self.city, self.fleet, sel,
+                             self.economy.get_day_of_week(), areas,
+                             hov, self.economy, self.ambient)
+        if menu:
+            self.ui.draw_main_menu(self.screen)
+        else:
+            self.ui.draw(self.screen)
         pygame.display.flip()
 
     # ------------------------------------------------------------------- loop
@@ -276,6 +375,9 @@ class WasteCityGame:
         elif event.type == pygame.VIDEORESIZE:
             self.screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
             self.ui._setup_buttons()
+
+        elif self.state == "menu":
+            self._handle_menu_event(event)
 
         elif event.type == pygame.KEYDOWN:
             mods = pygame.key.get_mods()
@@ -371,6 +473,11 @@ class WasteCityGame:
             frame_dt = min(frame_dt, 0.1)      # clamp a hitch (avoid death spiral)
             for event in pygame.event.get():
                 self._process_event(event)
+
+            if self.state == "menu":
+                self._step_backdrop(frame_dt)
+                self.render()
+                continue
 
             self._update_realtime(frame_dt)
 

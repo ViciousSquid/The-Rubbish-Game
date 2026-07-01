@@ -135,6 +135,8 @@ class FontSystem:
                 continue
         if mono_font is None:
             mono_font = base_font
+        self.base = base_font
+        self.mono = mono_font
         specs = {
             "display": (base_font, 28, True),
             "display_sub": (base_font, 18, True),
@@ -156,6 +158,15 @@ class FontSystem:
             self._fonts[key] = pygame.font.SysFont(name, size, bold=bold)
     def get(self, key):
         return self._fonts.get(key, self._fonts["body"])
+
+    def custom(self, size, bold=False):
+        """A cached SysFont at an arbitrary size (used for the menu title)."""
+        key = ("__custom__", size, bold)
+        f = self._fonts.get(key)
+        if f is None:
+            f = pygame.font.SysFont(self.base, size, bold=bold)
+            self._fonts[key] = f
+        return f
     def render(self, key, text, color):
         return self._fonts[key].render(text, True, color)
     def size(self, key, text):
@@ -424,6 +435,12 @@ class UIManager:
             "debug":   self._tab_debug,
         }
         self._setup_buttons()
+
+        # ── Main menu ─────────────────────────────────────────────────────────
+        self.menu_buttons = []           # (rect, action) rebuilt each menu draw
+        self._menu_settings_open = False
+        self._title_cache = None         # cached grungy title surface
+        self._title_cache_w = None       # screen width it was built for
 
     def _setup_buttons(self):
         # Toolbar buttons are rebuilt each frame in _draw_toolbar (they depend on
@@ -763,6 +780,215 @@ class UIManager:
     def _flash_insufficient(self):
         self._insufficient_funds_flash = True
         self._flash_timer = 0
+
+    # =====================================================================
+    #  Main menu  (title card over the live, animating city)
+    # =====================================================================
+    MAIN_MENU_ITEMS = [
+        ("new",      "NEW GAME"),
+        ("load",     "LOAD GAME"),
+        ("settings", "SETTINGS"),
+        ("quit",     "QUIT"),
+    ]
+
+    _DAY_LENGTH_LABEL = {"short": "Short", "normal": "Normal", "long": "Long"}
+    _EVENTS_LABEL = {"calm": "Calm", "normal": "Normal", "chaotic": "Chaotic"}
+
+    # Title styling
+    _TITLE_LINES = ["THE", "RUBBISH", "GAME"]
+    _TITLE_FACE = (240, 196, 42)      # spray-can yellow
+    _TITLE_OUTLINE = (16, 14, 10)     # near-black keyline
+    _TITLE_SPECK = (34, 28, 16)       # grunge fleck colour
+
+    def _outlined_title_line(self, font, text, radius, shadow_off):
+        """One title line: soft drop shadow + thick black keyline + yellow face,
+        on its own transparent surface."""
+        face = font.render(text, True, self._TITLE_FACE)
+        key = font.render(text, True, self._TITLE_OUTLINE)
+        bw, bh = face.get_size()
+        pad = radius + shadow_off + 6
+        surf = pygame.Surface((bw + pad * 2, bh + pad * 2), pygame.SRCALPHA)
+        cx, cy = pad, pad
+        # Drop shadow (semi-transparent black, offset down-right).
+        shadow = key.copy()
+        shadow.set_alpha(150)
+        surf.blit(shadow, (cx + shadow_off, cy + shadow_off))
+        # Thick keyline: stamp the black glyph over a filled disc of offsets.
+        r2 = radius * radius
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                if dx * dx + dy * dy <= r2:
+                    surf.blit(key, (cx + dx, cy + dy))
+        # Yellow face on top.
+        surf.blit(face, (cx, cy))
+        return surf
+
+    def _speckle_title(self, surf):
+        """Scatter stable dark flecks over the yellow face for a distressed look
+        (seeded so it never flickers frame-to-frame)."""
+        import random as _random
+        rng = _random.Random(0xB1A5)
+        mask = pygame.mask.from_surface(surf, 40)
+        w, h = surf.get_size()
+        for _ in range((w * h) // 850):
+            x = rng.randint(0, w - 1)
+            y = rng.randint(0, h - 1)
+            if not mask.get_at((x, y)):
+                continue
+            px = surf.get_at((x, y))
+            if px[0] > 150 and px[1] > 120 and px[2] < 120:   # only the yellow
+                sz = 2 if rng.random() < 0.25 else 1
+                pygame.draw.rect(surf, self._TITLE_SPECK, (x, y, sz, sz))
+
+    def _title_line_height(self, size):
+        f = self.fonts.custom(size, True)
+        radius = max(3, size // 18)
+        shadow_off = max(4, size // 11)
+        return f.get_height() + 2 * (radius + shadow_off + 6)
+
+    def _menu_title_surface(self, screen_w, screen_h):
+        if self._title_cache is not None and self._title_cache_w == (screen_w, screen_h):
+            return self._title_cache
+
+        max_w = min(screen_w * 0.60, 1040)
+        max_h = screen_h * 0.56          # leave room for the button row + hint
+        # Grow the font until the widest line ("RUBBISH") fills max_w *or* the
+        # three stacked lines would exceed the vertical budget.
+        size = 36
+        while size < 260:
+            nxt = size + 4
+            too_wide = self.fonts.custom(nxt, True).size("RUBBISH")[0] > max_w
+            stack_h = 3 * self._title_line_height(nxt) + 2 * int(nxt * 0.04)
+            if too_wide or stack_h > max_h:
+                break
+            size += 4
+        font = self.fonts.custom(size, True)
+        radius = max(3, size // 18)
+        shadow_off = max(4, size // 11)
+        line_gap = int(size * 0.04)
+
+        parts = [self._outlined_title_line(font, ln, radius, shadow_off)
+                 for ln in self._TITLE_LINES]
+        total_w = max(p.get_width() for p in parts)
+        total_h = sum(p.get_height() for p in parts) + line_gap * (len(parts) - 1)
+        surf = pygame.Surface((total_w, total_h), pygame.SRCALPHA)
+        y = 0
+        for p in parts:
+            surf.blit(p, ((total_w - p.get_width()) // 2, y))
+            y += p.get_height() + line_gap
+        self._speckle_title(surf)
+
+        self._title_cache = surf
+        self._title_cache_w = (screen_w, screen_h)
+        return surf
+
+    def draw_main_menu(self, screen):
+        """Render the title card on top of the already-drawn, animating city."""
+        self.ui = UIPrimitives(screen, self.fonts)
+        c = self.ui.c
+        w, h = screen.get_size()
+        self._screen_size = (w, h)
+        self.menu_buttons = []
+
+        # Faint top/bottom vignette only -- the city itself stays bright, as in
+        # the reference. The title's own keyline keeps it readable.
+        vig = pygame.Surface((w, h), pygame.SRCALPHA)
+        for i in range(90):
+            a = int(150 * (1 - i / 90))
+            pygame.draw.line(vig, (8, 10, 16, a), (0, i), (w, i))
+            pygame.draw.line(vig, (8, 10, 16, a), (0, h - 1 - i), (w, h - 1 - i))
+        screen.blit(vig, (0, 0))
+
+        title = self._menu_title_surface(w, h)
+        tx = (w - title.get_width()) // 2
+        ty = int(h * 0.06)
+        screen.blit(title, (tx, ty))
+        below = ty + title.get_height()
+
+        if self._menu_settings_open:
+            self._draw_menu_settings(screen, w, h, below)
+        else:
+            self._draw_menu_main(screen, w, h, below)
+
+        if getattr(self.game, "toast", "") and self.game.toast_timer > 0:
+            tw = self.fonts.size("body_s", self.game.toast)[0]
+            self.ui.text("body_s", self.game.toast, c.ACCENT_CORAL,
+                         (w - tw) // 2, h - 34)
+
+    def _menu_button_row(self, w, h, below):
+        """Geometry for the centred button row: (rects, bw, bh, start_x, row_y)."""
+        n = len(self.MAIN_MENU_ITEMS)
+        gap = 16
+        bh = 52
+        bw = min(210, max(150, (w - (n + 1) * gap) // n))
+        total = n * bw + (n - 1) * gap
+        start_x = (w - total) // 2
+        row_y = max(below + 34, int(h * 0.66))
+        row_y = min(row_y, h - bh - 46)
+        return bw, bh, gap, start_x, row_y
+
+    def _draw_menu_main(self, screen, w, h, below):
+        c = self.ui.c
+        mouse = pygame.mouse.get_pos()
+        bw, bh, gap, x, row_y = self._menu_button_row(w, h, below)
+
+        # Subtle darkened strip behind the row for legibility over the city.
+        total = len(self.MAIN_MENU_ITEMS) * bw + (len(self.MAIN_MENU_ITEMS) - 1) * gap
+        strip = pygame.Surface((total + 40, bh + 28), pygame.SRCALPHA)
+        strip.fill((10, 12, 18, 120))
+        screen.blit(strip, (x - 20, row_y - 14))
+
+        for action, label in self.MAIN_MENU_ITEMS:
+            rect = pygame.Rect(x, row_y, bw, bh)
+            self.ui.button(rect, label, hovered=rect.collidepoint(mouse),
+                           accent=(action == "new"))
+            self.menu_buttons.append((rect, action))
+            x += bw + gap
+
+        hint = "Enter = New Game    Esc = Quit    F5 / F9 quick save & load in game"
+        hw = self.fonts.size("body_s", hint)[0]
+        self.ui.text("body_s", hint, c.TEXT_MUTED, (w - hw) // 2, row_y + bh + 18)
+
+    def _draw_menu_settings(self, screen, w, h, below):
+        c = self.ui.c
+        mouse = pygame.mouse.get_pos()
+        s = getattr(self.game, "settings", {})
+
+        pw, ph = 480, 300
+        px = (w - pw) // 2
+        py = max(below + 24, int(h * 0.40))
+        py = min(py, h - ph - 30)
+        self.ui.panel(px, py, pw, ph, border=True)
+
+        ix = px + 28
+        iy = py + 22
+        self.ui.text("h2", "Settings", c.TEXT_PRIMARY, ix, iy)
+        iy += 44
+        rows = [
+            ("set_day_length", "Day length",
+             self._DAY_LENGTH_LABEL.get(s.get("day_length", "normal"), "Normal")),
+            ("set_events", "Event frequency",
+             self._EVENTS_LABEL.get(s.get("events", "normal"), "Normal")),
+            ("set_areas", "Show collection areas",
+             "On" if s.get("show_areas", True) else "Off"),
+        ]
+        for action, label, value in rows:
+            self.ui.text("body", label, c.TEXT_SECONDARY, ix, iy + 8)
+            chip = pygame.Rect(px + pw - 28 - 150, iy, 150, 34)
+            self.ui.button(chip, value, hovered=chip.collidepoint(mouse))
+            self.menu_buttons.append((chip, action))
+            iy += 50
+        iy += 8
+        back = pygame.Rect(ix, iy, 150, 46)
+        self.ui.button(back, "BACK", hovered=back.collidepoint(mouse), accent=True)
+        self.menu_buttons.append((back, "menu_back"))
+
+    def menu_resolve(self, pos):
+        """Return the action string for a click at `pos`, or None."""
+        for rect, action in self.menu_buttons:
+            if rect.collidepoint(pos):
+                return action
+        return None
 
     def draw(self, screen):
         self.ui = UIPrimitives(screen, self.fonts)
