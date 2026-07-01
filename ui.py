@@ -2,6 +2,7 @@ import pygame
 import math
 from city import AREA_COLS, AREA_ROWS, RES_STYLE_WEIGHTS, COM_STYLE_WEIGHTS
 import xmlio
+import savegame
 from procurement import VEHICLE_CATALOGUE
 
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -1478,6 +1479,13 @@ class UIManager:
         ui.value(f"x{waste.fill_multiplier():.2f}", x + 140, ty, c.ACCENT_TEAL)
         ui.label("Satisfaction ceiling", x + 280, ty)
         ui.value(f"{int(waste.satisfaction_ceiling())}%", x + 450, ty, c.ACCENT_TEAL)
+        ty += 26
+        cont = waste.contamination_rate()
+        cont_col = c.ACCENT_TEAL if cont < 0.10 else (c.TEXT_MUTED if cont < 0.16 else c.ACCENT_CORAL)
+        ui.label("Recycling rejected", x, ty)
+        ui.value(waste.contamination_label(), x + 140, ty, cont_col)
+        if cont >= 0.10:
+            ui.text("caption", "Add food/garden caddies to keep loads clean.", c.TEXT_DIM, x + 280, ty + 2)
 
     def _tab_fleet(self, screen, x, y, w, h):
         ui = self.ui
@@ -2217,7 +2225,14 @@ class UIManager:
 
     def _tab_data(self, screen, x, y, w, h):
         ui = self.ui
-        c = ui.c 
+        c = ui.c
+        ui.text("body_s", "Save / load the whole borough (full game state)", c.TEXT_MUTED, x, y)
+        sy = y + 32
+        sv = pygame.Rect(x, sy, 240, 40)
+        ld = pygame.Rect(sv.right + 16, sy, 240, 40)
+        self._pbtn(screen, sv, "Save game  (F5)", self._save_game, accent=True)
+        self._pbtn(screen, ld, "Load game  (F9)", self._load_game)
+        y = sy + 60
         ui.text("body_s", "Export the borough plan to a spreadsheet (.ods or .xml)", c.TEXT_MUTED, x, y)
         ty = y + 32
         exp = pygame.Rect(x, ty, 240, 40)
@@ -2939,6 +2954,14 @@ class UIManager:
 
     def _import_xml(self):
         ok, msg = xmlio.prompt_import(self.game)
+        self.game.set_toast(msg)
+
+    def _save_game(self):
+        ok, msg = savegame.save_game(self.game)
+        self.game.set_toast(msg)
+
+    def _load_game(self):
+        ok, msg = savegame.load_game(self.game)
         self.game.set_toast(msg)
 
     def _draw_wrapped_text(self, screen, text, x, y, max_width, font, colour):

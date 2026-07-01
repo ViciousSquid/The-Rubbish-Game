@@ -7,6 +7,7 @@ from ui import UIManager
 from fleet import FleetManager
 from waste import WastePolicy
 from ambient import AmbientState
+import savegame
 
 CITY_W = 60
 CITY_H = 60
@@ -168,16 +169,15 @@ class WasteCityGame:
         self.hovered_tile = None
 
     # ----------------------------------------------------------------- update
-    def update(self, dt):
+    def _update_realtime(self, dt):
+        """Real-time (unscaled) pass: camera, hover, transient UI. Runs once per
+        rendered frame regardless of game speed."""
         # Once the borough is insolvent the simulation halts — only the
         # game-over overlay remains, awaiting a restart.
         if self.economy.has_lost:
             self.economy.game_over_timer += dt
             self.ui.update(dt)
             return
-
-        # Simulation dt is scaled by game speed; UI/camera use real dt
-        sim_dt = dt * self.speed
 
         # Camera movement from held keys (the map stays live with windows open;
         # suppressed only while typing a truck rename).
@@ -203,6 +203,18 @@ class WasteCityGame:
         else:
             self.hovered_tile = None
 
+        if self.toast_timer > 0:
+            self.toast_timer -= dt
+            if self.toast_timer <= 0:
+                self.toast = ""
+
+        self.ui.update(dt)
+        self._clamp_camera()
+
+    def _step_sim(self, sim_dt):
+        """One fixed-size simulation tick. The game loop calls this N times per
+        frame at Nx speed, so the sim is deterministic and independent of frame
+        rate; only this pass advances game time."""
         bin_mult = (self.economy.get_bin_rate_multiplier()
                     * self.waste.fill_multiplier()
                     * self.economy.seasonal_fill_mult())
@@ -239,14 +251,6 @@ class WasteCityGame:
             self.economy.pending_event = None
 
         self.ambient.update(sim_dt, self.city, self.fleet, self.economy)
-
-        if self.toast_timer > 0:
-            self.toast_timer -= dt
-            if self.toast_timer <= 0:
-                self.toast = ""
-
-        self.ui.update(dt)
-        self._clamp_camera()
 
     # ---------------------------------------------------------------- render
     def render(self):
@@ -296,6 +300,12 @@ class WasteCityGame:
                             pygame.K_5: "finance", pygame.K_6: "data"}
                 if event.key in win_keys:
                     self.ui.toggle_window(win_keys[event.key])
+                elif event.key == pygame.K_F5:
+                    ok, msg = savegame.save_game(self)
+                    self.set_toast(msg)
+                elif event.key == pygame.K_F9:
+                    ok, msg = savegame.load_game(self)
+                    self.set_toast(msg)
                 elif event.key == pygame.K_TAB:
                     # Tab toggles the most-used management window.
                     self.ui.toggle_window("rounds")
@@ -348,12 +358,36 @@ class WasteCityGame:
             self.mouse["y"] = event.pos[1]
 
     def run(self):
+        # Fixed-timestep sim: the simulation always advances in FIXED_DT ticks,
+        # and game speed simply runs more ticks per frame. This keeps physics /
+        # collection deterministic and frame-rate independent, and lets high
+        # speeds (5x/10x) scale truck throughput correctly rather than starving
+        # it. Camera and UI still update once per frame on real dt.
+        FIXED_DT = 1.0 / 60.0
+        MAX_SUBSTEPS = 16          # hard cap so a stall can't spiral
+        accumulator = 0.0
         while True:
-            dt = self.clock.tick(60) / 1000.0
+            frame_dt = self.clock.tick(60) / 1000.0
+            frame_dt = min(frame_dt, 0.1)      # clamp a hitch (avoid death spiral)
             for event in pygame.event.get():
                 self._process_event(event)
-            if self.running:
-                self.update(dt)
+
+            self._update_realtime(frame_dt)
+
+            if self.running and not self.economy.has_lost:
+                accumulator += frame_dt * self.speed
+                steps = 0
+                while accumulator >= FIXED_DT and steps < MAX_SUBSTEPS:
+                    self._step_sim(FIXED_DT)
+                    steps += 1
+                    accumulator -= FIXED_DT
+                    if self.economy.has_lost:
+                        break
+                if steps >= MAX_SUBSTEPS:
+                    accumulator = 0.0          # drop the backlog we couldn't run
+            else:
+                accumulator = 0.0
+
             self.render()
 
 

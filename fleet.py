@@ -478,13 +478,28 @@ class FleetManager:
         return TRUCK_SPEED * truck.get("speed_factor", 1.0) * crew_factor
 
     def _follow_path(self, truck, dt):
+        # Spend the whole tick's movement budget, crossing as many path nodes as
+        # it reaches. Popping only one node per call (the old behaviour) capped a
+        # truck at one node per frame, so at high game speed sim-time advanced
+        # but collection throughput did not -- trucks fell behind. Consuming the
+        # full budget here makes throughput scale with dt (and with sub-steps).
         if not truck["path"]:
             return True
-        tx, ty = truck["path"][0]
-        if abs(tx - truck["x"]) > 1e-3:
-            truck["facing"] = 1 if tx > truck["x"] else -1
-        if self._move_towards(truck, tx, ty, self._truck_speed(truck), dt):
-            truck["path"].pop(0)
+        budget = self._truck_speed(truck) * dt
+        while truck["path"] and budget > 1e-9:
+            tx, ty = truck["path"][0]
+            if abs(tx - truck["x"]) > 1e-3:
+                truck["facing"] = 1 if tx > truck["x"] else -1
+            dx, dy = tx - truck["x"], ty - truck["y"]
+            dist = math.hypot(dx, dy)
+            if dist <= budget:
+                truck["x"], truck["y"] = tx, ty
+                truck["path"].pop(0)
+                budget -= dist
+            else:
+                truck["x"] += dx / dist * budget
+                truck["y"] += dy / dist * budget
+                budget = 0.0
         return len(truck["path"]) == 0
 
     # ----------------------------------------------------------------- claims

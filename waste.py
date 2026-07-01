@@ -130,6 +130,34 @@ class WastePolicy:
         offer (40 floor up to ~100 with the full set)."""
         return min(100.0, 70.0 + sum(s.satisfaction for s in self.enabled_streams()))
 
+    def contamination_rate(self):
+        """Fraction of the dry-recycling stream that arrives too contaminated to
+        process and is rejected at the MRF -- it's redirected to landfill,
+        earns no credit, and counts against the diversion target.
+
+        It's *derived* from policy rather than a raw knob: dry recycling fouls
+        badly when residents have nowhere else to put food scraps or garden
+        waste, so offering those caddies is what keeps loads clean. This gives
+        the food/garden toggles a hard economic payoff beyond satisfaction."""
+        rec = self.get("recycling")
+        if not rec or not rec.enabled:
+            return 0.0
+        rate = 0.06                                   # irreducible baseline
+        food = self.get("food")
+        if not (food and food.enabled):
+            rate += 0.10                              # food scraps in the dry bin
+        garden = self.get("garden")
+        if not (garden and garden.enabled):
+            rate += 0.03                              # grass/soil fouling paper
+        return max(0.0, min(0.30, rate))
+
+    def contamination_label(self):
+        r = self.contamination_rate()
+        if r <= 0:
+            return "n/a"
+        band = "low" if r < 0.10 else "high" if r >= 0.16 else "moderate"
+        return f"{r * 100:.0f}% ({band})"
+
     def split_volume(self, volume):
         """Apportion a chunk of collected volume across the enabled streams by
         fill share, returning {stream_id: units}."""
@@ -150,15 +178,27 @@ class WastePolicy:
         gate = 0.0
         recycle = 0.0
         garden = 0.0
+        cont = self.contamination_rate()
+        residual_stream = self.get("residual")
+        residual_gate = (residual_stream.gate_fee * landfill_tax_mult
+                         if residual_stream else 0.0)
         for sid, units in self.split_volume(volume).items():
             s = self.get(sid)
             unit_gate = s.gate_fee
             if sid == "residual":
                 unit_gate *= landfill_tax_mult
-            gate += units * unit_gate
-            if sid == "garden":
+            if sid == "recycling" and cont > 0.0:
+                # Rejected fraction is landfilled at the residual gate fee and
+                # earns nothing; only the clean remainder is credited.
+                rejected = units * cont
+                clean = units - rejected
+                gate += clean * unit_gate + rejected * residual_gate
+                recycle += clean * s.credit
+            elif sid == "garden":
+                gate += units * unit_gate
                 garden += units * s.credit
             else:
+                gate += units * unit_gate
                 recycle += units * s.credit
         return gate, recycle, garden
 
@@ -168,9 +208,14 @@ class WastePolicy:
         diversion target / fine system in the economy."""
         residual = 0.0
         diverted = 0.0
+        cont = self.contamination_rate()
         for sid, units in self.split_volume(volume).items():
             if sid == "residual":
                 residual += units
+            elif sid == "recycling" and cont > 0.0:
+                # Rejected loads are landfilled, so they don't count as diverted.
+                residual += units * cont
+                diverted += units * (1.0 - cont)
             else:
                 diverted += units
         return residual, diverted
