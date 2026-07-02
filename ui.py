@@ -4,6 +4,7 @@ import os
 from city import AREA_COLS, AREA_ROWS, RES_STYLE_WEIGHTS, COM_STYLE_WEIGHTS
 import xmlio
 import savegame
+import citystore
 from procurement import VEHICLE_CATALOGUE
 from assets import asset_path
 
@@ -472,8 +473,24 @@ class UIManager:
         # ── Main menu ─────────────────────────────────────────────────────────
         self.menu_buttons = []           # (rect, action) rebuilt each menu draw
         self._menu_settings_open = False
+        self._menu_newgame_open = False  # "Start New Game" chooser (Random + saved)
+        self._menu_editor_open = False   # "City Editor" chooser (Blank/Partial/Full + saved)
         self._title_cache = None         # cached grungy title surface
         self._title_cache_w = None       # screen width it was built for
+        # Static menu chrome, cached per screen size (rebuilt only on resize).
+        self._vignette_cache = None      # bottom vignette surface
+        self._vignette_cache_sz = None
+        self._menu_bar_cache = None      # translucent top-bar background strip
+        self._menu_bar_cache_w = None
+        # Dedication badge: static composite (shadow + keyline + face) built once;
+        # only the live pulse scale changes, applied via a per-frame rotozoom.
+        self._dedication_cache = None
+        self._dedication_cache_size = None
+
+        # ── Standalone city-editor state ─────────────────────────────────────
+        self._editor_top_widgets = []    # (rect, action) for the editor top bar
+        self._city_name_active = False   # save-as name prompt visible
+        self._city_name_buffer = ""
 
     def _setup_buttons(self):
         # Toolbar buttons are rebuilt each frame in _draw_toolbar (they depend on
@@ -572,6 +589,10 @@ class UIManager:
             changed = city.editor_place_building(tx, ty, style)
             if changed:
                 self._debug_status = f"Built {STYLE_LABELS.get(style, style)} at ({tx},{ty})."
+        elif mode == "landfill":
+            changed = city.editor_place_landfill(tx, ty)
+            if changed:
+                self._debug_status = f"Sited landfill at ({tx},{ty})."
         if not changed:
             self._debug_status = "Can't apply that tool there."
         return changed
@@ -820,6 +841,7 @@ class UIManager:
     MAIN_MENU_ITEMS = [
         ("new",      "NEW GAME"),
         ("load",     "LOAD GAME"),
+        ("editor",   "CITY EDITOR"),
         ("settings", "SETTINGS"),
         ("quit",     "QUIT"),
     ]
@@ -935,9 +957,64 @@ class UIManager:
             y += p.get_height() + line_gap
         self._apply_distress(surf)
 
+        # Remember the chosen face size so the pulsing "(for Sarah)" dedication
+        # (drawn live each frame, not baked in) can scale relative to it.
+        self._title_font_size = size
+
         self._title_cache = surf
         self._title_cache_w = (screen_w, screen_h)
         return surf
+
+    def _draw_title_dedication(self, screen, tx, ty, title_w, title_h):
+        """Live-drawn white "(for Sarah)" dedication: offset to the right of
+        centre, a black drop shadow for legibility, tilted 15deg, and gently
+        pulsing larger/smaller. Rendered per-frame so it can animate."""
+        size = getattr(self, "_title_font_size", 120)
+        base = max(16, int(size * 0.15))
+
+        # Smooth pulse ~+-12% of base size, ~2.6s period.
+        t = pygame.time.get_ticks() / 1000.0
+        scale = 1.0 + 0.12 * math.sin(t * 2.4)
+
+        # The badge composite (drop shadow + black keyline ring + white face) is
+        # identical every frame -- only the pulse scale changes. Build it once at
+        # the base size and cache it; the per-frame cost is then a single
+        # rotozoom rather than a fresh surface + an O(r^2) ring-blit loop.
+        if self._dedication_cache is None or self._dedication_cache_size != base:
+            font = self.fonts.custom(base, bold=True)
+            text = "(for Sarah)"
+            face = font.render(text, True, (255, 255, 255))
+            key = font.render(text, True, (0, 0, 0))
+
+            r = max(2, base // 12)              # keyline / outline radius
+            off = max(3, base // 8)             # drop-shadow offset
+            pad = r + off + 2
+            layer = pygame.Surface((face.get_width() + pad * 2,
+                                    face.get_height() + pad * 2), pygame.SRCALPHA)
+            cx = cy = pad
+            sh = key.copy()
+            sh.set_alpha(190)
+            layer.blit(sh, (cx + off, cy + off))    # drop shadow
+            for dx in range(-r, r + 1):             # black keyline ring
+                for dy in range(-r, r + 1):
+                    if dx * dx + dy * dy <= r * r:
+                        layer.blit(key, (cx + dx, cy + dy))
+            layer.blit(face, (cx, cy))              # white face
+            self._dedication_cache = layer
+            self._dedication_cache_size = base
+
+        # Pulse purely through rotozoom's scale (also scales the outline, which
+        # looks right) -- no rebuild, no ring loop, per frame.
+        badge = pygame.transform.rotozoom(self._dedication_cache, 15, scale)
+
+        # Anchor to a fixed point (right of centre, just below the title) and
+        # blit centred on it so the pulse grows/shrinks symmetrically.
+        anchor_x = tx + int(title_w * 0.74)
+        anchor_y = ty + title_h + int(size * 0.05)
+        px = anchor_x - badge.get_width() // 2
+        py = anchor_y - badge.get_height() // 2
+        px = min(px, screen.get_width() - badge.get_width() - 6)   # keep on-screen
+        screen.blit(badge, (px, py))
 
     MENU_BAR_H = 46
 
@@ -950,12 +1027,16 @@ class UIManager:
         self._screen_size = (w, h)
         self.menu_buttons = []
 
-        # Faint bottom vignette for depth (top is covered by the bar).
-        vig = pygame.Surface((w, h), pygame.SRCALPHA)
-        for i in range(80):
-            a = int(140 * (1 - i / 80))
-            pygame.draw.line(vig, (8, 10, 16, a), (0, h - 1 - i), (w, h - 1 - i))
-        screen.blit(vig, (0, 0))
+        # Faint bottom vignette for depth (top is covered by the bar). Static for
+        # a given window size, so build it once and reuse until the size changes.
+        if self._vignette_cache is None or self._vignette_cache_sz != (w, h):
+            vig = pygame.Surface((w, h), pygame.SRCALPHA)
+            for i in range(80):
+                a = int(140 * (1 - i / 80))
+                pygame.draw.line(vig, (8, 10, 16, a), (0, h - 1 - i), (w, h - 1 - i))
+            self._vignette_cache = vig
+            self._vignette_cache_sz = (w, h)
+        screen.blit(self._vignette_cache, (0, 0))
 
         # Title, centred in the area below the top bar.
         title = self._menu_title_surface(w, h)
@@ -964,6 +1045,8 @@ class UIManager:
         region_h = h - region_top - 24
         ty = region_top + max(0, (region_h - title.get_height()) // 2)
         screen.blit(title, (tx, ty))
+        self._draw_title_dedication(screen, tx, ty,
+                                    title.get_width(), title.get_height())
 
         # Top toolbar bar with the menu actions (drawn last so it sits on top).
         self._draw_top_menu_bar(screen, w)
@@ -975,14 +1058,87 @@ class UIManager:
 
         if self._menu_settings_open:
             self._draw_menu_settings(screen, w, h, region_top)
+        elif self._menu_newgame_open:
+            self._draw_menu_newgame(screen, w, h, region_top)
+        elif self._menu_editor_open:
+            self._draw_menu_editor(screen, w, h, region_top)
+
+    def _draw_menu_list_panel(self, screen, w, h, below, title, top_options,
+                              saved_actions, empty_note):
+        """Shared layout for the New Game / City Editor choosers: a titled panel
+        with a set of primary option buttons, then a list of saved cities, then
+        a BACK button. `top_options` is [(action, label, accent)] and
+        `saved_actions` maps each saved city to the action tuple emitted."""
+        c = self.ui.c
+        mouse = pygame.mouse.get_pos()
+        cities = citystore.list_cities()
+        shown = cities[:8]
+
+        pw = 500
+        row_h = 40
+        list_h = (len(shown) * row_h) if shown else 30
+        ph = 22 + 40 + len(top_options) * 44 + 18 + list_h + 14 + 46 + 22
+        ph = min(ph, h - below - 40)
+        px = (w - pw) // 2
+        py = max(below + 20, int(h * 0.26))
+        py = min(py, h - ph - 24)
+        self.ui.panel(px, py, pw, ph, border=True)
+
+        ix = px + 28
+        iy = py + 20
+        self.ui.text("h2", title, c.TEXT_PRIMARY, ix, iy)
+        iy += 42
+
+        for action, label, accent in top_options:
+            rect = pygame.Rect(ix, iy, pw - 56, 38)
+            self.ui.button(rect, label, hovered=rect.collidepoint(mouse), accent=accent)
+            self.menu_buttons.append((rect, action))
+            iy += 44
+
+        iy += 6
+        self.ui.text("body_s", "Saved cities", c.TEXT_MUTED, ix, iy)
+        iy += 22
+        if not shown:
+            self.ui.text("body_s", empty_note, c.TEXT_DIM, ix, iy)
+            iy += 30
+        else:
+            for e in shown:
+                rect = pygame.Rect(ix, iy, pw - 56, 34)
+                self.ui.button(rect, e["name"], hovered=rect.collidepoint(mouse))
+                self.menu_buttons.append((rect, saved_actions(e)))
+                iy += row_h
+
+        iy += 8
+        back = pygame.Rect(ix, iy, 150, 44)
+        self.ui.button(back, "BACK", hovered=back.collidepoint(mouse))
+        self.menu_buttons.append((back, "menu_back"))
+
+    def _draw_menu_newgame(self, screen, w, h, below):
+        self._draw_menu_list_panel(
+            screen, w, h, below, "Start New Game",
+            [("new_random", "Random City", True)],
+            lambda e: ("new_saved", e["path"]),
+            "None yet — build one in the City Editor.")
+
+    def _draw_menu_editor(self, screen, w, h, below):
+        self._draw_menu_list_panel(
+            screen, w, h, below, "City Editor",
+            [("edit_blank",   "New — Blank (roads & green only)", True),
+             ("edit_partial", "New — Partial (mostly green)", False),
+             ("edit_full",    "New — Full city", False)],
+            lambda e: ("edit_saved", e["path"]),
+            "None yet — save one below to reopen it later.")
 
     def _draw_top_menu_bar(self, screen, w):
         c = self.ui.c
         mouse = pygame.mouse.get_pos()
         bar_h = self.MENU_BAR_H
-        bar = pygame.Surface((w, bar_h), pygame.SRCALPHA)
-        bar.fill((14, 16, 22, 236))
-        screen.blit(bar, (0, 0))
+        if self._menu_bar_cache is None or self._menu_bar_cache_w != w:
+            bar = pygame.Surface((w, bar_h), pygame.SRCALPHA)
+            bar.fill((14, 16, 22, 236))
+            self._menu_bar_cache = bar
+            self._menu_bar_cache_w = w
+        screen.blit(self._menu_bar_cache, (0, 0))
         pygame.draw.line(screen, c.BORDER_SUBTLE, (0, bar_h), (w, bar_h), 1)
 
         x = 14
@@ -2562,23 +2718,181 @@ class UIManager:
             self._debug_tab = key
 
     # ── Bottom editor bar helpers ────────────────────────────────────────────
+    def _editor_bar_x(self):
+        """The bar spans the full width in the standalone editor (no left HUD),
+        but starts after the HUD when used as the in-game debug editor."""
+        return 0 if getattr(self.game, "state", None) == "editor" else HUD_W
+
     def _in_editor_bar(self, pos):
         """True if `pos` is inside the editor bar region."""
         if not self._editor_mode:
             return False
         w, h = self._screen_size
-        return pos[0] >= HUD_W and pos[1] >= h - EDITOR_BAR_H
+        return pos[0] >= self._editor_bar_x() and pos[1] >= h - EDITOR_BAR_H
 
     def _exit_editor_mode(self):
         self._editor_mode = False
         self.editor_tool = None
         self._debug_status = ""
 
+    def _editor_exit_clicked(self):
+        """The bottom bar's exit button: leaves the editor entirely when in the
+        standalone editor, or just hides the bar in the in-game debug editor."""
+        if getattr(self.game, "state", None) == "editor":
+            self.game.exit_editor_to_menu()
+        else:
+            self._exit_editor_mode()
+
     def _editor_bar_resolve(self, pos):
         for rect, fn in self._editor_bar_widgets:
             if rect.collidepoint(pos):
                 fn()
                 return
+
+    # ── Standalone editor state (reached from the main menu) ─────────────────
+    def enter_editor_state(self):
+        self._editor_mode = True
+        self.editor_tool = None
+        self._debug_status = ""
+        self._city_name_active = False
+        self._city_name_buffer = ""
+
+    def exit_editor_state(self):
+        self._editor_mode = False
+        self.editor_tool = None
+        self._city_name_active = False
+        self._city_name_buffer = ""
+
+    def _editor_source_label(self):
+        src = getattr(self.game, "_editor_source", None)
+        if not src:
+            return "New"
+        kind, val = src
+        if kind == "saved":
+            base = os.path.basename(val)
+            return base[:-5] if base.endswith(".json") else base
+        return {"blank": "Blank", "partial": "Partial", "full": "Full"}.get(val, str(val))
+
+    def draw_editor(self, screen):
+        self.ui = UIPrimitives(screen, self.fonts)
+        w, h = screen.get_size()
+        self._screen_size = (w, h)
+        self._draw_editor_topbar(screen, w)
+        self._draw_editor_bar(screen, w, h)
+        self._draw_toast(screen, w, h)
+        if self._city_name_active:
+            self._draw_city_name_prompt(screen, w, h)
+
+    def _draw_editor_topbar(self, screen, w):
+        ui = self.ui
+        c = ui.c
+        mouse = pygame.mouse.get_pos()
+        bar_h = self.MENU_BAR_H
+        bar = pygame.Surface((w, bar_h), pygame.SRCALPHA)
+        bar.fill((14, 16, 22, 236))
+        screen.blit(bar, (0, 0))
+        pygame.draw.line(screen, c.ACCENT_AMBER, (0, bar_h), (w, bar_h), 2)
+
+        label = f"CITY EDITOR  ·  {self._editor_source_label()}"
+        lsurf = ui.fonts.render("body_b", label, c.ACCENT_AMBER)
+        screen.blit(lsurf, (14, (bar_h - lsurf.get_height()) // 2))
+
+        self._editor_top_widgets = []
+        items = [("save",  "Save City"),
+                 ("play",  "Play This City"),
+                 ("regen", "Regenerate"),
+                 ("exit",  "Exit to Menu")]
+        bh = 32
+        by = (bar_h - bh) // 2
+        x = w - 14
+        for action, txt in reversed(items):
+            bw = ui.fonts.size("body_b", txt)[0] + 26
+            x -= bw
+            rect = pygame.Rect(x, by, bw, bh)
+            ui.button(rect, txt, hovered=rect.collidepoint(mouse), accent=(action == "play"))
+            self._editor_top_widgets.append((rect, action))
+            x -= 8
+
+    def _editor_top_action(self, action):
+        if action == "save":
+            self.start_city_name_prompt()
+        elif action == "play":
+            self.game.play_edited_city()
+        elif action == "regen":
+            self.game.editor_regenerate()
+        elif action == "exit":
+            self.game.exit_editor_to_menu()
+
+    def editor_on_mouse_down(self, pos):
+        """Return True if the press landed on editor chrome (suppresses the
+        camera pan while still letting the click resolve on release)."""
+        if self._city_name_active:
+            return True
+        if pos[1] <= self.MENU_BAR_H:
+            return True
+        return self._in_editor_bar(pos)
+
+    def editor_on_mouse_up(self, pos, was_click):
+        """Resolve a click on the editor chrome. Returns True if consumed (so
+        main.py won't also treat it as a map-brush click)."""
+        if not was_click:
+            return False
+        if self._city_name_active:
+            return True
+        for rect, action in self._editor_top_widgets:
+            if rect.collidepoint(pos):
+                self._editor_top_action(action)
+                return True
+        if self._in_editor_bar(pos):
+            self._editor_bar_resolve(pos)
+            return True
+        return False
+
+    # ── Save-as name prompt ──────────────────────────────────────────────────
+    def start_city_name_prompt(self):
+        self._city_name_active = True
+        src = getattr(self.game, "_editor_source", None)
+        default = ""
+        if src and src[0] == "saved":
+            base = os.path.basename(src[1])
+            default = base[:-5] if base.endswith(".json") else base
+        self._city_name_buffer = default
+
+    def handle_city_name_key(self, event):
+        if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            name = self._city_name_buffer.strip()
+            if name:
+                self.game.editor_save_city(name)
+            self._city_name_active = False
+            self._city_name_buffer = ""
+        elif event.key == pygame.K_ESCAPE:
+            self._city_name_active = False
+            self._city_name_buffer = ""
+        elif event.key == pygame.K_BACKSPACE:
+            self._city_name_buffer = self._city_name_buffer[:-1]
+        elif event.unicode and event.unicode.isprintable():
+            if len(self._city_name_buffer) < 28:
+                self._city_name_buffer += event.unicode
+
+    def _draw_city_name_prompt(self, screen, w, h):
+        ui = self.ui
+        c = ui.c
+        pw, ph = 460, 156
+        px = (w - pw) // 2
+        py = (h - ph) // 2
+        # Dim the backdrop a touch.
+        veil = pygame.Surface((w, h), pygame.SRCALPHA)
+        veil.fill((0, 0, 0, 120))
+        screen.blit(veil, (0, 0))
+        ui.panel(px, py, pw, ph, border=True)
+        ui.text("h2", "Save city as…", c.TEXT_PRIMARY, px + 24, py + 18)
+        field = pygame.Rect(px + 24, py + 60, pw - 48, 40)
+        pygame.draw.rect(screen, c.BG_PANEL, field, border_radius=4)
+        pygame.draw.rect(screen, c.ACCENT_AMBER, field, 1, border_radius=4)
+        ui.text("body_b", self._city_name_buffer + "_", c.TEXT_PRIMARY,
+                field.x + 10, field.y + 10)
+        ui.text("body_s", "Enter to save  ·  Esc to cancel", c.TEXT_DIM,
+                px + 24, py + ph - 28)
 
     def _draw_editor_bar(self, screen, w, h):
         """A slim two-row toolbar fixed to the bottom of the screen.  All
@@ -2589,9 +2903,9 @@ class UIManager:
         tool = self.editor_tool
         mouse = pygame.mouse.get_pos()
 
-        bar_x = HUD_W
+        bar_x = self._editor_bar_x()
         bar_y = h - EDITOR_BAR_H
-        bar_w = w - HUD_W
+        bar_w = w - bar_x
 
         # Background + amber top border to signal editor mode
         pygame.draw.rect(screen, c.BG_PANEL, pygame.Rect(bar_x, bar_y, bar_w, EDITOR_BAR_H))
@@ -2628,6 +2942,9 @@ class UIManager:
              lambda: self._set_tool_clear_green("commercial"),
              bool(tool and tool.get("mode") == "clear_green"
                   and tool.get("kind") == "commercial")),
+            ("Landfill",
+             self._set_tool_landfill,
+             bool(tool and tool.get("mode") == "landfill")),
         ]
         for label, fn, active in action_tools:
             tw = ui.fonts.size("body_b", label)[0] + 16
@@ -2652,7 +2969,7 @@ class UIManager:
         etw = ui.fonts.size("body_b", ex_label)[0] + 16
         exit_rect = pygame.Rect(w - etw - 8, r1_y, etw, BTN_H)
         ui.button(exit_rect, ex_label, hovered=exit_rect.collidepoint(mouse))
-        self._editor_bar_widgets.append((exit_rect, self._exit_editor_mode))
+        self._editor_bar_widgets.append((exit_rect, self._editor_exit_clicked))
 
         # ── Row 2: build-style chips ─────────────────────────────────────────
         SHORT = {
@@ -2905,10 +3222,15 @@ class UIManager:
     def _set_tool_build(self, style):
         self.editor_tool = {"mode": "build", "style": style}
 
+    def _set_tool_landfill(self):
+        self.editor_tool = {"mode": "landfill"}
+
     def _editor_tool_label(self, tool):
         mode = tool.get("mode")
         if mode == "bulldoze":
             return "Bulldoze"
+        if mode == "landfill":
+            return "Place landfill site"
         if mode == "green":
             return "Place green square"
         if mode == "clear_green":

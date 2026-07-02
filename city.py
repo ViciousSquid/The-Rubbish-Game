@@ -253,7 +253,19 @@ class CityGenerator:
             area.frequency = 1 if area.frequency >= 2 else 2
 
     # -------------------------------------------------------------- generate
-    def generate(self):
+    def generate(self, density="full", place_landfill=True):
+        """Build a fresh city.
+
+        density:
+          "full"    – dense borough (the classic random map).
+          "partial" – some buildings but mostly green space.
+          "blank"   – roads and green space only (no buildings); for the
+                      city editor, where the player places everything.
+        place_landfill:
+          When True (and not a blank map) a landfill is auto-sited in a
+          corner. The editor passes False so the player can place it by
+          hand via editor_place_landfill().
+        """
         self.tiles = []
         self.population = 0
         self.property_count = 0
@@ -265,9 +277,15 @@ class CityGenerator:
 
         roads = RoadGenerator.generate_grid(self.width, self.height)
 
-        # Randomise green space between 5% and 15%
-        base_green_threshold = random.uniform(0.05, 0.15)
-        base_building_threshold = 0.82 + (0.07 - base_green_threshold)
+        blank = (density == "blank")
+        if density == "partial":
+            # Mostly green space with a scattering of buildings.
+            base_green_threshold = 0.62
+            base_building_threshold = 0.90
+        else:  # "full" (default)
+            # Randomise green space between 5% and 15%
+            base_green_threshold = random.uniform(0.05, 0.15)
+            base_building_threshold = 0.82 + (0.07 - base_green_threshold)
 
         for y in range(self.height):
             row = []
@@ -277,28 +295,39 @@ class CityGenerator:
                 area = self.areas[area_id]
                 is_green = _is_green_area(area.name)
 
+                if key in roads:
+                    tile = Tile("road")
+                    tile.area_id = area_id
+                    self.metrics["roads"] += 1
+                    row.append(tile)
+                    continue
+
+                # Blank maps: everything that isn't road is plain green space.
+                if blank:
+                    tile = Tile("green")
+                    tile.area_id = area_id
+                    tile.bin_fill = 0.0
+                    self.metrics["green"] = self.metrics.get("green", 0) + 1
+                    row.append(tile)
+                    continue
+
                 # Park/green areas: lots of green space, fewer buildings
                 if is_green:
-                    green_threshold = 0.55  # ~55% green space
+                    green_threshold = max(base_green_threshold, 0.55)
                     building_threshold = 0.92
                 else:
                     green_threshold = base_green_threshold
                     building_threshold = base_building_threshold
 
-                if key in roads:
-                    tile = Tile("road")
+                roll = random.random()
+                if roll < green_threshold:
+                    tile = Tile("green")
                     tile.area_id = area_id
-                    self.metrics["roads"] += 1
+                    self.metrics["green"] = self.metrics.get("green", 0) + 1
+                elif roll < building_threshold:
+                    tile = self._make_building("residential", area_id, is_green)
                 else:
-                    roll = random.random()
-                    if roll < green_threshold:
-                        tile = Tile("green")
-                        tile.area_id = area_id
-                        self.metrics["green"] = self.metrics.get("green", 0) + 1
-                    elif roll < building_threshold:
-                        tile = self._make_building("residential", area_id, is_green)
-                    else:
-                        tile = self._make_building("commercial", area_id, is_green)
+                    tile = self._make_building("commercial", area_id, is_green)
                 row.append(tile)
             self.tiles.append(row)
 
@@ -319,8 +348,10 @@ class CityGenerator:
         for area in self.areas:
             area.route_type = area.get_dominant_type(self)
 
-        # Carve out the borough landfill in a far corner.
-        self._place_landfill()
+        # Carve out the borough landfill in a far corner (skipped for blank
+        # maps and whenever the caller wants to place it by hand).
+        if place_landfill and not blank:
+            self._place_landfill()
 
     # --------------------------------------------------------------- landfill
     # Depot reference (matches FleetManager.depot_x/y) so the landfill is sited
@@ -697,3 +728,179 @@ class CityGenerator:
             if self.editor_place_green(x, y):
                 count += 1
         return count
+
+    # ------------------------------------------------------- landfill (editor)
+    def _landfill_to_green(self, x, y):
+        """Turn a single landfill tile back into plain green space."""
+        t = self.tiles[y][x]
+        ng = Tile("green")
+        ng.area_id = t.area_id
+        ng.bin_fill = 0.0
+        self.tiles[y][x] = ng
+        self.metrics["green"] = self.metrics.get("green", 0) + 1
+
+    def clear_landfill(self):
+        """Remove the current landfill footprint (reverting its tiles to green)
+        so a new one can be sited. Haul-road tiles were never converted, so
+        nothing to restore there."""
+        if not self.landfill:
+            return
+        for (x, y) in list(self.landfill.get("tiles", ())):
+            if self.is_inside(x, y) and self.tiles[y][x].type == "landfill":
+                self._landfill_to_green(x, y)
+        self.landfill = None
+        self.version += 1
+
+    def editor_place_landfill(self, x, y):
+        """Editor tool: (re)site the borough landfill as an 8x8 block centred on
+        the clicked tile, clamped inside the map. Any existing landfill is
+        cleared first. Road tiles inside the footprint are kept as haul roads.
+        Returns True on success."""
+        if not self.is_inside(x, y):
+            return False
+        size = self.LANDFILL_SIZE
+        self.clear_landfill()
+        ox = max(0, min(self.width - size, x - size // 2))
+        oy = max(0, min(self.height - size, y - size // 2))
+        tiles = set()
+        for yy in range(oy, oy + size):
+            for xx in range(ox, ox + size):
+                if not self.is_inside(xx, yy):
+                    continue
+                if self.tiles[yy][xx].type == "road":
+                    continue              # keep haul roads through the site
+                self._convert_to_landfill(xx, yy)
+                tiles.add((xx, yy))
+        if not tiles:
+            return False
+        gate = self._find_landfill_gate(tiles)
+        self.landfill = {
+            "tiles": tiles,
+            "cx": ox + size // 2,
+            "cy": oy + size // 2,
+            "gate": gate,
+            "corner": "custom",
+        }
+        self.version += 1
+        return True
+
+    # ============================================================ save / load
+    # A compact, self-contained snapshot of the map geometry (tiles, rounds and
+    # landfill) used by citystore.py to persist edited cities to the `cities`
+    # folder. Deliberately independent of the runtime savegame format.
+
+    def _tile_state(self, x, y):
+        t = self.tiles[y][x]
+        d = {"t": t.type, "a": t.area_id}
+        if t.type in ("residential", "commercial"):
+            d.update({
+                "st": t.building_style,
+                "h": t.building_height,
+                "v": t.building_variant,
+                "p": t.population,
+                "f": t.fill_rate,
+                "cl": t.wall_color_light,
+                "cd": t.wall_color_dark,
+                "cr": t.roof_color,
+            })
+        return d
+
+    def to_state(self):
+        """Serialise the map to a plain dict (JSON-safe)."""
+        lf = None
+        if self.landfill:
+            gate = self.landfill.get("gate")
+            lf = {
+                "tiles": [[int(a), int(b)] for (a, b) in sorted(self.landfill["tiles"])],
+                "cx": self.landfill["cx"],
+                "cy": self.landfill["cy"],
+                "gate": ([int(gate[0]), int(gate[1])] if gate else None),
+                "corner": self.landfill.get("corner", "custom"),
+            }
+        return {
+            "width": self.width,
+            "height": self.height,
+            "areas": [
+                {"id": a.id, "name": a.name, "col": a.col, "row": a.row,
+                 "collection_day": a.collection_day, "frequency": a.frequency}
+                for a in self.areas
+            ],
+            "tiles": [[self._tile_state(x, y) for x in range(self.width)]
+                      for y in range(self.height)],
+            "landfill": lf,
+        }
+
+    @classmethod
+    def from_state(cls, state):
+        """Rebuild a CityGenerator from a to_state() dict."""
+        c = cls(int(state["width"]), int(state["height"]))
+        c.tiles = []
+        c.areas = []
+        c.metrics = {"residential": 0, "commercial": 0, "roads": 0, "green": 0}
+        c.population = 0
+        c.property_count = 0
+
+        for a in state.get("areas", []):
+            ar = Area(a["id"], a["name"], a["col"], a["row"])
+            ar.collection_day = a.get("collection_day", ar.collection_day)
+            ar.frequency = 2 if a.get("frequency", 1) >= 2 else 1
+            c.areas.append(ar)
+
+        for y, rowd in enumerate(state["tiles"]):
+            row = []
+            for x, d in enumerate(rowd):
+                tp = d.get("t", "green")
+                t = Tile(tp)
+                t.area_id = d.get("a", -1)
+                if tp == "road":
+                    c.metrics["roads"] += 1
+                    t.bin_fill = 0.0
+                elif tp == "green":
+                    c.metrics["green"] = c.metrics.get("green", 0) + 1
+                    t.bin_fill = 0.0
+                elif tp == "landfill":
+                    t.bin_fill = 0.0
+                    t.fill_rate = 0.0
+                    t.building_height = 0
+                elif tp in ("residential", "commercial"):
+                    t.building_style = d.get("st", "detached")
+                    t.building_height = d.get("h", 0)
+                    t.building_variant = d.get("v", 0)
+                    t.population = d.get("p", 0)
+                    t.fill_rate = d.get("f", 0.0)
+                    t.wall_color_light = d.get("cl", t.wall_color_light)
+                    t.wall_color_dark = d.get("cd", t.wall_color_dark)
+                    t.roof_color = d.get("cr", t.roof_color)
+                    c.metrics[tp] += 1
+                    c.population += t.population
+                    c.property_count += 1
+                row.append(t)
+            c.tiles.append(row)
+
+        # Register building tiles into their rounds and sync collection days.
+        for y in range(c.height):
+            for x in range(c.width):
+                t = c.tiles[y][x]
+                if t.type in ("residential", "commercial"):
+                    ar = c.get_area(t.area_id)
+                    if ar:
+                        ar.building_tiles.append((x, y))
+                        ar.property_count += 1
+                        ar.population += t.population
+                        t.collection_due = ar.collection_day
+        for ar in c.areas:
+            ar.route_type = ar.get_dominant_type(c)
+
+        lf = state.get("landfill")
+        if lf:
+            tiles = set((int(a), int(b)) for a, b in lf.get("tiles", []))
+            gate = tuple(lf["gate"]) if lf.get("gate") else None
+            c.landfill = {
+                "tiles": tiles,
+                "cx": lf.get("cx", 0),
+                "cy": lf.get("cy", 0),
+                "gate": gate,
+                "corner": lf.get("corner", "custom"),
+            }
+        c.version = 0
+        return c

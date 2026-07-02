@@ -10,6 +10,7 @@ from waste import WastePolicy
 from ambient import AmbientState
 from assets import asset_path
 import savegame
+import citystore
 
 CITY_W = 60
 CITY_H = 60
@@ -64,7 +65,8 @@ class WasteCityGame:
 
         # ── Game state / start menu ──────────────────────────────────────────
         # The city generated above becomes the living backdrop behind the menu.
-        self.state = "menu"            # "menu" | "playing"
+        self.state = "menu"            # "menu" | "playing" | "editor"
+        self._editor_source = None     # ("new", density) | ("saved", path)
         self._menu_cam_t = 0.0         # drives the slow cinematic backdrop pan
         self.settings = {
             "day_length": "normal",    # short | normal | long
@@ -76,12 +78,24 @@ class WasteCityGame:
     def _toggle_areas(self):
         self.show_areas = not self.show_areas
 
-    def _clear_and_regenerate(self):
+    def _clear_and_regenerate(self, city_path=None):
         self.economy = Economy()
         self.waste = WastePolicy()
         self.fleet = FleetManager(self)
-        self.city = CityGenerator(CITY_W, CITY_H)
-        self.city.generate()
+        if city_path:
+            try:
+                self.city = citystore.load_city(city_path)
+            except Exception as e:
+                self.city = CityGenerator(CITY_W, CITY_H)
+                self.city.generate()
+                self.set_toast(f"Couldn't load city: {e}")
+            # A saved map might have been left without a landfill in the editor;
+            # a playable borough needs one, so auto-site it as a fallback.
+            if not getattr(self.city, "landfill", None):
+                self.city._place_landfill()
+        else:
+            self.city = CityGenerator(CITY_W, CITY_H)
+            self.city.generate()
         self.fleet.setup_initial_fleet()
         self.ambient = AmbientState()
         # Reset any open floating windows for a clean fresh term.
@@ -103,9 +117,11 @@ class WasteCityGame:
         ev = {"calm": 0.16, "normal": 0.30, "chaotic": 0.48}
         self.economy.event_chance = ev.get(self.settings.get("events"), 0.30)
 
-    def _start_new_game(self):
-        self._clear_and_regenerate()
+    def _start_new_game(self, city_path=None):
+        self._clear_and_regenerate(city_path=city_path)
         self._apply_settings()
+        self.ui._menu_newgame_open = False
+        self.ui._menu_editor_open = False
         self.toast = ""
         self.toast_timer = 0.0
         self.state = "playing"
@@ -118,8 +134,29 @@ class WasteCityGame:
             self.state = "playing"
 
     def _menu_dispatch(self, action):
+        # Dynamic entries (saved cities) arrive as tuples.
+        if isinstance(action, tuple):
+            kind, val = action
+            if kind == "new_saved":
+                self._start_new_game(city_path=val)
+            elif kind == "edit_saved":
+                self._start_editor(("saved", val))
+            return
+
         if action == "new":
+            # Open the start-game chooser (Random + any saved cities).
+            self.ui._menu_editor_open = False
+            self.ui._menu_settings_open = False
+            self.ui._menu_newgame_open = True
+        elif action == "new_random":
             self._start_new_game()
+        elif action == "editor":
+            # Open the city-editor chooser (Blank/Partial/Full + saved).
+            self.ui._menu_newgame_open = False
+            self.ui._menu_settings_open = False
+            self.ui._menu_editor_open = True
+        elif action in ("edit_blank", "edit_partial", "edit_full"):
+            self._start_editor(("new", action.split("_", 1)[1]))
         elif action == "load":
             self._menu_load()
         elif action == "settings":
@@ -129,6 +166,8 @@ class WasteCityGame:
             sys.exit()
         elif action == "menu_back":
             self.ui._menu_settings_open = False
+            self.ui._menu_newgame_open = False
+            self.ui._menu_editor_open = False
         elif action == "set_day_length":
             order = ["short", "normal", "long"]
             cur = self.settings.get("day_length", "normal")
@@ -146,15 +185,160 @@ class WasteCityGame:
             if action:
                 self._menu_dispatch(action)
         elif event.type == pygame.KEYDOWN:
+            panel_open = (self.ui._menu_settings_open or self.ui._menu_newgame_open
+                          or self.ui._menu_editor_open)
             if event.key in (pygame.K_ESCAPE, pygame.K_q):
-                if self.ui._menu_settings_open:
+                if panel_open:
                     self.ui._menu_settings_open = False
+                    self.ui._menu_newgame_open = False
+                    self.ui._menu_editor_open = False
                 else:
                     pygame.quit()
                     sys.exit()
             elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                if not self.ui._menu_settings_open:
+                if not panel_open:
                     self._start_new_game()
+
+    # ---------------------------------------------------------- city editor
+    def _start_editor(self, source):
+        """Enter the standalone city editor. `source` is ("new", density) for a
+        freshly-generated blank/partial/full map, or ("saved", path) to open an
+        existing city for further editing."""
+        self._editor_source = source
+        kind, val = source
+        if kind == "saved":
+            try:
+                self.city = citystore.load_city(val)
+            except Exception as e:
+                self.set_toast(f"Couldn't open city: {e}")
+                return
+        else:
+            self.city = CityGenerator(CITY_W, CITY_H)
+            self.city.generate(density=val, place_landfill=False)
+
+        # Fresh support objects so the map renders and the fleet's road graph
+        # rebinds to the new city. The editor doesn't run the simulation.
+        self.economy = Economy()
+        self.waste = WastePolicy()
+        self.fleet = FleetManager(self)
+        self.ambient = AmbientState()
+
+        self.ui.windows.clear()
+        self.ui._win_drag = None
+        self.ui._menu_newgame_open = False
+        self.ui._menu_editor_open = False
+        self.ui.enter_editor_state()
+        self.clear_selection()
+        self.toast = ""
+        self.toast_timer = 0.0
+        self.state = "editor"
+        self._center_camera()
+
+    def editor_regenerate(self):
+        """Re-roll / reload the editor's current map from its source."""
+        if self._editor_source:
+            self._start_editor(self._editor_source)
+
+    def editor_save_city(self, name):
+        ok, msg = citystore.save_city(self.city, name)
+        self.set_toast(msg)
+        return ok
+
+    def play_edited_city(self):
+        """Leave the editor and start a fresh game on the edited city."""
+        if not getattr(self.city, "landfill", None):
+            self.set_toast("Place a landfill site first (Landfill tool).")
+            return
+        self.economy = Economy()
+        self.waste = WastePolicy()
+        self.fleet = FleetManager(self)
+        self.fleet.setup_initial_fleet()
+        self.ambient = AmbientState()
+        self._apply_settings()
+        self.ui.exit_editor_state()
+        self.ui.windows.clear()
+        self.ui._win_drag = None
+        self.clear_selection()
+        self.toast = ""
+        self.toast_timer = 0.0
+        self.state = "playing"
+        self._center_camera()
+
+    def exit_editor_to_menu(self):
+        """Abandon the editor and return to the main menu (with a fresh living
+        backdrop city behind it)."""
+        self.ui.exit_editor_state()
+        self._clear_and_regenerate()
+        self.ui._menu_settings_open = False
+        self.ui._menu_newgame_open = False
+        self.ui._menu_editor_open = False
+        self.state = "menu"
+        self._center_camera()
+
+    def _editor_map_click(self, pos):
+        coord = self.renderer.screen_to_tile(pos[0], pos[1],
+                                              self.screen.get_width(),
+                                              self.screen.get_height())
+        tool = self.ui.editor_tool or {}
+        if tool.get("mode") == "landfill":
+            if self.city.editor_place_landfill(coord["x"], coord["y"]):
+                self.set_toast("Landfill sited.")
+            else:
+                self.set_toast("Can't place a landfill there.")
+        else:
+            self.ui.apply_editor_brush(coord["x"], coord["y"])
+
+    def _step_editor(self, dt):
+        """Editor frame: keep the UI responsive and the camera clamped, but
+        freeze the simulation entirely."""
+        if self.toast_timer > 0:
+            self.toast_timer -= dt
+            if self.toast_timer <= 0:
+                self.toast = ""
+        self.ui.update(dt)
+        self._clamp_camera()
+
+    def _handle_editor_event(self, event):
+        ui = self.ui
+        # A save-name prompt captures all keys while open.
+        if ui._city_name_active:
+            if event.type == pygame.KEYDOWN:
+                ui.handle_city_name_key(event)
+            return
+
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                self.exit_editor_to_menu()
+            elif event.key == pygame.K_g:
+                self.show_areas = not self.show_areas
+
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button == 1:
+                self._ui_press = ui.editor_on_mouse_down(event.pos)
+                self.dragging = True
+                self.drag_moved = False
+            elif event.button == 4:
+                self.camera["zoom"] = min(4, self.camera["zoom"] * 1.1)
+            elif event.button == 5:
+                self.camera["zoom"] = max(0.3, self.camera["zoom"] * 0.9)
+
+        elif event.type == pygame.MOUSEBUTTONUP:
+            if event.button == 1:
+                was_click = self.dragging and not self.drag_moved
+                consumed = ui.editor_on_mouse_up(event.pos, was_click)
+                if was_click and not consumed:
+                    self._editor_map_click(event.pos)
+                self.dragging = False
+                self._ui_press = False
+
+        elif event.type == pygame.MOUSEMOTION:
+            if self.dragging and not self._ui_press:
+                self.camera["x"] += event.rel[0] / self.camera["zoom"]
+                self.camera["y"] += event.rel[1] / self.camera["zoom"]
+                if abs(event.rel[0]) > 2 or abs(event.rel[1]) > 2:
+                    self.drag_moved = True
+            self.mouse["x"] = event.pos[0]
+            self.mouse["y"] = event.pos[1]
 
     def _step_backdrop(self, dt):
         """Keep the city alive behind the menu: ambient life, driving lorries
@@ -347,22 +531,34 @@ class WasteCityGame:
 
     # ---------------------------------------------------------------- render
     def render(self):
-        self.screen.fill((22, 24, 30))
         w, h = self.screen.get_size()
-        for i in range(0, h, 2):
-            t = i / h
-            g = int(40 + (22 - 40) * t)
-            pygame.draw.line(self.screen, (g, g, int(g * 1.1)), (0, i), (w, i), 2)
+        # The backdrop gradient is static for a given window size. Build it once
+        # and blit it, rather than issuing ~h/2 draw.line calls every frame.
+        cache = getattr(self, "_bg_gradient_cache", None)
+        if cache is None or self._bg_gradient_size != (w, h):
+            grad = pygame.Surface((w, h))
+            grad.fill((22, 24, 30))
+            for i in range(0, h, 2):
+                t = i / h
+                g = int(40 + (22 - 40) * t)
+                pygame.draw.line(grad, (g, g, int(g * 1.1)), (0, i), (w, i), 2)
+            self._bg_gradient_cache = grad
+            self._bg_gradient_size = (w, h)
+            cache = grad
+        self.screen.blit(cache, (0, 0))
 
         menu = self.state == "menu"
-        sel = None if menu else self.selected_tile
-        hov = None if menu else self.hovered_tile
+        editor = self.state == "editor"
+        sel = None if (menu or editor) else self.selected_tile
+        hov = None if (menu or editor) else self.hovered_tile
         areas = self.show_areas and not menu
         self.renderer.render(self.city, self.fleet, sel,
                              self.economy.get_day_of_week(), areas,
                              hov, self.economy, self.ambient)
         if menu:
             self.ui.draw_main_menu(self.screen)
+        elif editor:
+            self.ui.draw_editor(self.screen)
         else:
             self.ui.draw(self.screen)
         pygame.display.flip()
@@ -379,6 +575,9 @@ class WasteCityGame:
 
         elif self.state == "menu":
             self._handle_menu_event(event)
+
+        elif self.state == "editor":
+            self._handle_editor_event(event)
 
         elif event.type == pygame.KEYDOWN:
             mods = pygame.key.get_mods()
@@ -477,6 +676,11 @@ class WasteCityGame:
 
             if self.state == "menu":
                 self._step_backdrop(frame_dt)
+                self.render()
+                continue
+
+            if self.state == "editor":
+                self._step_editor(frame_dt)
                 self.render()
                 continue
 
