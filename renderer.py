@@ -3,6 +3,7 @@ import math
 import os
 import random                           # was previously imported inline per-call
 from city import AREA_COLS, AREA_ROWS, DAY_NAMES
+from assets import asset_path
 
 # ─── module-level font cache ──────────────────────────────────────────────────
 # pygame.font.SysFont() is an OS call that can take several milliseconds.
@@ -143,7 +144,7 @@ class Renderer:
         self._truck_icon = None
         try:
             from PIL import Image
-            png_path = "truck.png"
+            png_path = asset_path("truck.png")
             if os.path.exists(png_path):
                 img = Image.open(png_path).convert("RGBA")
                 self._truck_icon = pygame.image.fromstring(img.tobytes(), img.size, "RGBA")

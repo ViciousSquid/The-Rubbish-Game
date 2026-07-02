@@ -1,9 +1,11 @@
 import pygame
 import math
+import os
 from city import AREA_COLS, AREA_ROWS, RES_STYLE_WEIGHTS, COM_STYLE_WEIGHTS
 import xmlio
 import savegame
 from procurement import VEHICLE_CATALOGUE
+from assets import asset_path
 
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 HUD_W = 280
@@ -158,6 +160,37 @@ class FontSystem:
             self._fonts[key] = pygame.font.SysFont(name, size, bold=bold)
     def get(self, key):
         return self._fonts.get(key, self._fonts["body"])
+
+    def _find_anton(self):
+        # Preferred: the bundled _internal folder (dev + frozen build).
+        p = asset_path("Anton-Regular.ttf")
+        if os.path.isfile(p):
+            return p
+        # Legacy fallbacks kept so an un-moved copy still loads.
+        here = os.path.dirname(os.path.abspath(__file__))
+        for base in (os.getcwd(), here):
+            for rel in ("assets/fonts/Anton-Regular.ttf",
+                        "fonts/Anton-Regular.ttf",
+                        "Anton-Regular.ttf"):
+                p = os.path.join(base, rel)
+                if os.path.isfile(p):
+                    return p
+        return None
+
+    def title(self, size):
+        """The Anton display face at `size` (cached). Falls back to the bold
+        system font if the Anton TTF isn't bundled."""
+        key = ("__title__", size)
+        f = self._fonts.get(key)
+        if f is None:
+            if not hasattr(self, "_anton_path"):
+                self._anton_path = self._find_anton()
+            if self._anton_path:
+                f = pygame.font.Font(self._anton_path, size)
+            else:
+                f = pygame.font.SysFont(self.base, size, bold=True)
+            self._fonts[key] = f
+        return f
 
     def custom(self, size, bold=False):
         """A cached SysFont at an arbitrary size (used for the menu title)."""
@@ -801,71 +834,95 @@ class UIManager:
     _TITLE_SPECK = (34, 28, 16)       # grunge fleck colour
 
     def _outlined_title_line(self, font, text, radius, shadow_off):
-        """One title line: soft drop shadow + thick black keyline + yellow face,
-        on its own transparent surface."""
+        """One title line: soft drop shadow + thick black keyline + yellow face.
+        Padding is asymmetric (extra room down-right for the shadow) so the
+        lines can be stacked tightly, the way the reference reads."""
         face = font.render(text, True, self._TITLE_FACE)
         key = font.render(text, True, self._TITLE_OUTLINE)
         bw, bh = face.get_size()
-        pad = radius + shadow_off + 6
-        surf = pygame.Surface((bw + pad * 2, bh + pad * 2), pygame.SRCALPHA)
-        cx, cy = pad, pad
-        # Drop shadow (semi-transparent black, offset down-right).
+        pad_tl = radius + 4
+        pad_br = radius + shadow_off + 4
+        surf = pygame.Surface((bw + pad_tl + pad_br, bh + pad_tl + pad_br),
+                              pygame.SRCALPHA)
+        cx, cy = pad_tl, pad_tl
         shadow = key.copy()
-        shadow.set_alpha(150)
+        shadow.set_alpha(165)
         surf.blit(shadow, (cx + shadow_off, cy + shadow_off))
-        # Thick keyline: stamp the black glyph over a filled disc of offsets.
         r2 = radius * radius
         for dx in range(-radius, radius + 1):
             for dy in range(-radius, radius + 1):
                 if dx * dx + dy * dy <= r2:
                     surf.blit(key, (cx + dx, cy + dy))
-        # Yellow face on top.
         surf.blit(face, (cx, cy))
         return surf
 
-    def _speckle_title(self, surf):
-        """Scatter stable dark flecks over the yellow face for a distressed look
-        (seeded so it never flickers frame-to-frame)."""
+    @staticmethod
+    def _is_title_yellow(px):
+        return px[3] > 0 and px[0] > 150 and px[1] > 120 and px[2] < 120
+
+    def _apply_distress(self, surf):
+        """Chew up the yellow faces with stable grain, erosion bites and a few
+        scratches so the title reads as a distressed stencil (seeded, so it
+        never flickers). Transparent bites reveal the black keyline beneath."""
         import random as _random
         rng = _random.Random(0xB1A5)
         mask = pygame.mask.from_surface(surf, 40)
         w, h = surf.get_size()
-        for _ in range((w * h) // 850):
-            x = rng.randint(0, w - 1)
-            y = rng.randint(0, h - 1)
-            if not mask.get_at((x, y)):
-                continue
-            px = surf.get_at((x, y))
-            if px[0] > 150 and px[1] > 120 and px[2] < 120:   # only the yellow
-                sz = 2 if rng.random() < 0.25 else 1
-                pygame.draw.rect(surf, self._TITLE_SPECK, (x, y, sz, sz))
+
+        # 1. Fine grain — dark opaque flecks over the yellow.
+        for _ in range((w * h) // 110):
+            x, y = rng.randint(0, w - 1), rng.randint(0, h - 1)
+            if mask.get_at((x, y)) and self._is_title_yellow(surf.get_at((x, y))):
+                sz = 1 if rng.random() < 0.78 else 2
+                surf.fill(self._TITLE_SPECK + (255,), (x, y, sz, sz))
+
+        # 2. Erosion bites — small transparent holes exposing the keyline.
+        for _ in range((w * h) // 1900):
+            x, y = rng.randint(0, w - 1), rng.randint(0, h - 1)
+            if mask.get_at((x, y)) and self._is_title_yellow(surf.get_at((x, y))):
+                pygame.draw.circle(surf, (0, 0, 0, 0), (x, y),
+                                   rng.choice([1, 1, 2, 2, 3]))
+
+        # 3. Scratches — thin near-horizontal streaks scored through the paint.
+        for _ in range(max(8, w // 34)):
+            x0, y0 = rng.randint(0, w - 1), rng.randint(0, h - 1)
+            length = rng.randint(w // 12, w // 4)
+            ang = rng.uniform(-0.22, 0.22)
+            ca, sa = math.cos(ang), math.sin(ang)
+            for t in range(length):
+                x, y = int(x0 + t * ca), int(y0 + t * sa)
+                if 0 <= x < w and 0 <= y < h and mask.get_at((x, y)) \
+                        and self._is_title_yellow(surf.get_at((x, y))):
+                    if rng.random() < 0.55:
+                        surf.set_at((x, y), (0, 0, 0, 0))
 
     def _title_line_height(self, size):
-        f = self.fonts.custom(size, True)
-        radius = max(3, size // 18)
-        shadow_off = max(4, size // 11)
-        return f.get_height() + 2 * (radius + shadow_off + 6)
+        f = self.fonts.title(size)
+        radius = max(3, size // 20)
+        shadow_off = max(4, size // 12)
+        return f.get_height() + 2 * radius + shadow_off + 8
 
     def _menu_title_surface(self, screen_w, screen_h):
         if self._title_cache is not None and self._title_cache_w == (screen_w, screen_h):
             return self._title_cache
 
-        max_w = min(screen_w * 0.60, 1040)
-        max_h = screen_h * 0.56          # leave room for the button row + hint
-        # Grow the font until the widest line ("RUBBISH") fills max_w *or* the
-        # three stacked lines would exceed the vertical budget.
-        size = 36
-        while size < 260:
+        max_w = min(screen_w * 0.64, 1120)
+        max_h = screen_h * 0.72
+        # Grow the (condensed) Anton size until the widest line fills the width
+        # budget or the stacked block would exceed the height budget.
+        size = 40
+        line_gap_frac = -0.16     # negative: pull the tight Anton lines together
+        while size < 320:
             nxt = size + 4
-            too_wide = self.fonts.custom(nxt, True).size("RUBBISH")[0] > max_w
-            stack_h = 3 * self._title_line_height(nxt) + 2 * int(nxt * 0.04)
+            too_wide = self.fonts.title(nxt).size("RUBBISH")[0] > max_w
+            stack_h = 3 * self._title_line_height(nxt) + 2 * int(nxt * line_gap_frac)
             if too_wide or stack_h > max_h:
                 break
             size += 4
-        font = self.fonts.custom(size, True)
-        radius = max(3, size // 18)
-        shadow_off = max(4, size // 11)
-        line_gap = int(size * 0.04)
+        font = self.fonts.title(size)
+        radius = max(3, size // 20)
+        shadow_off = max(4, size // 12)
+        line_gap = int(size * line_gap_frac)
 
         parts = [self._outlined_title_line(font, ln, radius, shadow_off)
                  for ln in self._TITLE_LINES]
@@ -876,78 +933,68 @@ class UIManager:
         for p in parts:
             surf.blit(p, ((total_w - p.get_width()) // 2, y))
             y += p.get_height() + line_gap
-        self._speckle_title(surf)
+        self._apply_distress(surf)
 
         self._title_cache = surf
         self._title_cache_w = (screen_w, screen_h)
         return surf
 
+    MENU_BAR_H = 46
+
     def draw_main_menu(self, screen):
-        """Render the title card on top of the already-drawn, animating city."""
+        """Title card over the live city: a top toolbar of menu actions (as in
+        the reference) and the big distressed Anton title centred below."""
         self.ui = UIPrimitives(screen, self.fonts)
         c = self.ui.c
         w, h = screen.get_size()
         self._screen_size = (w, h)
         self.menu_buttons = []
 
-        # Faint top/bottom vignette only -- the city itself stays bright, as in
-        # the reference. The title's own keyline keeps it readable.
+        # Faint bottom vignette for depth (top is covered by the bar).
         vig = pygame.Surface((w, h), pygame.SRCALPHA)
-        for i in range(90):
-            a = int(150 * (1 - i / 90))
-            pygame.draw.line(vig, (8, 10, 16, a), (0, i), (w, i))
+        for i in range(80):
+            a = int(140 * (1 - i / 80))
             pygame.draw.line(vig, (8, 10, 16, a), (0, h - 1 - i), (w, h - 1 - i))
         screen.blit(vig, (0, 0))
 
+        # Title, centred in the area below the top bar.
         title = self._menu_title_surface(w, h)
         tx = (w - title.get_width()) // 2
-        ty = int(h * 0.06)
+        region_top = self.MENU_BAR_H + 8
+        region_h = h - region_top - 24
+        ty = region_top + max(0, (region_h - title.get_height()) // 2)
         screen.blit(title, (tx, ty))
-        below = ty + title.get_height()
 
-        if self._menu_settings_open:
-            self._draw_menu_settings(screen, w, h, below)
-        else:
-            self._draw_menu_main(screen, w, h, below)
+        # Top toolbar bar with the menu actions (drawn last so it sits on top).
+        self._draw_top_menu_bar(screen, w)
 
         if getattr(self.game, "toast", "") and self.game.toast_timer > 0:
             tw = self.fonts.size("body_s", self.game.toast)[0]
             self.ui.text("body_s", self.game.toast, c.ACCENT_CORAL,
-                         (w - tw) // 2, h - 34)
+                         (w - tw) // 2, h - 32)
 
-    def _menu_button_row(self, w, h, below):
-        """Geometry for the centred button row: (rects, bw, bh, start_x, row_y)."""
-        n = len(self.MAIN_MENU_ITEMS)
-        gap = 16
-        bh = 52
-        bw = min(210, max(150, (w - (n + 1) * gap) // n))
-        total = n * bw + (n - 1) * gap
-        start_x = (w - total) // 2
-        row_y = max(below + 34, int(h * 0.66))
-        row_y = min(row_y, h - bh - 46)
-        return bw, bh, gap, start_x, row_y
+        if self._menu_settings_open:
+            self._draw_menu_settings(screen, w, h, region_top)
 
-    def _draw_menu_main(self, screen, w, h, below):
+    def _draw_top_menu_bar(self, screen, w):
         c = self.ui.c
         mouse = pygame.mouse.get_pos()
-        bw, bh, gap, x, row_y = self._menu_button_row(w, h, below)
+        bar_h = self.MENU_BAR_H
+        bar = pygame.Surface((w, bar_h), pygame.SRCALPHA)
+        bar.fill((14, 16, 22, 236))
+        screen.blit(bar, (0, 0))
+        pygame.draw.line(screen, c.BORDER_SUBTLE, (0, bar_h), (w, bar_h), 1)
 
-        # Subtle darkened strip behind the row for legibility over the city.
-        total = len(self.MAIN_MENU_ITEMS) * bw + (len(self.MAIN_MENU_ITEMS) - 1) * gap
-        strip = pygame.Surface((total + 40, bh + 28), pygame.SRCALPHA)
-        strip.fill((10, 12, 18, 120))
-        screen.blit(strip, (x - 20, row_y - 14))
-
+        x = 14
+        bh = 32
+        by = (bar_h - bh) // 2
         for action, label in self.MAIN_MENU_ITEMS:
-            rect = pygame.Rect(x, row_y, bw, bh)
+            bw = self.fonts.size("body_b", label)[0] + 34
+            rect = pygame.Rect(x, by, bw, bh)
             self.ui.button(rect, label, hovered=rect.collidepoint(mouse),
                            accent=(action == "new"))
             self.menu_buttons.append((rect, action))
-            x += bw + gap
-
-        hint = "Enter = New Game    Esc = Quit    F5 / F9 quick save & load in game"
-        hw = self.fonts.size("body_s", hint)[0]
-        self.ui.text("body_s", hint, c.TEXT_MUTED, (w - hw) // 2, row_y + bh + 18)
+            x += bw + 8
 
     def _draw_menu_settings(self, screen, w, h, below):
         c = self.ui.c

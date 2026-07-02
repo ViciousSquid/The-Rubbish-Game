@@ -8,6 +8,7 @@ from ui import UIManager
 from fleet import FleetManager
 from waste import WastePolicy
 from ambient import AmbientState
+from assets import asset_path
 import savegame
 
 CITY_W = 60
@@ -21,7 +22,7 @@ class WasteCityGame:
         
         # Load and set the application icon
         try:
-            icon = pygame.image.load("icon.ico")
+            icon = pygame.image.load(asset_path("icon.ico"))
             pygame.display.set_icon(icon)
         except (pygame.error, FileNotFoundError):
             # Fallback if the icon asset path isn't ready yet during development
