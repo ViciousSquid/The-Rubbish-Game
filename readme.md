@@ -8,9 +8,9 @@ Part Transport Tycoon logistics, part local-government black comedy, in an isome
 or not.
 
 
-<img src="https://github.com/user-attachments/assets/c319af75-2939-4168-a197-bdb480de5af0" width="900">
+[![Watch the game in action](https://img.youtube.com/vi/kwl9lmTJ-dg/0.jpg)](https://www.youtube.com/watch?v=kwl9lmTJ-dg)
 
-Why you'll like it
+#### Why you'll like it
 
 
 * A living isometric borough — a procedurally-generated town of terraces,
