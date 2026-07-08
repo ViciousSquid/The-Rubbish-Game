@@ -443,6 +443,59 @@ class Renderer:
                 best, best_d2 = truck, d2
         return best
 
+    def draw_unreachable(self, tiles, pulse=1.0):
+        """Flag building tiles no lorry can reach with a hatched red overlay.
+        `pulse` (0..1) gently modulates the fill alpha so the warning breathes."""
+        if not tiles:
+            return
+        cx   = self.screen.get_width() // 2 + self.camera["x"]
+        cy   = 120 + self.camera["y"]
+        zoom = self.camera["zoom"]
+        hw   = (self.tile_w / 2) * zoom
+        hh   = (self.tile_h / 2) * zoom
+        sw, sh = self.screen.get_size()
+        overlay = self._get_alpha_surf(sw, sh)
+        fill = int(60 + 45 * max(0.0, min(1.0, pulse)))
+        lw = max(2, int(2 * zoom))
+        for (x, y) in tiles:
+            iso = self.to_iso(x, y)
+            ix  = cx + iso[0] * zoom
+            iy  = cy + iso[1] * zoom
+            if ix < -hw or ix > sw + hw or iy < -hh or iy > sh + hh:
+                continue
+            pts = [(ix, iy), (ix + hw, iy + hh),
+                   (ix, iy + 2 * hh), (ix - hw, iy + hh)]
+            pygame.draw.polygon(overlay, (220, 50, 45, fill), pts)
+            pygame.draw.polygon(overlay, (240, 70, 60, 235), pts, lw)
+        self.screen.blit(overlay, (0, 0))
+
+    def draw_editor_cursor(self, tiles, color):
+        """Outline (and lightly fill) a set of map tiles under the editor brush
+        so painting reads like SimCity zoning. `tiles` is an iterable of (x, y)
+        grid coords; `color` is the RGB tint for the active tool."""
+        if not tiles:
+            return
+        cx   = self.screen.get_width() // 2 + self.camera["x"]
+        cy   = 120 + self.camera["y"]
+        zoom = self.camera["zoom"]
+        hw   = (self.tile_w / 2) * zoom
+        hh   = (self.tile_h / 2) * zoom
+        r, g, b = color
+        sw, sh = self.screen.get_size()
+        overlay = self._get_alpha_surf(sw, sh)
+        lw = max(2, int(2 * zoom))
+        for (x, y) in tiles:
+            iso = self.to_iso(x, y)
+            ix  = cx + iso[0] * zoom
+            iy  = cy + iso[1] * zoom
+            if ix < -hw or ix > sw + hw or iy < -hh or iy > sh + hh:
+                continue
+            pts = [(ix, iy), (ix + hw, iy + hh),
+                   (ix, iy + 2 * hh), (ix - hw, iy + hh)]
+            pygame.draw.polygon(overlay, (r, g, b, 55), pts)
+            pygame.draw.polygon(overlay, (r, g, b, 230), pts, lw)
+        self.screen.blit(overlay, (0, 0))
+
     # ─── tile floor ───────────────────────────────────────────────────────────
 
     def draw_tile(self, x, y, tile, is_selected, zoom, city=None, static_only=False, snow=0.0):

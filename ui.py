@@ -446,6 +446,12 @@ class UIManager:
         # ── Debug tools (Ctrl+Shift+D) ───────────────────────────────────────
         self._debug_tab = "tools"        # "tools" | "editor" (editor only shown in bar)
         self.editor_tool = None          # current map-editor brush, or None
+        self.editor_brush_size = 1       # 1 / 3 / 5 -- SimCity-style square nib
+        self._editor_help_open = False   # intro/shortcuts overlay
+        self._editor_help_close_rect = None
+        self._editor_show_warnings = True    # highlight unreachable buildings
+        self._unreach_cache = set()          # cached stranded tiles…
+        self._unreach_cache_ver = -1         # …keyed on city.version
         self.editor_selected_area = None # round targeted by district tools
         self._debug_status = ""          # short feedback line in the debug window
         # Bottom-bar editor mode: replaces the old floating editor sub-tab.
@@ -563,39 +569,152 @@ class UIManager:
         clicks to the editor brush instead of normal tile selection."""
         return self._editor_mode
 
-    def apply_editor_brush(self, tx, ty):
-        """Apply the current editor brush to map tile (tx, ty). Called from
-        main.py's handle_map_click. Returns True if a tile was changed."""
+    def apply_editor_brush(self, tx, ty, quiet=False):
+        """Apply the current editor brush to a single map tile (tx, ty).
+
+        `quiet` suppresses the status feedback line -- drag-painting sets it so
+        the bar doesn't flicker "Can't apply that tool there" every time the nib
+        sweeps across a road. Returns True if the tile actually changed."""
         tool = self.editor_tool
         if not tool:
             return False
         city = self.game.city
         mode = tool.get("mode")
         changed = False
-        if mode == "bulldoze":
+        if mode == "zone":
+            kind = tool.get("kind", "residential")
+            changed = city.editor_paint_zone(tx, ty, kind)
+            if changed and not quiet:
+                self._debug_status = f"Zoned {kind} at ({tx},{ty})."
+        elif mode == "bulldoze":
             changed = city.editor_bulldoze(tx, ty)
-            if changed:
+            if changed and not quiet:
                 self._debug_status = f"Bulldozed ({tx},{ty})."
         elif mode == "green":
             changed = city.editor_place_green(tx, ty)
-            if changed:
+            if changed and not quiet:
                 self._debug_status = f"Placed green square at ({tx},{ty})."
         elif mode == "clear_green":
             changed = city.editor_clear_green(tx, ty, tool.get("kind", "residential"))
-            if changed:
+            if changed and not quiet:
                 self._debug_status = f"Redeveloped green square at ({tx},{ty})."
         elif mode == "build":
             style = tool.get("style")
             changed = city.editor_place_building(tx, ty, style)
-            if changed:
+            if changed and not quiet:
                 self._debug_status = f"Built {STYLE_LABELS.get(style, style)} at ({tx},{ty})."
+        elif mode == "road":
+            changed = city.editor_place_road(tx, ty)
+            if changed and not quiet:
+                self._debug_status = f"Laid road at ({tx},{ty})."
+        elif mode == "erase_road":
+            changed = city.editor_remove_road(tx, ty)
+            if changed and not quiet:
+                self._debug_status = f"Removed road at ({tx},{ty})."
         elif mode == "landfill":
             changed = city.editor_place_landfill(tx, ty)
-            if changed:
+            if changed and not quiet:
                 self._debug_status = f"Sited landfill at ({tx},{ty})."
-        if not changed:
+        if not changed and not quiet:
             self._debug_status = "Can't apply that tool there."
         return changed
+
+    # ── SimCity-style painting: brush footprint + drag application ────────────
+    def editor_brush_footprint_radius(self):
+        """Half-width of the square nib for area tools (0 = 1x1, 1 = 3x3…)."""
+        return max(0, (self.editor_brush_size - 1) // 2)
+
+    def editor_brush_tiles(self, cx, cy):
+        """Tiles covered by the current nib centred on (cx, cy)."""
+        r = self.editor_brush_footprint_radius()
+        return [(cx + dx, cy + dy)
+                for dy in range(-r, r + 1)
+                for dx in range(-r, r + 1)]
+
+    def editor_paint(self, cx, cy):
+        """Apply the current brush across its footprint at map tile (cx, cy).
+        The landfill tool is always a single fixed stamp regardless of nib size.
+        Returns True if anything changed."""
+        tool = self.editor_tool
+        if not tool:
+            return False
+        if tool.get("mode") == "landfill":
+            return self.apply_editor_brush(cx, cy, quiet=True)
+        changed = False
+        for (tx, ty) in self.editor_brush_tiles(cx, cy):
+            if self.apply_editor_brush(tx, ty, quiet=True):
+                changed = True
+        return changed
+
+    def editor_cursor_tiles(self, hovered):
+        """Map tiles the brush preview should outline under `hovered`. Mirrors
+        the actual footprint each tool will affect, including the clamped 8x8
+        block the landfill tool drops."""
+        if not hovered:
+            return []
+        cx, cy = hovered["x"], hovered["y"]
+        tool = self.editor_tool or {}
+        city = self.game.city
+        if tool.get("mode") == "landfill":
+            size = getattr(city, "LANDFILL_SIZE", 8)
+            ox = max(0, min(city.width - size, cx - size // 2))
+            oy = max(0, min(city.height - size, cy - size // 2))
+            return [(x, y) for y in range(oy, oy + size)
+                    for x in range(ox, ox + size)]
+        return self.editor_brush_tiles(cx, cy)
+
+    def editor_cursor_color(self):
+        """RGB tint for the brush preview, keyed to what the active tool does."""
+        tool = self.editor_tool or {}
+        mode = tool.get("mode")
+        kind = tool.get("kind")
+        if mode == "zone":
+            return (90, 200, 110) if kind == "residential" else (80, 160, 235)
+        if mode == "clear_green":
+            return (90, 200, 110) if kind == "residential" else (80, 160, 235)
+        if mode == "build":
+            return (90, 200, 110) if tool.get("style") in RES_STYLE_WEIGHTS \
+                else (80, 160, 235)
+        if mode == "green":
+            return (120, 210, 120)
+        if mode == "road":
+            return (200, 200, 208)
+        if mode == "erase_road":
+            return (235, 140, 70)
+        if mode == "bulldoze":
+            return (235, 95, 80)
+        if mode == "landfill":
+            return (225, 190, 80)
+        return (245, 245, 245)
+
+    def editor_cycle_brush_size(self, direction):
+        """Step the nib through 1 -> 3 -> 5 (SimCity-style). `direction` is +/-1."""
+        sizes = [1, 3, 5]
+        try:
+            i = sizes.index(self.editor_brush_size)
+        except ValueError:
+            i = 0
+        i = max(0, min(len(sizes) - 1, i + (1 if direction > 0 else -1)))
+        self.editor_brush_size = sizes[i]
+
+    def _set_brush_size(self, size):
+        self.editor_brush_size = size
+
+    def _set_tool_zone(self, kind):
+        self.editor_tool = {"mode": "zone", "kind": kind}
+
+    def _set_tool_road(self, erase):
+        self.editor_tool = {"mode": "erase_road" if erase else "road"}
+
+    def editor_unreachable_tiles(self):
+        """Stranded building tiles for the current map, recomputed only when the
+        map actually changes (city.version bumps on every edit)."""
+        city = self.game.city
+        ver = getattr(city, "version", 0)
+        if ver != self._unreach_cache_ver:
+            self._unreach_cache = city.unreachable_building_tiles()
+            self._unreach_cache_ver = ver
+        return self._unreach_cache
 
     # ----- per-vehicle inspect windows (opened by clicking a lorry) --------
     def _truck_window_title(self, truck):
@@ -2756,6 +2875,7 @@ class UIManager:
         self._debug_status = ""
         self._city_name_active = False
         self._city_name_buffer = ""
+        self._editor_help_open = True       # greet with the how-to overlay
 
     def exit_editor_state(self):
         self._editor_mode = False
@@ -2780,8 +2900,92 @@ class UIManager:
         self._draw_editor_topbar(screen, w)
         self._draw_editor_bar(screen, w, h)
         self._draw_toast(screen, w, h)
+        if self._editor_help_open:
+            self._draw_editor_help(screen, w, h)
         if self._city_name_active:
             self._draw_city_name_prompt(screen, w, h)
+
+    def _draw_editor_help(self, screen, w, h):
+        """Intro + keyboard-shortcut overlay shown when the editor opens (and
+        via the Help button / H). Dismissed with the ✕ in its top-right."""
+        ui = self.ui
+        c = ui.c
+        mouse = pygame.mouse.get_pos()
+
+        veil = pygame.Surface((w, h), pygame.SRCALPHA)
+        veil.fill((0, 0, 0, 150))
+        screen.blit(veil, (0, 0))
+
+        pw, ph = 620, 486
+        px = (w - pw) // 2
+        py = max(self.MENU_BAR_H + 12, (h - ph) // 2)
+        ui.panel(px, py, pw, ph, border=True)
+        pygame.draw.line(screen, c.ACCENT_AMBER, (px, py + 52), (px + pw, py + 52), 2)
+
+        ui.text("h1", "City Editor", c.ACCENT_AMBER, px + 24, py + 16)
+
+        # Close button (✕) top-right.
+        cb = pygame.Rect(px + pw - 40, py + 12, 28, 28)
+        hov = cb.collidepoint(mouse)
+        pygame.draw.rect(screen, (70, 40, 40) if hov else c.BG_PANEL, cb, border_radius=4)
+        pygame.draw.rect(screen, c.ACCENT_AMBER if hov else c.BORDER_SUBTLE, cb, 1, border_radius=4)
+        xs = ui.fonts.render("body_b", "✕", c.TEXT_PRIMARY)
+        screen.blit(xs, (cb.centerx - xs.get_width() // 2, cb.centery - xs.get_height() // 2))
+        self._editor_help_close_rect = cb
+
+        x = px + 24
+        y = py + 66
+        for line in (
+            "Drag on the map to paint. Pick a tool from the bottom bar, then hold the",
+            "left mouse button and drag to lay it down. Place a Landfill site, then hit",
+            "\u201cPlay This City\u201d when you're happy with the borough.",
+        ):
+            ui.text("body", line, c.TEXT_PRIMARY, x, y)
+            y += 22
+        y += 10
+        ui.text("body_b", "Keyboard & mouse", c.ACCENT_TEAL, x, y)
+        y += 26
+
+        shortcuts = [
+            ("R", "Residential zone"),
+            ("C", "Commercial zone"),
+            ("P", "Park / green space"),
+            ("D", "Road"),
+            ("E", "Erase road"),
+            ("B", "Bulldoze building"),
+            ("L", "Landfill (8×8 stamp)"),
+            ("[ ]", "Brush size 1× / 3× / 5×"),
+            ("G", "Toggle round overlay"),
+            ("W", "Toggle reach warnings"),
+            ("R-drag", "Pan the camera"),
+            ("Scroll", "Zoom in / out"),
+            ("Esc", "Drop tool · then exit"),
+        ]
+        col_w = (pw - 48) // 2
+        row_h = 26
+        key_w = 78
+        for i, (key, desc) in enumerate(shortcuts):
+            col = i % 2
+            row = i // 2
+            cx0 = x + col * col_w
+            cy0 = y + row * row_h
+            chip = pygame.Rect(cx0, cy0, key_w - 10, 20)
+            pygame.draw.rect(screen, (18, 20, 26), chip, border_radius=4)
+            pygame.draw.rect(screen, c.BORDER_SUBTLE, chip, 1, border_radius=4)
+            ks = ui.fonts.render("body_s", key, c.ACCENT_AMBER)
+            screen.blit(ks, (chip.centerx - ks.get_width() // 2,
+                             chip.centery - ks.get_height() // 2))
+            ui.text("body_s", desc, c.TEXT_PRIMARY, cx0 + key_w, cy0 + 2)
+
+        yb = y + ((len(shortcuts) + 1) // 2) * row_h + 12
+        pygame.draw.rect(screen, (220, 50, 45), pygame.Rect(x, yb + 2, 14, 14), border_radius=3)
+        pygame.draw.rect(screen, (240, 70, 60), pygame.Rect(x, yb + 2, 14, 14), 1, border_radius=3)
+        ui.text("body_s",
+                "Red squares: buildings no lorry can reach (too far from a connected road).",
+                c.TEXT_PRIMARY, x + 22, yb)
+        yb += 24
+        ui.text("caption", "Press H or ? any time to show this again.",
+                c.TEXT_DIM, x, yb)
 
     def _draw_editor_topbar(self, screen, w):
         ui = self.ui
@@ -2798,7 +3002,35 @@ class UIManager:
         screen.blit(lsurf, (14, (bar_h - lsurf.get_height()) // 2))
 
         self._editor_top_widgets = []
-        items = [("save",  "Save City"),
+
+        # Reachability readout pill (click to toggle the red highlight).
+        n = len(self.editor_unreachable_tiles())
+        if self._editor_show_warnings:
+            if n:
+                pill_txt = f"⚠ {n} unreachable"
+                pill_fg  = (255, 210, 205)
+                pill_bg  = (120, 34, 30)
+            else:
+                pill_txt = "✓ All collectable"
+                pill_fg  = (210, 245, 215)
+                pill_bg  = (28, 74, 40)
+        else:
+            pill_txt = f"⚠ {n} hidden" if n else "✓ warnings off"
+            pill_fg  = c.TEXT_MUTED
+            pill_bg  = (34, 38, 46)
+        psz = ui.fonts.size("body_s", pill_txt)
+        pill = pygame.Rect(24 + lsurf.get_width(), (bar_h - 24) // 2,
+                           psz[0] + 22, 24)
+        hovp = pill.collidepoint(mouse)
+        pygame.draw.rect(screen, pill_bg, pill, border_radius=12)
+        pygame.draw.rect(screen, pill_fg if hovp else pill_bg, pill, 1, border_radius=12)
+        ps = ui.fonts.render("body_s", pill_txt, pill_fg)
+        screen.blit(ps, (pill.centerx - ps.get_width() // 2,
+                         pill.centery - ps.get_height() // 2))
+        self._editor_top_widgets.append((pill, "warn"))
+
+        items = [("help",  "? Help"),
+                 ("save",  "Save City"),
                  ("play",  "Play This City"),
                  ("regen", "Regenerate"),
                  ("exit",  "Exit to Menu")]
@@ -2814,7 +3046,11 @@ class UIManager:
             x -= 8
 
     def _editor_top_action(self, action):
-        if action == "save":
+        if action == "help":
+            self._editor_help_open = not self._editor_help_open
+        elif action == "warn":
+            self._editor_show_warnings = not self._editor_show_warnings
+        elif action == "save":
             self.start_city_name_prompt()
         elif action == "play":
             self.game.play_edited_city()
@@ -2826,6 +3062,8 @@ class UIManager:
     def editor_on_mouse_down(self, pos):
         """Return True if the press landed on editor chrome (suppresses the
         camera pan while still letting the click resolve on release)."""
+        if self._editor_help_open:
+            return True                    # overlay eats all map interaction
         if self._city_name_active:
             return True
         if pos[1] <= self.MENU_BAR_H:
@@ -2836,7 +3074,11 @@ class UIManager:
         """Resolve a click on the editor chrome. Returns True if consumed (so
         main.py won't also treat it as a map-brush click)."""
         if not was_click:
-            return False
+            return self._editor_help_open   # swallow drags while help is up
+        if self._editor_help_open:
+            # Click the ✕ (or anywhere outside the panel) to dismiss.
+            self._editor_help_open = False
+            return True
         if self._city_name_active:
             return True
         for rect, action in self._editor_top_widgets:
@@ -2927,39 +3169,80 @@ class UIManager:
         pygame.draw.line(screen, c.BORDER_SUBTLE, (bx, bar_y + 6), (bx, bar_y + 32))
         bx += 10
 
-        action_tools = [
+        # Primary "paint" palette: zone brushes first (SimCity-style), then the
+        # land tools. Each entry is (label, callback, active?, tint).
+        palette = [
+            ("Residential",
+             lambda: self._set_tool_zone("residential"),
+             bool(tool and tool.get("mode") == "zone"
+                  and tool.get("kind") == "residential"),
+             (52, 150, 82)),
+            ("Commercial",
+             lambda: self._set_tool_zone("commercial"),
+             bool(tool and tool.get("mode") == "zone"
+                  and tool.get("kind") == "commercial"),
+             (48, 118, 176)),
+            (None, None, None, None),                 # divider
+            ("Park",
+             self._set_tool_green,
+             bool(tool and tool.get("mode") == "green"),
+             (70, 150, 70)),
             ("Bulldoze",
              self._set_tool_bulldoze,
-             bool(tool and tool.get("mode") == "bulldoze")),
-            ("Green sq.",
-             self._set_tool_green,
-             bool(tool and tool.get("mode") == "green")),
-            ("→Res",
-             lambda: self._set_tool_clear_green("residential"),
-             bool(tool and tool.get("mode") == "clear_green"
-                  and tool.get("kind") == "residential")),
-            ("→Com",
-             lambda: self._set_tool_clear_green("commercial"),
-             bool(tool and tool.get("mode") == "clear_green"
-                  and tool.get("kind") == "commercial")),
+             bool(tool and tool.get("mode") == "bulldoze"),
+             (170, 66, 56)),
+            (None, None, None, None),                 # divider
+            ("Road",
+             lambda: self._set_tool_road(False),
+             bool(tool and tool.get("mode") == "road"),
+             (120, 122, 130)),
+            ("Erase Rd",
+             lambda: self._set_tool_road(True),
+             bool(tool and tool.get("mode") == "erase_road"),
+             (168, 104, 52)),
             ("Landfill",
              self._set_tool_landfill,
-             bool(tool and tool.get("mode") == "landfill")),
+             bool(tool and tool.get("mode") == "landfill"),
+             (168, 138, 58)),
         ]
-        for label, fn, active in action_tools:
+        for label, fn, active, tint in palette:
+            if label is None:
+                bx += 4
+                pygame.draw.line(screen, c.BORDER_SUBTLE,
+                                 (bx, bar_y + 6), (bx, bar_y + 32))
+                bx += 8
+                continue
             tw = ui.fonts.size("body_b", label)[0] + 16
             rect = pygame.Rect(bx, r1_y, tw, BTN_H)
-            ui.button(rect, label, accent=active, hovered=rect.collidepoint(mouse))
+            ui.button(rect, label, accent=active, hovered=rect.collidepoint(mouse),
+                      color=tint)
             self._editor_bar_widgets.append((rect, fn))
             bx += tw + GAP
 
+        # Brush-size (nib) control.
+        bx += 4
+        pygame.draw.line(screen, c.BORDER_SUBTLE, (bx, bar_y + 6), (bx, bar_y + 32))
+        bx += 8
+        nl = ui.fonts.render("body_s", "Nib:", c.TEXT_MUTED)
+        screen.blit(nl, (bx, r1_y + (BTN_H - nl.get_height()) // 2))
+        bx += nl.get_width() + 6
+        for size in (1, 3, 5):
+            lbl = f"{size}×"
+            tw = ui.fonts.size("body_b", lbl)[0] + 12
+            rect = pygame.Rect(bx, r1_y, tw, BTN_H)
+            ui.button(rect, lbl, accent=(self.editor_brush_size == size),
+                      hovered=rect.collidepoint(mouse))
+            self._editor_bar_widgets.append((rect, lambda s=size: self._set_brush_size(s)))
+            bx += tw + GAP
+
         # Status text
-        bx += 6
+        bx += 8
         if tool:
-            status_text = f"Tool: {self._editor_tool_label(tool)}"
+            status_text = (f"Tool: {self._editor_tool_label(tool)}"
+                           "   ·   drag to paint · right-drag to pan")
             status_col  = c.ACCENT_TEAL
         else:
-            status_text = "Select a brush then click the map  ·  ESC to exit"
+            status_text = "Pick a tool, then drag on the map to paint  ·  right-drag pans  ·  ESC exits"
             status_col  = c.TEXT_DIM
         ssurf = ui.fonts.render("body_s", status_text, status_col)
         screen.blit(ssurf, (bx, r1_y + (BTN_H - ssurf.get_height()) // 2))
@@ -3227,6 +3510,13 @@ class UIManager:
 
     def _editor_tool_label(self, tool):
         mode = tool.get("mode")
+        if mode == "zone":
+            kind = tool.get("kind", "residential")
+            return f"Zone {kind.capitalize()}"
+        if mode == "road":
+            return "Road"
+        if mode == "erase_road":
+            return "Erase road"
         if mode == "bulldoze":
             return "Bulldoze"
         if mode == "landfill":

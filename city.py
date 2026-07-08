@@ -671,6 +671,147 @@ class CityGenerator:
             return False
         return self.editor_place_green(x, y)
 
+    def editor_paint_zone(self, x, y, kind):
+        """SimCity-style zone brush. Convert any buildable tile at (x, y) into a
+        weighted-random building of `kind` ('residential' or 'commercial'),
+        whether the tile is currently green space or a building of the other
+        kind. Roads and landfill are refused so haul routes stay intact.
+
+        Painting a tile that is *already* the requested kind is a no-op (returns
+        False). That keeps click-and-drag painting idempotent -- a tile is only
+        rolled once as the cursor sweeps over it, so buildings don't flicker or
+        re-roll every frame while the mouse is held down. Returns True on a real
+        change."""
+        if not self.is_inside(x, y):
+            return False
+        if kind not in ("residential", "commercial"):
+            return False
+        old = self.tiles[y][x]
+        if old.type in ("road", "landfill"):
+            return False
+        if old.type == kind:
+            return False
+        area_id = old.area_id
+        weights = RES_STYLE_WEIGHTS if kind == "residential" else COM_STYLE_WEIGHTS
+        style = _weighted_choice(weights)
+        self._unwind_tile(x, y)
+        tile = self._build_tile(kind, area_id, style)
+        self.tiles[y][x] = tile
+        self._register_area_tile(x, y, tile)
+        self.version += 1
+        return True
+
+    def editor_place_road(self, x, y):
+        """Road brush: pave any buildable tile at (x, y). Existing roads and the
+        landfill are left untouched; building/green bookkeeping is unwound first.
+        The fleet rebuilds its road graph from these tiles when a game starts on
+        the city, so painted roads become drivable automatically. Returns True on
+        a real change."""
+        if not self.is_inside(x, y):
+            return False
+        old = self.tiles[y][x]
+        if old.type in ("road", "landfill"):
+            return False
+        area_id = old.area_id
+        self._unwind_tile(x, y)
+        tile = Tile("road")
+        tile.area_id = area_id
+        self.tiles[y][x] = tile
+        self.metrics["roads"] = self.metrics.get("roads", 0) + 1
+        self.version += 1
+        return True
+
+    def editor_remove_road(self, x, y):
+        """Erase-road brush: turn a road tile back into green space. Refuses the
+        landfill's haul gate so the tip stays reachable. Returns True on a real
+        change."""
+        if not self.is_inside(x, y):
+            return False
+        old = self.tiles[y][x]
+        if old.type != "road":
+            return False
+        gate = self.landfill.get("gate") if self.landfill else None
+        if gate is not None and tuple(gate) == (x, y):
+            return False
+        area_id = old.area_id
+        tile = Tile("green")
+        tile.area_id = area_id
+        tile.bin_fill = 0.0
+        self.tiles[y][x] = tile
+        self.metrics["roads"] = max(0, self.metrics.get("roads", 0) - 1)
+        self.metrics["green"] = self.metrics.get("green", 0) + 1
+        self.version += 1
+        return True
+
+    def unreachable_building_tiles(self, depot=(5, 5), reach=2):
+        """Return the set of (x, y) building tiles no lorry could ever service.
+
+        Mirrors the fleet's real routing: a lorry drives the road network out
+        from the depot, and its loaders reach up to `reach` tiles (Manhattan)
+        from a stop. A building is therefore collectable only if it sits within
+        `reach` of a road tile that connects back to the depot. This flags the
+        two ways an edited map can silently strand bins -- zoning buildings too
+        far from any road, or erasing roads until a chunk is cut off from the
+        depot. Roads/green/landfill are never counted."""
+        from collections import deque
+        W, H = self.width, self.height
+
+        road = [[False] * W for _ in range(H)]
+        any_road = False
+        for y in range(H):
+            trow = self.tiles[y]
+            rrow = road[y]
+            for x in range(W):
+                if trow[x].type == "road":
+                    rrow[x] = True
+                    any_road = True
+
+        buildings = {(x, y)
+                     for y in range(H) for x in range(W)
+                     if self.tiles[y][x].type in ("residential", "commercial")}
+        if not any_road:
+            return buildings
+
+        # BFS the road network reachable from the depot (or, if the depot tile
+        # itself was paved over/erased, from any road tile beside it).
+        seen = [[False] * W for _ in range(H)]
+        dq = deque()
+        dx0, dy0 = depot
+        seeds = []
+        if self.is_inside(dx0, dy0) and road[dy0][dx0]:
+            seeds.append((dx0, dy0))
+        else:
+            for ax, ay in ((dx0 + 1, dy0), (dx0 - 1, dy0),
+                           (dx0, dy0 + 1), (dx0, dy0 - 1)):
+                if self.is_inside(ax, ay) and road[ay][ax]:
+                    seeds.append((ax, ay))
+        for sx, sy in seeds:
+            seen[sy][sx] = True
+            dq.append((sx, sy))
+        while dq:
+            x, y = dq.popleft()
+            for ax, ay in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                if 0 <= ax < W and 0 <= ay < H and road[ay][ax] and not seen[ay][ax]:
+                    seen[ay][ax] = True
+                    dq.append((ax, ay))
+
+        # Splash each reachable road's kerbside reach onto a served mask.
+        offs = [(ox, oy)
+                for ox in range(-reach, reach + 1)
+                for oy in range(-reach, reach + 1)
+                if 0 < abs(ox) + abs(oy) <= reach]
+        served = [[False] * W for _ in range(H)]
+        for y in range(H):
+            srow = seen[y]
+            for x in range(W):
+                if srow[x]:
+                    for ox, oy in offs:
+                        bx, by = x + ox, y + oy
+                        if 0 <= bx < W and 0 <= by < H:
+                            served[by][bx] = True
+
+        return {(x, y) for (x, y) in buildings if not served[y][x]}
+
     def regenerate_area(self, area_id):
         """District tool: re-roll every building in a round to a fresh style,
         keeping each tile's existing residential/commercial split. Returns

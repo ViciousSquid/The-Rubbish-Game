@@ -16,6 +16,35 @@ CITY_W = 60
 CITY_H = 60
 
 
+def _tiles_on_line(a, b):
+    """Integer grid tiles from `a` to `b` inclusive (Bresenham). The start `a`
+    is excluded so a continuous drag doesn't re-apply the tile painted on the
+    previous motion event. Used to fill gaps when the mouse jumps several tiles
+    between frames."""
+    (x0, y0), (x1, y1) = a, b
+    if (x0, y0) == (x1, y1):
+        return [(x1, y1)]
+    dx = abs(x1 - x0)
+    dy = -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
+    out = []
+    while True:
+        if (x0, y0) != a:
+            out.append((x0, y0))
+        if x0 == x1 and y0 == y1:
+            break
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x0 += sx
+        if e2 <= dx:
+            err += dx
+            y0 += sy
+    return out
+
+
 class WasteCityGame:
     def __init__(self):
         pygame.init()
@@ -41,6 +70,12 @@ class WasteCityGame:
         self.drag_moved = False
         self._ui_press = False     # True when a left-press started on the UI
         self.mouse = {"x": 0, "y": 0}
+
+        # Editor drag-painting (SimCity-style): left-drag paints the active
+        # brush; right/middle-drag pans instead.
+        self._editor_painting = False
+        self._editor_last_tile = None   # last painted (x, y) for line-fill
+        self._editor_pan = False        # right/middle button panning the camera
 
         self.selected_tile = None
         self.hovered_tile = None
@@ -229,6 +264,10 @@ class WasteCityGame:
         self.ui._menu_editor_open = False
         self.ui.enter_editor_state()
         self.clear_selection()
+        self.hovered_tile = None
+        self._editor_painting = False
+        self._editor_last_tile = None
+        self._editor_pan = False
         self.toast = ""
         self.toast_timer = 0.0
         self.state = "editor"
@@ -249,6 +288,7 @@ class WasteCityGame:
         if not getattr(self.city, "landfill", None):
             self.set_toast("Place a landfill site first (Landfill tool).")
             return
+        stranded = len(self.city.unreachable_building_tiles())
         self.economy = Economy()
         self.waste = WastePolicy()
         self.fleet = FleetManager(self)
@@ -263,6 +303,10 @@ class WasteCityGame:
         self.toast_timer = 0.0
         self.state = "playing"
         self._center_camera()
+        if stranded:
+            self.set_toast(
+                f"Note: {stranded} building(s) sit too far from a road and "
+                f"won't be collected — their bins will overflow.")
 
     def exit_editor_to_menu(self):
         """Abandon the editor and return to the main menu (with a fresh living
@@ -275,18 +319,32 @@ class WasteCityGame:
         self.state = "menu"
         self._center_camera()
 
+    def _editor_tile_at(self, pos):
+        return self.renderer.screen_to_tile(pos[0], pos[1],
+                                             self.screen.get_width(),
+                                             self.screen.get_height())
+
     def _editor_map_click(self, pos):
-        coord = self.renderer.screen_to_tile(pos[0], pos[1],
-                                              self.screen.get_width(),
-                                              self.screen.get_height())
+        """A discrete click on the map (used for the landfill stamp, which is a
+        single placement rather than a paint stroke)."""
+        coord = self._editor_tile_at(pos)
         tool = self.ui.editor_tool or {}
         if tool.get("mode") == "landfill":
             if self.city.editor_place_landfill(coord["x"], coord["y"]):
                 self.set_toast("Landfill sited.")
             else:
                 self.set_toast("Can't place a landfill there.")
-        else:
-            self.ui.apply_editor_brush(coord["x"], coord["y"])
+
+    def _editor_paint_at(self, pos):
+        """Paint the active brush at the tile under `pos`, filling the straight
+        line back to the previously-painted tile so a fast drag leaves no gaps."""
+        coord = self._editor_tile_at(pos)
+        cur = (coord["x"], coord["y"])
+        last = self._editor_last_tile
+        stops = _tiles_on_line(last, cur) if last is not None else [cur]
+        for (tx, ty) in stops:
+            self.ui.editor_paint(tx, ty)
+        self._editor_last_tile = cur
 
     def _step_editor(self, dt):
         """Editor frame: keep the UI responsive and the camera clamped, but
@@ -298,6 +356,17 @@ class WasteCityGame:
         self.ui.update(dt)
         self._clamp_camera()
 
+    # Hotkeys that select a brush from the keyboard (SimCity muscle memory).
+    _EDITOR_HOTKEYS = {
+        pygame.K_r: ("zone", "residential"),
+        pygame.K_c: ("zone", "commercial"),
+        pygame.K_p: ("green", None),
+        pygame.K_d: ("road", None),
+        pygame.K_e: ("erase_road", None),
+        pygame.K_b: ("bulldoze", None),
+        pygame.K_l: ("landfill", None),
+    }
+
     def _handle_editor_event(self, event):
         ui = self.ui
         # A save-name prompt captures all keys while open.
@@ -307,16 +376,57 @@ class WasteCityGame:
             return
 
         if event.type == pygame.KEYDOWN:
+            # Help overlay: H/? toggles it; while it's up it captures Esc and
+            # otherwise swallows keys so shortcuts don't fire behind it.
+            if event.key == pygame.K_h or event.unicode == "?":
+                ui._editor_help_open = not ui._editor_help_open
+                return
+            if ui._editor_help_open:
+                if event.key == pygame.K_ESCAPE:
+                    ui._editor_help_open = False
+                return
             if event.key == pygame.K_ESCAPE:
-                self.exit_editor_to_menu()
+                # First Esc drops the active brush; a second Esc leaves the editor.
+                if ui.editor_tool:
+                    ui.editor_tool = None
+                else:
+                    self.exit_editor_to_menu()
             elif event.key == pygame.K_g:
                 self.show_areas = not self.show_areas
+            elif event.key == pygame.K_w:
+                ui._editor_show_warnings = not ui._editor_show_warnings
+            elif event.key in (pygame.K_LEFTBRACKET, pygame.K_MINUS):
+                ui.editor_cycle_brush_size(-1)
+            elif event.key in (pygame.K_RIGHTBRACKET, pygame.K_EQUALS):
+                ui.editor_cycle_brush_size(1)
+            elif event.key in self._EDITOR_HOTKEYS:
+                mode, kind = self._EDITOR_HOTKEYS[event.key]
+                ui.editor_tool = {"mode": mode}
+                if kind:
+                    ui.editor_tool["kind"] = kind
 
         elif event.type == pygame.MOUSEBUTTONDOWN:
             if event.button == 1:
-                self._ui_press = ui.editor_on_mouse_down(event.pos)
-                self.dragging = True
-                self.drag_moved = False
+                on_chrome = ui.editor_on_mouse_down(event.pos)
+                self._ui_press = on_chrome
+                tool = ui.editor_tool or {}
+                if on_chrome:
+                    # Resolve as a click on release; never paint or pan.
+                    self.dragging = True
+                    self.drag_moved = False
+                elif tool and tool.get("mode") != "landfill":
+                    # Paint tools: start a stroke and paint the first tile now.
+                    self._editor_painting = True
+                    self._editor_last_tile = None
+                    self._update_editor_hover(event.pos)
+                    self._editor_paint_at(event.pos)
+                else:
+                    # Landfill (single stamp) or no tool: treat as a click; a
+                    # left-drag with no tool falls back to panning.
+                    self.dragging = True
+                    self.drag_moved = False
+            elif event.button in (2, 3):
+                self._editor_pan = True          # right / middle drag pans
             elif event.button == 4:
                 self.camera["zoom"] = min(4, self.camera["zoom"] * 1.1)
             elif event.button == 5:
@@ -324,21 +434,41 @@ class WasteCityGame:
 
         elif event.type == pygame.MOUSEBUTTONUP:
             if event.button == 1:
-                was_click = self.dragging and not self.drag_moved
-                consumed = ui.editor_on_mouse_up(event.pos, was_click)
-                if was_click and not consumed:
-                    self._editor_map_click(event.pos)
+                if self._editor_painting:
+                    self._editor_painting = False
+                    self._editor_last_tile = None
+                else:
+                    was_click = self.dragging and not self.drag_moved
+                    consumed = ui.editor_on_mouse_up(event.pos, was_click)
+                    if was_click and not consumed:
+                        self._editor_map_click(event.pos)
                 self.dragging = False
                 self._ui_press = False
+            elif event.button in (2, 3):
+                self._editor_pan = False
 
         elif event.type == pygame.MOUSEMOTION:
-            if self.dragging and not self._ui_press:
-                self.camera["x"] += event.rel[0] / self.camera["zoom"]
-                self.camera["y"] += event.rel[1] / self.camera["zoom"]
-                if abs(event.rel[0]) > 2 or abs(event.rel[1]) > 2:
-                    self.drag_moved = True
             self.mouse["x"] = event.pos[0]
             self.mouse["y"] = event.pos[1]
+            self._update_editor_hover(event.pos)
+            if self._editor_painting:
+                self._editor_paint_at(event.pos)
+            else:
+                # Pan on right/middle drag, or on a left drag when no brush is
+                # selected (so an empty hand still lets you move the map).
+                no_tool = not ui.editor_tool
+                if self._editor_pan or (self.dragging and not self._ui_press and no_tool):
+                    self.camera["x"] += event.rel[0] / self.camera["zoom"]
+                    self.camera["y"] += event.rel[1] / self.camera["zoom"]
+                    if abs(event.rel[0]) > 2 or abs(event.rel[1]) > 2:
+                        self.drag_moved = True
+
+    def _update_editor_hover(self, pos):
+        """Track the tile under the cursor so the brush footprint can preview."""
+        if pos[1] <= self.ui.MENU_BAR_H or self.ui._in_editor_bar(pos):
+            self.hovered_tile = None
+        else:
+            self.hovered_tile = self._editor_tile_at(pos)
 
     def _step_backdrop(self, dt):
         """Keep the city alive behind the menu: ambient life, driving lorries
@@ -558,6 +688,14 @@ class WasteCityGame:
         if menu:
             self.ui.draw_main_menu(self.screen)
         elif editor:
+            if self.ui._editor_show_warnings:
+                pulse = 0.5 + 0.5 * math.sin(pygame.time.get_ticks() * 0.004)
+                self.renderer.draw_unreachable(
+                    self.ui.editor_unreachable_tiles(), pulse)
+            if self.ui.editor_tool and self.hovered_tile:
+                self.renderer.draw_editor_cursor(
+                    self.ui.editor_cursor_tiles(self.hovered_tile),
+                    self.ui.editor_cursor_color())
             self.ui.draw_editor(self.screen)
         else:
             self.ui.draw(self.screen)
