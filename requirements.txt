@@ -1,2 +1,3 @@
 pygame
 pyexcel-ods
+Pillow
