@@ -10,6 +10,8 @@ or not.
 
 [![Watch the game in action](https://img.youtube.com/vi/kwl9lmTJ-dg/0.jpg)](https://www.youtube.com/watch?v=kwl9lmTJ-dg)
 
+### [[Download version 1.0 for Windows]](https://github.com/ViciousSquid/The-Rubbish-Game/releases/tag/v1.0)
+
 #### Why you'll like it
 
 
