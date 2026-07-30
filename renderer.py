@@ -161,9 +161,12 @@ class Renderer:
             except Exception:
                 self._truck_icon = None
 
-        # Static cache for batch rendering
-        self._static_cache = None
-        self._cache_key    = None
+        # Static cache for batch rendering. `_cache_base_key` fingerprints the
+        # inputs that force a full rebuild (city version, zoom, snow, night);
+        # the cache also records the tile `bounds` it covers so we can rebuild
+        # when the viewport pans outside a zoomed-in, viewport-bounded cache.
+        self._static_cache  = None
+        self._cache_base_key = None
 
         # ── per-frame SRCALPHA surface pool ───────────────────────────────────
         # Creating pygame.Surface(…, SRCALPHA) allocates memory every call.
@@ -213,15 +216,31 @@ class Renderer:
         day_progress = economy.get_day_progress() if economy is not None else 0.25
         is_night = _daylight_brightness(day_progress) < 0.4
 
-        # Build or reuse the static cache
-        if self._static_cache is None or self._needs_static_cache_update(city, zoom, snow, is_night):
-            self._static_cache = self._render_static(city, zoom, snow, is_night)
+        # ── Frustum cull ─────────────────────────────────────────────────────
+        # Work out which tiles can actually touch the screen this frame, in tile
+        # space. Everything below is bounded by this window, so a zoomed-in view
+        # never builds, blits, or iterates the whole city — only the slice on
+        # screen (plus a small margin for tall buildings).
+        vis = self._visible_tile_bounds(city, cx, cy, zoom, sw, sh)
+        vx0, vy0, vx1, vy1 = vis
+
+        # Build or reuse the static cache (whole-city when zoomed out enough that
+        # it's cheap; otherwise just the visible window).
+        self._update_static_cache(city, zoom, snow, is_night, vis)
 
         use_cache = self._static_cache is not None
         if use_cache:
             cache = self._static_cache
-            self.screen.blit(cache["surface"],
-                             (int(cx - cache["offset_x"]), int(cy - cache["offset_y"])))
+            surf  = cache["surface"]
+            dest_x = int(cx - cache["offset_x"])
+            dest_y = int(cy - cache["offset_y"])
+            # Blit only the part of the cache that overlaps the screen — the
+            # cache surface can be far larger than the viewport (whole city),
+            # and blitting it whole every frame is the main mobile framerate
+            # sink. Copying just the on-screen sub-rect keeps this ~viewport-cost.
+            src = pygame.Rect(-dest_x, -dest_y, sw, sh).clip(surf.get_rect())
+            if src.width > 0 and src.height > 0:
+                self.screen.blit(surf, (dest_x + src.x, dest_y + src.y), src)
 
         # Pre-compute selection / hover grid positions for O(1) per-tile matching.
         sel_pos = (selected_tile["x"], selected_tile["y"]) if selected_tile else None
@@ -233,8 +252,8 @@ class Renderer:
         cull_y_lo = -320 * zoom
         cull_y_hi =  sh  + 80  * zoom
 
-        for y in range(city.height):
-            for x in range(city.width):
+        for y in range(vy0, vy1):
+            for x in range(vx0, vx1):
                 iso = self.to_iso(x, y)
                 ix  = cx + iso[0] * zoom
                 iy  = cy + iso[1] * zoom
@@ -332,34 +351,91 @@ class Renderer:
 
     # ─── static cache ─────────────────────────────────────────────────────────
 
-    def _needs_static_cache_update(self, city, zoom, snow=0.0, night=False):
-        key = (id(city), getattr(city, "version", 0), round(zoom, 2),
-               round(snow, 1), bool(night))
-        if self._cache_key != key:
-            self._cache_key = key
-            return True
-        return False
+    # Whole-city static cache is only worth building (for free panning) while it
+    # stays reasonably small; past this it's rebuilt to cover just the viewport,
+    # so zooming in never renders the entire city into one giant surface.
+    _WHOLE_CITY_BUDGET = 12_000_000
+    _MAX_CACHE_PIXELS  = 25_000_000
 
-    def _render_static(self, city, zoom, snow=0.0, night=False):
-        """Render all static city geometry (ground tiles + buildings) to an
-        off-screen surface.  Returns None if the cache would be too large."""
-        corners = [
-            self.to_iso(0, 0),
-            self.to_iso(city.width, 0),
-            self.to_iso(0, city.height),
-            self.to_iso(city.width, city.height),
-        ]
-        min_ix = min(c[0] for c in corners)
-        max_ix = max(c[0] for c in corners)
-        min_iy = min(c[1] for c in corners)
-        max_iy = max(c[1] for c in corners)
+    def _visible_tile_bounds(self, city, cx, cy, zoom, sw, sh):
+        """Half-open tile window (x0, y0, x1, y1) that can touch the screen,
+        clamped to the city. Uses the same screen-space margins as the per-tile
+        frustum cull so the window and the cull agree on what's drawn."""
+        hw, hh = self._iso_hw, self._iso_hh
+        x_lo, x_hi = -80 * zoom, sw + 80 * zoom
+        y_lo, y_hi = -320 * zoom, sh + 80 * zoom
+        xs, ys = [], []
+        for sx, sy in ((x_lo, y_lo), (x_hi, y_lo), (x_lo, y_hi), (x_hi, y_hi)):
+            ix = (sx - cx) / zoom
+            iy = (sy - cy) / zoom
+            xs.append((ix / hw + iy / hh) / 2)
+            ys.append((iy / hh - ix / hw) / 2)
+        x0 = min(max(0, int(math.floor(min(xs))) - 1), city.width)
+        y0 = min(max(0, int(math.floor(min(ys))) - 1), city.height)
+        x1 = max(x0, min(city.width,  int(math.ceil(max(xs))) + 1))
+        y1 = max(y0, min(city.height, int(math.ceil(max(ys))) + 1))
+        # Camera fully off the map collapses to a zero-area window (nothing to
+        # draw); otherwise this is a valid 0 <= x0 <= x1 <= width window.
+        return (x0, y0, x1, y1)
 
-        pad     = 200
-        cache_w = int((max_ix - min_ix) * zoom) + pad * 2
-        cache_h = int((max_iy - min_iy) * zoom) + pad * 2 + int(160 * zoom)
+    def _region_iso_span(self, bounds, zoom):
+        """Pixel size of the cache surface covering `bounds` at `zoom`."""
+        bx0, by0, bx1, by1 = bounds
+        corners = [self.to_iso(bx0, by0), self.to_iso(bx1, by0),
+                   self.to_iso(bx0, by1), self.to_iso(bx1, by1)]
+        min_ix = min(c[0] for c in corners); max_ix = max(c[0] for c in corners)
+        min_iy = min(c[1] for c in corners); max_iy = max(c[1] for c in corners)
+        pad = 200
+        w = int((max_ix - min_ix) * zoom) + pad * 2
+        h = int((max_iy - min_iy) * zoom) + pad * 2 + int(160 * zoom)
+        return w, h, min_ix, min_iy, pad
 
-        MAX_CACHE_PIXELS = 25_000_000
-        if cache_w * cache_h > MAX_CACHE_PIXELS:
+    def _update_static_cache(self, city, zoom, snow, night, vis):
+        """Ensure `self._static_cache` is valid for this frame, rebuilding only
+        when needed. Caches the whole city while that's cheap (so panning is a
+        free blit); once zoomed in it caches only the visible window plus a
+        margin, rebuilding when a pan escapes that margin."""
+        base_key = (id(city), getattr(city, "version", 0), round(zoom, 2),
+                    round(snow, 1), bool(night))
+        full = (0, 0, city.width, city.height)
+        fw, fh, *_ = self._region_iso_span(full, zoom)
+        whole = fw * fh <= self._WHOLE_CITY_BUDGET
+
+        cache = self._static_cache
+        need = cache is None or self._cache_base_key != base_key
+        if not need:
+            bx0, by0, bx1, by1 = cache["bounds"]
+            if whole:
+                # Want the whole city cached; rebuild if the current cache is a
+                # partial (zoomed-in) one left over from before.
+                need = not (bx0 == 0 and by0 == 0
+                            and bx1 == city.width and by1 == city.height)
+            else:
+                vx0, vy0, vx1, vy1 = vis
+                # Rebuild once the visible window slips outside the cached slice.
+                need = (vx0 < bx0 or vy0 < by0 or vx1 > bx1 or vy1 > by1)
+        if not need:
+            return
+
+        if whole:
+            bounds = full
+        else:
+            pad = 6   # tile margin so small pans don't force a rebuild
+            vx0, vy0, vx1, vy1 = vis
+            bounds = (max(0, vx0 - pad), max(0, vy0 - pad),
+                      min(city.width, vx1 + pad), min(city.height, vy1 + pad))
+
+        self._cache_base_key = base_key
+        self._static_cache = self._render_static(city, zoom, snow, night, bounds)
+
+    def _render_static(self, city, zoom, snow, night, bounds):
+        """Render the static city geometry (ground + buildings) for the tile
+        rectangle `bounds` into an off-screen surface. Returns None if the
+        surface would exceed the hard pixel cap."""
+        bx0, by0, bx1, by1 = bounds
+        cache_w, cache_h, min_ix, min_iy, pad = self._region_iso_span(bounds, zoom)
+
+        if cache_w <= 0 or cache_h <= 0 or cache_w * cache_h > self._MAX_CACHE_PIXELS:
             return None
 
         offset_x = int(-min_ix * zoom) + pad
@@ -371,8 +447,8 @@ class Renderer:
         old_screen  = self.screen
         self.screen = surface
         try:
-            for y in range(city.height):
-                for x in range(city.width):
+            for y in range(by0, by1):
+                for x in range(bx0, bx1):
                     iso = self.to_iso(x, y)
                     ix  = offset_x + iso[0] * zoom
                     iy  = offset_y + iso[1] * zoom
@@ -384,7 +460,8 @@ class Renderer:
         finally:
             self.screen = old_screen
 
-        return {"surface": surface, "offset_x": offset_x, "offset_y": offset_y}
+        return {"surface": surface, "offset_x": offset_x, "offset_y": offset_y,
+                "bounds": bounds}
 
     # ─── ground ───────────────────────────────────────────────────────────────
 
@@ -1663,12 +1740,16 @@ class Renderer:
         font  = _get_font("segoeui", max(9, int(11 * zoom)), bold=True)
         small = _get_font("segoeui", max(8, int(9  * zoom)))
 
+        sw, sh = self.screen.get_size()
         for area in city.areas:
             mid_x = (area.col + 0.5) * city.width  / AREA_COLS
             mid_y = (area.row + 0.5) * city.height / AREA_ROWS
             iso   = self.to_iso(mid_x, mid_y)
             sx    = int(cx + iso[0] * zoom)
             sy    = int(cy + iso[1] * zoom)
+            # Skip tags well off screen — no point rendering their text/boxes.
+            if sx < -160 or sx > sw + 160 or sy < -120 or sy > sh + 120:
+                continue
 
             route_type = area.route_type
             if route_type == "residential":
