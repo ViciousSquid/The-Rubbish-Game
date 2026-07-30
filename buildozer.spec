@@ -32,7 +32,13 @@ requirements = python3,pygame
 # ── Display ───────────────────────────────────────────────────────────────
 orientation = landscape
 fullscreen = 1
-# Menu/backdrop base colour, shown behind the splash while Python starts up.
+# Presplash shown while the Python interpreter boots. python-for-android always
+# shows *something* here (there's no way to skip the loading screen), and with
+# no image set it falls back to its own default Kivy/p4a splash. We override it
+# with a solid tile the exact colour of the backdrop below and of the game's
+# first frame, so the load screen reads as a plain dark screen — no visible
+# logo or splash — that blends straight into the menu.
+presplash.filename = _internal/presplash.png
 android.presplash_color = #16181e
 
 # ── Android build ─────────────────────────────────────────────────────────
