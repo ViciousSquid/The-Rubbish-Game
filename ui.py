@@ -1839,7 +1839,7 @@ class UIManager:
         if not eco.has_won:
             ui.card(x, y, HUD_W - 28, 44, selected=False)
             sat_floor = int(getattr(eco, "win_sat_floor", 75))
-            ui.label(f"PERFECT STREAK (SAT ≥ {sat_floor}%)", x + 12, y + 6)
+            ui.label(f"STREAK (SAT ≥ {sat_floor}%)", x + 12, y + 6)
             streak = eco.perfect_days_streak
             ui.text("body_b", f"{streak}/{target}", c.STATUS_GOOD, right - 12, y + 6, align="right")
             ui.progress_bar(x + 12, y + 28, HUD_W - 52, 4, streak, target, color=c.STATUS_GOOD, show_text=False)
