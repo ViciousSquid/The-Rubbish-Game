@@ -40,8 +40,11 @@ IS_ANDROID = _detect_android()
 
 # Logical design height.  Smaller values magnify the UI more (bigger touch
 # targets) at the cost of showing less of the map.  720 matches the desktop
-# baseline; 680 gives a small, comfortable bump for phones.
-LOGICAL_H = 680
+# baseline; 680 was too close to it to read as scaled up at all -- on a
+# typical 1080px-tall landscape phone that's only ~1.6x, well under
+# Android's 48dp minimum touch target once real screen density is factored
+# in. 480 gives ~2.25x on a 1080px-tall phone and ~3x on a 1440px one.
+LOGICAL_H = 480
 
 # Pinch sensitivity: how far the two fingers must spread/close (as a ratio of the
 # last measured distance) before we emit one zoom step.

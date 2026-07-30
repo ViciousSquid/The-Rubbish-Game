@@ -16,6 +16,13 @@ source.include_patterns = _internal/*
 # Keep build/tooling files out of the APK.
 source.exclude_dirs = bin, .buildozer, .git, .github, __pycache__
 
+# App launcher icon. Without this p4a falls back to its own default (a Kivy
+# logo). p4a copies whatever file this points to straight into
+# res/mipmap/icon.png with no format conversion, so it must already be a
+# real PNG -- icon.ico (a Windows .ico) doesn't work here even though pygame
+# can load it at runtime for the desktop window icon.
+icon.filename = _internal/icon.png
+
 # ── Requirements ──────────────────────────────────────────────────────────
 # Only pygame is needed. Pillow and pyexcel-ods are desktop-only extras that
 # the game degrades gracefully without (truck sprite falls back to pygame's
