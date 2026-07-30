@@ -39,7 +39,6 @@ android.allow_backup = True
 # mouse events; it's selected automatically for a pygame requirement, but we
 # pin it here so the build is explicit and reproducible.
 p4a.bootstrap = sdl2
-p4a.branch = v2024.01.21
 
 # Pin python-for-android instead of tracking its master branch. Current
 # master hardcodes CPython 3.14.2 for the on-device Python while still
