@@ -73,6 +73,15 @@ class FloatingWindow:
         self.key   = key
         self.title = title
         self.rect  = pygame.Rect(x, y, w, h)
+        # The requested size is the window's *natural* size — big enough for its
+        # tab to draw its whole content. On short/narrow displays (landscape
+        # phones) `rect` is shrunk to the viewport in `_clamp_window`, and the
+        # body then scrolls through this full content height.
+        self.natural_w = w
+        self.natural_h = h
+        self.scroll     = 0        # vertical body scroll offset (px)
+        self.max_scroll = 0        # set each frame from content vs body height
+        self.scrollable = False    # True while the body overflows the frame
         self.widgets = []      # (rect, fn) click targets collected during draw
         self.cells   = []      # (rect, area_id, day) round-day cells
         self.close_rect = None
@@ -472,6 +481,13 @@ class UIManager:
         self.windows = []              # open windows, back-to-front (front last)
         self._win_index = {}           # key -> FloatingWindow (persistent pos)
         self._win_drag = None          # (window, grab_dx, grab_dy) while dragging
+        self._win_scroll = None        # [window, last_y, moved] while flick-scrolling a body
+        self._toolbar_h = TOOLBAR_H    # live toolbar band height (grows when it wraps)
+        # HUD status column becomes scrollable when it overflows a short
+        # (landscape-phone) viewport; these track the offset and drag gesture.
+        self._hud_scroll = 0
+        self._hud_max_scroll = 0
+        self._hud_scroll_drag = None   # [last_y, moved] while dragging the HUD
         self.toolbar_buttons = []      # (rect, action) rebuilt each draw
         self._screen_size = (1280, 720)
         self._content_renderers = {
@@ -789,11 +805,28 @@ class UIManager:
     def _clamp_window(self, win):
         w, h = self._screen_size
         r = win.rect
-        r.x = max(HUD_W + 4, min(r.x, w - r.w - 4))
-        # keep the title bar reachable below the toolbar and above the bottom;
-        # if the editor bar is visible, leave room for it too.
+        top = self._toolbar_h + 4
+        # If the editor bar is visible, leave room for it too.
         bottom_margin = (EDITOR_BAR_H + 4) if self._editor_mode else 4
-        r.y = max(TOOLBAR_H + 4, min(r.y, h - WINDOW_TITLEBAR_H - bottom_margin))
+
+        # ── Fit the window to the viewport ───────────────────────────────────
+        # On short/narrow displays (landscape phones) a window's natural size
+        # can exceed the screen. Cap both dimensions so the whole frame — and
+        # its scrollable body — stays on screen; the body scrolls to reveal any
+        # content that no longer fits vertically.
+        avail_h = h - top - bottom_margin
+        r.h = max(WINDOW_TITLEBAR_H + 60, min(win.natural_h, avail_h))
+        r.w = min(win.natural_w, w - 16)
+
+        # Horizontal placement: normally keep windows in the map area (right of
+        # the HUD). But a window too wide to fit there is allowed to slide left
+        # over the HUD so it stays fully visible on narrow phone viewports.
+        if r.w > w - HUD_W - 12:
+            min_x = max(8, w - r.w - 8)
+        else:
+            min_x = HUD_W + 4
+        r.x = max(min_x, min(r.x, w - r.w - 8))
+        r.y = max(top, min(r.y, h - r.h - bottom_margin))
 
     def window_at(self, pos):
         for win in reversed(self.windows):
@@ -802,7 +835,7 @@ class UIManager:
         return None
 
     def _in_toolbar(self, pos):
-        return pos[1] < TOOLBAR_H and pos[0] >= HUD_W
+        return pos[1] < self._toolbar_h and pos[0] >= HUD_W
 
     # ----- mouse routing (called from main.py) -----------------------------
     def on_mouse_down(self, pos):
@@ -819,20 +852,45 @@ class UIManager:
                 return True
             if win.titlebar_rect().collidepoint(pos):
                 self._win_drag = (win, pos[0] - win.rect.x, pos[1] - win.rect.y)
+            elif win.scrollable and win.body_rect().collidepoint(pos):
+                # A press-drag inside a scrolling body flicks the content (touch
+                # scroll). A press with no drag still resolves as a tap on-up.
+                self._win_scroll = [win, pos[1], False]
             return True
         if self._in_editor_bar(pos):
             return True            # consume so it doesn't start a camera drag
-        if self._in_toolbar(pos) or pos[0] < HUD_W:
+        if self._in_toolbar(pos):
             return True            # consume; act on release
+        if pos[0] < HUD_W:
+            # Consume; act on release. A drag on the overflowing HUD scrolls it.
+            if self._hud_max_scroll > 0:
+                self._hud_scroll_drag = [pos[1], False]
+            return True
         return False
 
     def on_mouse_motion(self, rel, pos):
-        """Returns True while dragging a window (suppresses camera pan)."""
+        """Returns True while dragging a window/scroll region (suppresses the
+        camera pan)."""
         if self._win_drag is not None:
             win, gx, gy = self._win_drag
             win.rect.x = pos[0] - gx
             win.rect.y = pos[1] - gy
             self._clamp_window(win)
+            return True
+        if self._win_scroll is not None:
+            win, last_y, _moved = self._win_scroll
+            dy = pos[1] - last_y
+            if dy:
+                win.scroll = max(0, min(win.max_scroll, win.scroll - dy))
+            self._win_scroll = [win, pos[1], _moved or abs(dy) > 2]
+            return True
+        if self._hud_scroll_drag is not None:
+            last_y, _moved = self._hud_scroll_drag
+            dy = pos[1] - last_y
+            if dy:
+                self._hud_scroll = max(0, min(self._hud_max_scroll,
+                                              self._hud_scroll - dy))
+            self._hud_scroll_drag = [pos[1], _moved or abs(dy) > 2]
             return True
         return False
 
@@ -840,7 +898,14 @@ class UIManager:
         """Release handling. Returns True if the UI consumed the event."""
         was_dragging_window = self._win_drag is not None
         self._win_drag = None
-        if was_dragging_window:
+        # A flicked scroll (moved) consumes the release; a tap falls through so
+        # the button/cell under the finger still resolves.
+        scroll_moved = self._win_scroll is not None and self._win_scroll[2]
+        self._win_scroll = None
+        hud_scroll_moved = (self._hud_scroll_drag is not None
+                            and self._hud_scroll_drag[1])
+        self._hud_scroll_drag = None
+        if was_dragging_window or scroll_moved or hud_scroll_moved:
             return True
         if self.game.economy.has_lost:
             return False
@@ -860,14 +925,28 @@ class UIManager:
         return False
 
     def on_scroll(self, button, pos):
-        """Route a mousewheel into a window (currently only the staff fleet
-        list scrolls). Returns True if consumed."""
+        """Route a mousewheel into a window body, the staff fleet sub-list, or
+        the HUD. Returns True if consumed."""
         win = self.window_at(pos)
-        if win is not None and win.key == "staff" and self._staff_fleet_clip is not None:
-            delta = -50 if button == 4 else 50
-            self._staff_fleet_scroll = max(
-                0, min(self._staff_fleet_max_scroll,
-                       self._staff_fleet_scroll + delta))
+        if win is not None:
+            # Staff fleet sub-list scrolls when the pointer is over it.
+            if (win.key == "staff" and self._staff_fleet_clip is not None
+                    and self._staff_fleet_clip.collidepoint(pos)):
+                delta = -50 if button == 4 else 50
+                self._staff_fleet_scroll = max(
+                    0, min(self._staff_fleet_max_scroll,
+                           self._staff_fleet_scroll + delta))
+                return True
+            if win.scrollable:
+                delta = -46 if button == 4 else 46
+                win.scroll = max(0, min(win.max_scroll, win.scroll + delta))
+                return True
+            return False
+        # HUD wheel scroll (when its status column overflows the viewport).
+        if pos[0] < HUD_W and self._hud_max_scroll > 0:
+            delta = -46 if button == 4 else 46
+            self._hud_scroll = max(0, min(self._hud_max_scroll,
+                                          self._hud_scroll + delta))
             return True
         return False
 
@@ -875,6 +954,14 @@ class UIManager:
         if win.close_rect and win.close_rect.collidepoint(pos):
             self.close_window(win)
             return
+        # A scrolling body clips its content to the body's vertical span; ignore
+        # clicks that fall outside it (e.g. on a widget scrolled up under the
+        # title bar) so scrolled-off controls can't be triggered by an invisible
+        # hit-box. Horizontal position is already inside the window frame.
+        if win.scrollable:
+            body = win.body_rect()
+            if not (body.y <= pos[1] < body.bottom):
+                return
         # Resolve against THIS window's collected click targets.
         self.planner_widgets = win.widgets
         self.planner_cells = win.cells
@@ -1396,45 +1483,61 @@ class UIManager:
     # ----- toolbar & floating windows --------------------------------------
     def _draw_toolbar(self, screen, w, h):
         """Persistent top toolbar across the map area: game speed plus a toggle
-        button for each floating window (highlighted while its window is open)."""
+        button for each floating window (highlighted while its window is open).
+
+        The row wraps onto extra rows when the buttons can't fit the map area's
+        width — this keeps every control reachable on narrow landscape phones,
+        where all nine buttons don't fit on one line. `self._toolbar_h` records
+        the resulting band height so windows clamp below it."""
         ui = self.ui
         c = ui.c
         if self.game.economy.has_lost:
+            self._toolbar_h = TOOLBAR_H
             return
         x0 = HUD_W
-        pygame.draw.rect(screen, c.BG_PANEL, pygame.Rect(x0, 0, w - x0, TOOLBAR_H))
-        pygame.draw.line(screen, c.BORDER_SUBTLE, (x0, TOOLBAR_H), (w, TOOLBAR_H), 1)
-
-        self.toolbar_buttons = []
         mouse = pygame.mouse.get_pos()
-        bx = x0 + 12
-        by = (TOOLBAR_H - 28) // 2
         bh = 28
+        gap = 6
+        row_top = (TOOLBAR_H - bh) // 2
+        x_start = x0 + 12
+        right_limit = w - 8
 
-        # Pause / resume
-        pr = pygame.Rect(bx, by, 84, bh)
-        ui.button(pr, "Resume" if not self.game.running else "Pause",
-                  hovered=pr.collidepoint(mouse), accent=not self.game.running)
-        self.toolbar_buttons.append((pr, "pause"))
-        bx = pr.right + 8
-
-        # Speed cycle
-        sr = pygame.Rect(bx, by, 64, bh)
-        ui.button(sr, f"{self.game.speed}x", hovered=sr.collidepoint(mouse))
-        self.toolbar_buttons.append((sr, "speed"))
-        bx = sr.right + 14
-
-        pygame.draw.line(screen, c.BORDER_SUBTLE, (bx - 7, 8), (bx - 7, TOOLBAR_H - 8), 1)
-
-        # One toggle per window
+        # Assemble the buttons: pause, speed, then one toggle per window.
+        running = self.game.running
+        entries = [
+            ("pause", "Resume" if not running else "Pause", 84, not running, False),
+            ("speed", f"{self.game.speed}x", 64, False, False),
+        ]
         for key, short, title, ww, hh in WINDOW_DEFS:
             tw = ui.fonts.size("body_b", short)[0] + 26
-            rect = pygame.Rect(bx, by, tw, bh)
             is_open = any(win.key == key for win in self.windows)
-            hovered = rect.collidepoint(mouse)
-            ui.button(rect, short, hovered=hovered, pressed=is_open)
-            self.toolbar_buttons.append((rect, ("win", key)))
-            bx += tw + 6
+            entries.append((("win", key), short, tw, False, is_open))
+
+        # Flow the buttons left-to-right, wrapping to a new row on overflow.
+        placed = []
+        bx = x_start
+        row = 0
+        for action, label, tw, accent, pressed in entries:
+            if bx + tw > right_limit and bx > x_start:
+                row += 1
+                bx = x_start
+            rect = pygame.Rect(bx, row_top + row * TOOLBAR_H, tw, bh)
+            placed.append((rect, action, label, accent, pressed))
+            bx = rect.right + gap
+
+        self._toolbar_h = (row + 1) * TOOLBAR_H
+
+        # Background band + bottom divider, then the buttons.
+        pygame.draw.rect(screen, c.BG_PANEL,
+                         pygame.Rect(x0, 0, w - x0, self._toolbar_h))
+        pygame.draw.line(screen, c.BORDER_SUBTLE,
+                         (x0, self._toolbar_h), (w, self._toolbar_h), 1)
+
+        self.toolbar_buttons = []
+        for rect, action, label, accent, pressed in placed:
+            ui.button(rect, label, hovered=rect.collidepoint(mouse),
+                      accent=accent, pressed=pressed)
+            self.toolbar_buttons.append((rect, action))
 
     def _draw_windows(self, screen, w, h):
         self._prune_truck_windows()
@@ -1480,12 +1583,56 @@ class UIManager:
         self.planner_widgets = win.widgets
         self.planner_cells = win.cells
         body = win.body_rect()
+
+        # Each tab is laid out for its natural body height. When the window has
+        # been shrunk to fit a short viewport, render the tab at that full
+        # height but shifted up by the scroll offset and clipped to the body,
+        # so the whole tab remains reachable by scrolling. Widget click-rects
+        # are collected at their on-screen (scrolled) positions, so hit-testing
+        # stays correct — see the body-region guard in `_resolve_window_click`.
+        natural_body_h = win.natural_h - WINDOW_TITLEBAR_H - 8 - WINDOW_PAD
+        win.max_scroll = max(0, natural_body_h - body.h)
+        win.scrollable = win.max_scroll > 0
+        win.scroll = max(0, min(win.scroll, win.max_scroll))
+
+        content_h = natural_body_h if win.scrollable else body.h
+        content_y = body.y - win.scroll
+
+        prev_clip = screen.get_clip()
+        if win.scrollable:
+            # Clip vertically to the body (so scrolled content can't spill onto
+            # the title bar or past the frame) but horizontally to the whole
+            # window interior — tabs right-align content to the body edge and
+            # rely on the window's side padding for breathing room, exactly as
+            # on desktop.
+            screen.set_clip(pygame.Rect(r.x + 2, body.y, r.w - 4, body.h))
         renderer = self._content_renderers.get(win.key)
         if renderer:
-            renderer(screen, body.x, body.y, body.w, body.h)
+            renderer(screen, body.x, content_y, body.w, content_h)
         elif win.key.startswith("truck_"):
-            self._truck_window_content(screen, body.x, body.y, body.w, body.h,
-                                       int(win.key.split("_", 1)[1]))
+            self._truck_window_content(screen, body.x, content_y, body.w,
+                                       content_h, int(win.key.split("_", 1)[1]))
+        if win.scrollable:
+            screen.set_clip(prev_clip)
+            self._draw_window_scrollbar(screen, r, body, win.scroll,
+                                        win.max_scroll, natural_body_h)
+
+    def _draw_window_scrollbar(self, screen, frame, body, scroll, max_scroll,
+                               content_h):
+        """Slim scrollbar tucked into the window's right padding."""
+        ui = self.ui
+        c = ui.c
+        sb_w = 5
+        sb_x = frame.right - sb_w - 4
+        track = pygame.Rect(sb_x, body.y, sb_w, body.h)
+        pygame.draw.rect(screen, c.BG_DEEP, track, border_radius=sb_w // 2)
+        ratio = body.h / max(1, content_h)
+        thumb_h = max(24, int(body.h * ratio))
+        thumb_y = body.y + int(scroll / max(1, max_scroll)
+                               * max(0, body.h - thumb_h))
+        thumb = pygame.Rect(sb_x, thumb_y, sb_w, thumb_h)
+        pygame.draw.rect(screen, c.ACCENT_AMBER_DIM, thumb,
+                         border_radius=sb_w // 2)
 
     def _draw_toast(self, screen, w, h):
         if not getattr(self.game, "toast", "") or self.game.toast_timer <= 0:
@@ -1632,7 +1779,14 @@ class UIManager:
         right = HUD_W - 14
         pygame.draw.rect(screen, c.BG_DEEP, pygame.Rect(0, 0, HUD_W, h))
         pygame.draw.line(screen, c.BORDER_SUBTLE, (HUD_W, 0), (HUD_W, h), 1)
-        y = 16
+        # The status column is taller than a landscape-phone viewport, so its
+        # content scrolls inside the fixed HUD panel. Clip to the column and
+        # shift everything up by the scroll offset; the panel background and
+        # divider above are drawn full-height and stay put.
+        _hud_prev_clip = screen.get_clip()
+        screen.set_clip(pygame.Rect(0, 0, HUD_W, h))
+        y0 = 16
+        y = y0 - self._hud_scroll
         ui.text("h2", f"Day {eco.day}", c.TEXT_PRIMARY, x, y)
         ui.text("body", eco.get_day_of_week_name(), c.TEXT_MUTED, x + 80, y + 4)
         trend = eco.budget_trend
@@ -1740,6 +1894,23 @@ class UIManager:
         ui.value(str(karen_n), right, y,
                  c.TEXT_DIM if karen_n == 0 else c.STATUS_WARN, align="right")
         y += 26
+
+        # ── Scroll bookkeeping ───────────────────────────────────────────────
+        content_bottom = y + self._hud_scroll + 8   # natural bottom of content
+        self._hud_max_scroll = max(0, content_bottom - h)
+        if self._hud_scroll > self._hud_max_scroll:
+            self._hud_scroll = self._hud_max_scroll
+        screen.set_clip(_hud_prev_clip)
+        if self._hud_max_scroll > 0:
+            sb_w = 4
+            track = pygame.Rect(HUD_W - sb_w - 2, 4, sb_w, h - 8)
+            ratio = (h - 8) / max(1, content_bottom - 8)
+            thumb_h = max(24, int((h - 8) * ratio))
+            thumb_y = 4 + int(self._hud_scroll / max(1, self._hud_max_scroll)
+                              * max(0, (h - 8) - thumb_h))
+            pygame.draw.rect(screen, c.ACCENT_AMBER_DIM,
+                             pygame.Rect(track.x, thumb_y, sb_w, thumb_h),
+                             border_radius=sb_w // 2)
 
     def _draw_event_banner(self, screen, w):
         active = self.game.economy.active_event
@@ -2492,7 +2663,12 @@ class UIManager:
         scroll = self._staff_fleet_scroll
 
         # ── Draw cards inside clip ───────────────────────────────────────────
-        screen.set_clip(clip_rect)
+        # Preserve any clip already in force (the whole window may itself be
+        # clipped for scrolling on a short viewport) and restore it afterwards.
+        # Intersect with it so cards never spill outside the window body.
+        _outer_clip = screen.get_clip()
+        card_clip = clip_rect.clip(_outer_clip) if _outer_clip else clip_rect
+        screen.set_clip(card_clip)
         for i, vb in enumerate(veh_bd):
             card_top = list_top + i * (CARD_H + CARD_GAP) - scroll
             if card_top + CARD_H <= list_top:
@@ -2619,7 +2795,7 @@ class UIManager:
                                lambda tid=vb["id"]: self._cycle_truck_area(tid),
                                clip_rect, fkey="body_s", accent=(pref >= 0))
 
-        screen.set_clip(None)
+        screen.set_clip(_outer_clip)
 
         if not fleet.trucks:
             ui.text("body_s", "No vehicles in fleet.",
