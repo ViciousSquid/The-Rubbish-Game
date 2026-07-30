@@ -182,6 +182,10 @@ class ProcurementEvent:
             "name": "Bureaucracy Bottleneck",
             "description": "UK operator licensing (O-License) paperwork has been delayed. The Vehicle and Operator Services Agency (VOSA) needs another 5 days to process your application.",
             "delay_days": 5,
+            # Revealed part-way through the wait (delay_days before the quoted
+            # arrival) -- you find out the paperwork stalled before the lorry
+            # was ever due.
+            "reveal": "midwait",
             "message": "O-License paperwork delayed by 5 days. Consider a spot rental to cover the gap.",
         },
         {
@@ -189,6 +193,9 @@ class ProcurementEvent:
             "name": "PDI Flaw",
             "description": "The truck arrived on schedule, but the pre-delivery inspection found a faulty hydraulic compactor blade. It\'s been sent to the repair bay for 3 days.",
             "delay_days": 3,
+            # Revealed *on* the quoted arrival day: the vehicle turns up on
+            # time and then fails its pre-delivery inspection.
+            "reveal": "arrival",
             "message": "Hydraulic compactor blade fault detected. Vehicle in repair bay for 3 days.",
         },
     ]
@@ -217,7 +224,12 @@ class Order:
 
         tier = get_tier(tier_id)
         self.base_lead_time = tier.random_lead_time() if tier else vehicle.lead_time
+        # The *quoted* arrival day -- what the dealer promises at order time.
+        # A pending procurement event, if one was rolled, is a surprise: it
+        # is not revealed (and its delay not applied to arrival_day) until
+        # trigger_event_if_due() fires during the wait.
         self.arrival_day = order_day + self.base_lead_time
+        self.quoted_arrival = self.arrival_day
 
         # Procurement event tracking (dealer tier only)
         self.pending_event = None
@@ -226,7 +238,9 @@ class Order:
         self.event_description = None
         self.event_triggered = False
 
-        # For dealer tier, roll for a potential event at order time
+        # For dealer tier, roll for a potential event at order time. The roll
+        # happens now (so a single order has one fixed fate), but the player
+        # sees nothing until the reveal day.
         if tier and tier.event_eligible:
             event = ProcurementEvent.roll_event()
             if event:
@@ -234,7 +248,6 @@ class Order:
                 self.event_delay_days = event["delay_days"]
                 self.event_name = event["name"]
                 self.event_description = event["description"]
-                self.arrival_day += self.event_delay_days
 
     @property
     def display_tier_name(self):
@@ -268,11 +281,10 @@ class Order:
             f"Arriving: Day {self.arrival_day} ({remaining} day{'s' if remaining != 1 else ''} left)",
         ]
 
-        if self.event_name and not self.event_triggered:
+        # An un-triggered pending event is a *surprise* -- never shown here.
+        if self.event_triggered and self.event_name:
             lines.append(f"⚠ {self.event_name}: +{self.event_delay_days} days")
             lines.append(f"   {self.event_description}")
-        elif self.event_triggered and self.event_name:
-            lines.append(f"⚠ {self.event_name} resolved")
 
         if self.is_rental:
             lines.append(f"Daily cost: £{self.adjusted_running_cost}/day")
@@ -286,10 +298,26 @@ class Order:
         return "\n".join(lines)
 
     def trigger_event_if_due(self, today):
-        """Check if the procurement event should trigger now."""
-        if self.pending_event and not self.event_triggered:
-            # Event triggers when we're within the delay period of arrival
-            if today >= self.arrival_day - self.event_delay_days:
-                self.event_triggered = True
-                return self.pending_event
+        """Check if the procurement event should reveal itself now.
+
+        Until this fires, the order shows the clean quoted arrival day and the
+        player has no idea anything is wrong. On the reveal day the delay is
+        added to arrival_day and the event dict is returned so the caller can
+        toast/banner it.
+
+          reveal == "midwait": revealed `delay_days` before the quoted arrival
+                               (bad news lands early -- paperwork stalled).
+          reveal == "arrival": revealed *on* the quoted arrival day (the lorry
+                               turned up and failed its PDI)."""
+        if not self.pending_event or self.event_triggered:
+            return None
+        reveal = self.pending_event.get("reveal", "arrival")
+        if reveal == "midwait":
+            due_day = self.quoted_arrival - self.event_delay_days
+        else:
+            due_day = self.quoted_arrival
+        if today >= due_day:
+            self.event_triggered = True
+            self.arrival_day = self.quoted_arrival + self.event_delay_days
+            return self.pending_event
         return None

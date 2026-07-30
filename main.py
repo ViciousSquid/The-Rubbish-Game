@@ -11,6 +11,7 @@ from ambient import AmbientState
 from assets import asset_path
 import savegame
 import citystore
+import android_compat
 
 CITY_W = 60
 CITY_H = 60
@@ -59,6 +60,15 @@ class WasteCityGame:
             pass
 
         self.screen = pygame.display.set_mode((1280, 720), pygame.RESIZABLE)
+
+        # Android: replace the fullscreen device display with a scaled logical
+        # surface. The whole game renders into `self.screen` as usual; the
+        # platform magnifies it to fill the phone screen each frame and maps
+        # touch input back into logical coordinates. Returns None on desktop.
+        self.android = android_compat.setup()
+        if self.android:
+            self.screen = self.android.logical
+
         self.clock = pygame.time.Clock()
 
         self.running = True
@@ -699,7 +709,10 @@ class WasteCityGame:
             self.ui.draw_editor(self.screen)
         else:
             self.ui.draw(self.screen)
-        pygame.display.flip()
+        if self.android:
+            self.android.present()
+        else:
+            pygame.display.flip()
 
     # ------------------------------------------------------------------- loop
     def _process_event(self, event):
@@ -708,8 +721,12 @@ class WasteCityGame:
             sys.exit()
 
         elif event.type == pygame.VIDEORESIZE:
-            self.screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
-            self.ui._setup_buttons()
+            # On Android the display is a fixed fullscreen surface driven by the
+            # platform shim, so ignore resize events (they'd tear down the
+            # logical surface the game renders into).
+            if not self.android:
+                self.screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
+                self.ui._setup_buttons()
 
         elif self.state == "menu":
             self._handle_menu_event(event)
@@ -810,7 +827,13 @@ class WasteCityGame:
             frame_dt = self.clock.tick(60) / 1000.0
             frame_dt = min(frame_dt, 0.1)      # clamp a hitch (avoid death spiral)
             for event in pygame.event.get():
-                self._process_event(event)
+                if self.android:
+                    # Translate touch/coordinates into logical space and expand
+                    # pinch gestures into zoom (mouse-wheel) events.
+                    for ev in self.android.process(event):
+                        self._process_event(ev)
+                else:
+                    self._process_event(event)
 
             if self.state == "menu":
                 self._step_backdrop(frame_dt)

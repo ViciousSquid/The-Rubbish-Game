@@ -151,6 +151,16 @@ class Renderer:
         except Exception:
             self._truck_icon = None
 
+        # Pillow is optional (it isn't bundled on Android builds). pygame loads
+        # PNG natively, so fall back to its own loader and the sprite still shows.
+        if self._truck_icon is None:
+            try:
+                png_path = asset_path("truck.png")
+                if os.path.exists(png_path):
+                    self._truck_icon = pygame.image.load(png_path).convert_alpha()
+            except Exception:
+                self._truck_icon = None
+
         # Static cache for batch rendering
         self._static_cache = None
         self._cache_key    = None

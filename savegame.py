@@ -20,6 +20,21 @@ Two wrinkles the loader handles:
     construction. On load we mutate that same dict in place rather than
     rebinding it, otherwise the camera and the renderer would drift apart.
 
+Robustness:
+
+  * Saves are written atomically (tmp file + os.replace) so a crash or power
+    cut mid-save can never corrupt an existing save -- F5 is exactly the key
+    people hammer right before things go wrong.
+
+  * Because whole live objects are pickled, adding an attribute to Economy /
+    FleetManager / Order between releases would otherwise make old saves
+    explode with AttributeError mid-frame. ``_migrate`` runs after unpickling:
+    versioned MIGRATIONS convert old semantics forward, and ``_backfill``
+    defensively fills in any attributes added since the save was written.
+    When you add a new attribute to a pickled class, add a matching default
+    to ``_backfill`` (and a MIGRATIONS step if the *meaning* of old data
+    changed).
+
 F5 quick-saves, F9 quick-loads (see main.py); the Data window has buttons too.
 """
 
@@ -28,7 +43,7 @@ import pickle
 
 from ambient import AmbientState
 
-SNAPSHOT_VERSION = 2
+SNAPSHOT_VERSION = 3
 DEFAULT_NAME = "BoroughWaste_Save.sav"
 
 
@@ -84,6 +99,7 @@ def save_game(game, path=None):
     fleet = game.fleet
     keep_game = fleet.game
     fleet.game = None                       # don't drag the display into pickle
+    tmp = path + ".tmp"
     try:
         data = {
             "version": SNAPSHOT_VERSION,
@@ -95,13 +111,75 @@ def save_game(game, path=None):
             "speed": game.speed,
             "show_areas": game.show_areas,
         }
-        with open(path, "wb") as f:
+        # Atomic write: dump to a sibling tmp file, then rename over the
+        # target. os.replace is atomic on the same filesystem, so an existing
+        # save can never be left half-written by a crash mid-dump.
+        with open(tmp, "wb") as f:
             pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
         return True, f"Saved: {os.path.basename(path)}"
     except Exception as e:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
         return False, f"Save failed: {e}"
     finally:
         fleet.game = keep_game              # always reattach the live back-ref
+
+
+# ---------------------------------------------------------------------------
+#  Migration -- old saves forward to the current snapshot version
+# ---------------------------------------------------------------------------
+
+def _ensure(obj, name, factory):
+    """setattr(obj, name, factory()) if the attribute is missing."""
+    if obj is not None and not hasattr(obj, name):
+        setattr(obj, name, factory())
+
+
+def _migrate_v2_to_v3(data):
+    """v2 -> v3: procurement event delays used to be baked into
+    Order.arrival_day at order time; they are now applied only when the event
+    reveals itself (Order.trigger_event_if_due). Convert in-flight orders:
+    strip the pre-applied delay back off so arrival_day is the quoted date,
+    and record quoted_arrival."""
+    fleet = data.get("fleet")
+    for o in (getattr(fleet, "orders", None) or []):
+        if hasattr(o, "quoted_arrival"):
+            continue
+        delay = getattr(o, "event_delay_days", 0) or 0
+        if (delay and getattr(o, "pending_event", None)
+                and not getattr(o, "event_triggered", False)):
+            o.arrival_day -= delay
+        o.quoted_arrival = o.arrival_day
+
+
+# Each entry migrates FROM that version to the next. Applied in order.
+MIGRATIONS = {
+    2: _migrate_v2_to_v3,
+}
+
+
+def _backfill(data):
+    """Fill in attributes added to pickled classes since the save was written.
+    Runs for every load regardless of version -- cheap and defensive."""
+    fleet = data.get("fleet")
+    _ensure(fleet, "_dist_fields", dict)
+
+
+def _migrate(data):
+    """Bring an unpickled save dict up to SNAPSHOT_VERSION in place."""
+    ver = data.get("version") or 1
+    while ver < SNAPSHOT_VERSION:
+        step = MIGRATIONS.get(ver)
+        if step:
+            step(data)
+        ver += 1
+    _backfill(data)
+    data["version"] = SNAPSHOT_VERSION
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +210,8 @@ def load_game(game, path=None):
     ver = data.get("version")
 
     try:
+        _migrate(data)
+
         game.city = data["city"]
         game.fleet = data["fleet"]
         game.fleet.game = game                       # restore back-reference
@@ -146,9 +226,10 @@ def load_game(game, path=None):
         game.show_areas = data.get("show_areas", True)
 
         # Presentation: ambient is cosmetic, so start it fresh; force the fleet
-        # to rebuild its road graph against the loaded city.
+        # to rebuild its road graph and route caches against the loaded city.
         game.ambient = AmbientState()
         game.fleet._roads_built_for = None
+        game.fleet._dist_fields = {}
 
         # Reset transient UI so nothing dangles against the old objects.
         game.ui.windows.clear()

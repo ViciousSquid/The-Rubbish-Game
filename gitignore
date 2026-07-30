@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Buildozer / python-for-android
+.buildozer/
+bin/
+*.apk
+*.aab
+
+# Saves / exports produced at runtime
+*.save

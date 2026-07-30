@@ -5,6 +5,7 @@ from city import AREA_COLS, AREA_ROWS, RES_STYLE_WEIGHTS, COM_STYLE_WEIGHTS
 import xmlio
 import savegame
 import citystore
+from economy import DIFFICULTY_PRESETS, DIFFICULTY_ORDER, get_difficulty
 from procurement import VEHICLE_CATALOGUE
 from assets import asset_path
 
@@ -44,14 +45,19 @@ ROUTE_TYPE_COLORS = {
 # draggable, overlapping windows. Each entry: key, short toolbar label, title
 # bar caption, default width, default height. The window CONTENT is rendered by
 # the existing `_tab_<key>` methods, which already draw into an (x,y,w,h) rect.
+# Heights are sized to their tab's real content so nothing ever draws past
+# the window frame (windows aren't clipped): rounds = 12 round rows + the
+# threshold/capacity footer; waste = 4 stream cards + the summary rows;
+# fleet = 3 catalogue rows + the fleet/orders footer; data = buttons + the
+# import/export notes.
 WINDOW_DEFS = [
-    ("rounds",  "Rounds",  "Collection Rounds",    764, 462),
-    ("waste",   "Waste",   "Waste Streams",        660, 466),
-    ("fleet",   "Fleet",   "Fleet & Procurement",  800, 548),
+    ("rounds",  "Rounds",  "Collection Rounds",    872, 530),
+    ("waste",   "Waste",   "Waste Streams",        660, 520),
+    ("fleet",   "Fleet",   "Fleet & Procurement",  800, 648),
     ("staff",   "Staff",   "Staff & Vehicles",     864, 560),
-    ("finance", "Finance", "Finance",              788, 640),
+    ("finance", "Finance", "Finance",              788, 664),
     ("charts",  "Charts",  "Financial Charts",     760, 560),
-    ("data",    "Data",    "Data & Plan I/O",      620, 420),
+    ("data",    "Data",    "Data & Plan I/O",      620, 508),
 ]
 WINDOW_TITLEBAR_H = 34
 WINDOW_PAD        = 16
@@ -95,10 +101,14 @@ class ColorSystem:
     BORDER_SUBTLE = (48, 56, 72)
     BORDER = (72, 84, 108)
     BORDER_BRIGHT = (120, 140, 170)
-    TEXT_PRIMARY = (245, 248, 252)
-    TEXT_SECONDARY = (180, 190, 210)
-    TEXT_MUTED = (175, 185, 205)
-    TEXT_DIM = (135, 145, 165)
+    # Body text is white across the board — the old grey tiers were hard to
+    # read on the dark panels. TEXT_DIM stays a whisper softer than white so
+    # disabled controls still read as disabled, but it remains bright enough
+    # to read comfortably.
+    TEXT_PRIMARY = (255, 255, 255)
+    TEXT_SECONDARY = (255, 255, 255)
+    TEXT_MUTED = (255, 255, 255)
+    TEXT_DIM = (218, 224, 236)
     ACCENT_AMBER = (255, 190, 80)
     ACCENT_AMBER_DIM = (200, 150, 60)
     ACCENT_TEAL = (80, 200, 190)
@@ -1183,21 +1193,31 @@ class UIManager:
             self._draw_menu_editor(screen, w, h, region_top)
 
     def _draw_menu_list_panel(self, screen, w, h, below, title, top_options,
-                              saved_actions, empty_note):
+                              saved_actions, empty_note, difficulty_row=False):
         """Shared layout for the New Game / City Editor choosers: a titled panel
-        with a set of primary option buttons, then a list of saved cities, then
-        a BACK button. `top_options` is [(action, label, accent)] and
-        `saved_actions` maps each saved city to the action tuple emitted."""
+        with (optionally) a difficulty selector, a set of primary option
+        buttons, then a list of saved cities, then a BACK button.
+        `top_options` is [(action, label, accent)] and `saved_actions` maps
+        each saved city to the action tuple emitted."""
         c = self.ui.c
         mouse = pygame.mouse.get_pos()
         cities = citystore.list_cities()
-        shown = cities[:8]
 
         pw = 500
         row_h = 40
+        diff_h = 102 if difficulty_row else 0   # matches _draw_difficulty_selector
+        # Fixed chrome: title, options, list header, BACK, paddings.
+        chrome_h = 22 + 40 + diff_h + len(top_options) * 44 + 18 + 22 + 14 + 46 + 22
+        # Only list as many saved cities as genuinely fit the space left —
+        # rows must never spill below the panel frame.
+        avail_h = (h - below - 44) - chrome_h
+        max_rows = max(0, avail_h // row_h)
+        shown = cities[:min(8, max_rows)]
+        hidden = len(cities) - len(shown)
         list_h = (len(shown) * row_h) if shown else 30
-        ph = 22 + 40 + len(top_options) * 44 + 18 + list_h + 14 + 46 + 22
-        ph = min(ph, h - below - 40)
+        if hidden > 0:
+            list_h += 18
+        ph = chrome_h + list_h - 22
         px = (w - pw) // 2
         py = max(below + 20, int(h * 0.26))
         py = min(py, h - ph - 24)
@@ -1207,6 +1227,9 @@ class UIManager:
         iy = py + 20
         self.ui.text("h2", title, c.TEXT_PRIMARY, ix, iy)
         iy += 42
+
+        if difficulty_row:
+            iy = self._draw_difficulty_selector(screen, ix, iy, pw - 56)
 
         for action, label, accent in top_options:
             rect = pygame.Rect(ix, iy, pw - 56, 38)
@@ -1218,7 +1241,9 @@ class UIManager:
         self.ui.text("body_s", "Saved cities", c.TEXT_MUTED, ix, iy)
         iy += 22
         if not shown:
-            self.ui.text("body_s", empty_note, c.TEXT_DIM, ix, iy)
+            note = (empty_note if not cities
+                    else f"{len(cities)} saved — window too small to list.")
+            self.ui.text("body_s", note, c.TEXT_DIM, ix, iy)
             iy += 30
         else:
             for e in shown:
@@ -1226,18 +1251,50 @@ class UIManager:
                 self.ui.button(rect, e["name"], hovered=rect.collidepoint(mouse))
                 self.menu_buttons.append((rect, saved_actions(e)))
                 iy += row_h
+            if hidden > 0:
+                self.ui.text("caption", f"+{hidden} more not shown",
+                             c.TEXT_DIM, ix, iy)
+                iy += 18
 
         iy += 8
         back = pygame.Rect(ix, iy, 150, 44)
         self.ui.button(back, "BACK", hovered=back.collidepoint(mouse))
         self.menu_buttons.append((back, "menu_back"))
 
+    def _draw_difficulty_selector(self, screen, x, y, w):
+        """Three difficulty chips + a short description of the selected preset.
+        Returns the y below the block. Used inside the Start New Game panel."""
+        c = self.ui.c
+        mouse = pygame.mouse.get_pos()
+        current = self.game.settings.get("difficulty", "easy")
+
+        self.ui.text("body_s", "Difficulty", c.TEXT_MUTED, x, y)
+        y += 20
+        chip_gap = 8
+        chip_w = (w - chip_gap * 2) // 3
+        for i, diff_id in enumerate(DIFFICULTY_ORDER):
+            preset = DIFFICULTY_PRESETS[diff_id]
+            rect = pygame.Rect(x + i * (chip_w + chip_gap), y, chip_w, 30)
+            self.ui.button(rect, preset["label"],
+                           accent=(diff_id == current),
+                           hovered=rect.collidepoint(mouse))
+            self.menu_buttons.append((rect, ("difficulty", diff_id)))
+        y += 36
+        blurb = get_difficulty(current)["blurb"]
+        font = self.fonts.get("caption")
+        lines = self._wrap_text(blurb, font, w)[:3]
+        for i, ln in enumerate(lines):
+            self.ui.text("caption", ln, c.TEXT_PRIMARY, x, y + i * 14)
+        y += 46          # fixed blurb strip (up to 3 caption lines)
+        return y
+
     def _draw_menu_newgame(self, screen, w, h, below):
         self._draw_menu_list_panel(
             screen, w, h, below, "Start New Game",
             [("new_random", "Random City", True)],
             lambda e: ("new_saved", e["path"]),
-            "None yet — build one in the City Editor.")
+            "None yet — build one in the City Editor.",
+            difficulty_row=True)
 
     def _draw_menu_editor(self, screen, w, h, below):
         self._draw_menu_list_panel(
@@ -1276,9 +1333,9 @@ class UIManager:
         mouse = pygame.mouse.get_pos()
         s = getattr(self.game, "settings", {})
 
-        pw, ph = 480, 300
+        pw, ph = 480, 350
         px = (w - pw) // 2
-        py = max(below + 24, int(h * 0.40))
+        py = max(below + 24, int(h * 0.34))
         py = min(py, h - ph - 30)
         self.ui.panel(px, py, pw, ph, border=True)
 
@@ -1286,7 +1343,9 @@ class UIManager:
         iy = py + 22
         self.ui.text("h2", "Settings", c.TEXT_PRIMARY, ix, iy)
         iy += 44
+        diff_label = get_difficulty(s.get("difficulty", "easy"))["label"]
         rows = [
+            ("set_difficulty", "Difficulty (next new game)", diff_label),
             ("set_day_length", "Day length",
              self._DAY_LENGTH_LABEL.get(s.get("day_length", "normal"), "Normal")),
             ("set_events", "Event frequency",
@@ -1403,7 +1462,9 @@ class UIManager:
                          tb, border_radius=8)
         pygame.draw.rect(screen, c.BG_ACTIVE if focused else c.BG_CARD,
                          pygame.Rect(tb.x, tb.y + tb.h - 10, tb.w, 10))
-        ui.text("body_b", win.title,
+        # Trim the caption so it can never run under the close box.
+        title = self._ellipsize(win.title, ui.fonts.get("body_b"), tb.w - 52)
+        ui.text("body_b", title,
                 c.ACCENT_AMBER if focused else c.TEXT_SECONDARY,
                 tb.x + 14, tb.y + 9)
 
@@ -1429,9 +1490,12 @@ class UIManager:
     def _draw_toast(self, screen, w, h):
         if not getattr(self.game, "toast", "") or self.game.toast_timer <= 0:
             return
-        msg = self.game.toast
         ui = self.ui
         pad = 16
+        # Never wider than the map area — long messages get an ellipsis.
+        max_w = max(160, w - HUD_W - 24)
+        msg = self._ellipsize(self.game.toast, ui.fonts.get("body_b"),
+                              max_w - pad * 2)
         surf = ui.fonts.render("body_b", msg, ui.c.TEXT_PRIMARY)
         bw = surf.get_width() + pad * 2
         bh = 40
@@ -1472,7 +1536,10 @@ class UIManager:
 
         title = ui.fonts.render("display", "SECTION 114 NOTICE", c.STATUS_BAD)
         screen.blit(title, title.get_rect(center=(w // 2, by + 44)))
-        sub = ui.fonts.render("h2", "The borough is bankrupt.", c.TEXT_PRIMARY)
+        diff_label = getattr(eco, "difficulty_label", "Comfortable")
+        sub = ui.fonts.render(
+            "h2", f"The borough is bankrupt.  ({diff_label} difficulty)",
+            c.TEXT_PRIMARY)
         screen.blit(sub, sub.get_rect(center=(w // 2, by + 78)))
 
         reason = (getattr(eco, "lost_reason", "") or
@@ -1529,8 +1596,11 @@ class UIManager:
         bh = 36
         bx = (w - bw) // 2
 
-        # Anchor to the very bottom of the window with a 10px margin
+        # Anchor to the very bottom of the window with a 10px margin; step up
+        # out of the way when the crisis/S114 banner occupies that band.
         by = screen.get_height() - bh - 10
+        if self._crisis_banner_visible():
+            by = screen.get_height() - 60 - bh - 8
 
         # Background
         pygame.draw.rect(screen, (0, 0, 0, 80), pygame.Rect(bx + 2, by + 2, bw, bh), border_radius=6)
@@ -1589,12 +1659,19 @@ class UIManager:
         sat_color = c.STATUS_GOOD if eco.satisfaction >= 70 else c.STATUS_WARN if eco.satisfaction >= 40 else c.STATUS_BAD
         ui.text("h2", f"{int(eco.satisfaction)}%", sat_color, right - 12, y + 4, align="right")
         ui.text("body_s", eco.satisfaction_label(), c.TEXT_MUTED, right - 12, y + 26, align="right")
+        # Where the mood can settle given the service on offer and rate
+        # pressure — broadening the waste service raises this cap.
+        eff_ceiling = max(20.0, self.game.waste.satisfaction_ceiling()
+                          - eco.tax_satisfaction_penalty())
+        ui.text("caption", f"service cap {int(eff_ceiling)}%", c.TEXT_DIM,
+                x + 12, y + 26)
         ui.stat_bar(x + 12, y + 44, HUD_W - 52, eco.satisfaction, 100)
         y += 58
         target = max(1, getattr(eco, "win_streak_target", 14))
         if not eco.has_won:
             ui.card(x, y, HUD_W - 28, 44, selected=False)
-            ui.label("PERFECT SERVICE STREAK", x + 12, y + 6)
+            sat_floor = int(getattr(eco, "win_sat_floor", 75))
+            ui.label(f"PERFECT STREAK (SAT ≥ {sat_floor}%)", x + 12, y + 6)
             streak = eco.perfect_days_streak
             ui.text("body_b", f"{streak}/{target}", c.STATUS_GOOD, right - 12, y + 6, align="right")
             ui.progress_bar(x + 12, y + 28, HUD_W - 52, 4, streak, target, color=c.STATUS_GOOD, show_text=False)
@@ -1605,22 +1682,28 @@ class UIManager:
             ui.text("h2", "CHAMPION", c.ACCENT_AMBER, right - 12, y + 6, align="right")
             ui.progress_bar(x + 12, y + 28, HUD_W - 52, 4, 1, 1, color=c.ACCENT_AMBER, show_text=False)
             y += 52
-        ui.card(x, y, HUD_W - 28, 100)
+        diff_id = getattr(eco, "difficulty", "easy")
+        diff_col = {"easy": c.ACCENT_SAGE, "medium": c.STATUS_WARN,
+                    "hard": c.STATUS_BAD}.get(diff_id, c.TEXT_SECONDARY)
+        ui.card(x, y, HUD_W - 28, 122)
         stats = [
             ("Population", f"{city.population:,}", c.TEXT_SECONDARY),
             ("Properties", f"{city.property_count:,}", c.TEXT_SECONDARY),
             ("Lorries", str(len(fleet.trucks)), c.ACCENT_TEAL),
             ("Crew", str(fleet.workers), c.ACCENT_TEAL),
+            ("Difficulty", getattr(eco, "difficulty_label", "Comfortable"),
+             diff_col),
         ]
         sy = y + 10
         for label, value, val_color in stats:
             ui.label(label, x + 12, sy)
             ui.value(value, right - 12, sy, val_color, align="right")
             sy += 22
-        y += 110
+        y += 132
         if eco.active_event and eco.active_event.get("duration", 0) > 0:
             ui.card(x, y, HUD_W - 28, 32, selected=True)
             txt = f"{eco.active_event['name']} - {eco.active_event['remaining_days']}d"
+            txt = self._ellipsize(txt, ui.fonts.get("body_s"), HUD_W - 52)
             ui.text("body_s", txt, c.ACCENT_AMBER, x + 12, y + 8)
             y += 40
         y += 6
@@ -1696,32 +1779,69 @@ class UIManager:
         else:
             progress = 1.0  # persistent: fully open, no animation
 
-        bw = min(520, max(360, w // 2))
-        bh = 80
+        # Long descriptions (breakdown notices, DEFRA fines…) word-wrap inside
+        # the banner, which grows to fit — text must never escape the frame.
+        bw = min(560, max(360, w // 2))
+        pad_x = 20
+        body_font = ui.fonts.get("body")
+        title = self._ellipsize(event.get("name", ""), ui.fonts.get("h2"),
+                                bw - pad_x * 2)
+        desc_lines = self._wrap_text(event.get("desc", ""), body_font,
+                                     bw - pad_x * 2)
+        if len(desc_lines) > 3:
+            desc_lines = desc_lines[:3]
+            desc_lines[-1] = self._ellipsize(desc_lines[-1] + "…", body_font,
+                                             bw - pad_x * 2)
+        line_h = body_font.get_height() + 2
+        bh = 50 + max(1, len(desc_lines)) * line_h + 12
         bx = (w - bw) // 2
-        by = int(-100 + (130 * progress))
+        by = int(-(bh + 20) + ((bh + 50) * progress))
 
         pygame.draw.rect(screen, (0, 0, 0, 80), pygame.Rect(bx + 3, by + 3, bw, bh), border_radius=8)
         pygame.draw.rect(screen, c.BG_CARD,     pygame.Rect(bx, by, bw, bh),         border_radius=8)
         pygame.draw.rect(screen, accent,         pygame.Rect(bx, by, 5, bh),          border_radius=8)
         pygame.draw.rect(screen, c.BORDER,       pygame.Rect(bx, by, bw, bh), 1,      border_radius=8)
 
-        ui.text("h2",   event["name"], accent,        bx + 20, by + 14)
-        ui.text("body", event["desc"], c.TEXT_SECONDARY, bx + 20, by + 44)
+        ui.text("h2", title, accent, bx + pad_x, by + 14)
+        ty = by + 44
+        for ln in desc_lines:
+            ui.text("body", ln, c.TEXT_SECONDARY, bx + pad_x, ty)
+            ty += line_h
+
+    def _crisis_banner_visible(self):
+        eco = self.game.economy
+        return (self._insufficient_funds_flash
+                or (eco.is_insolvent() and not eco.has_lost)
+                or eco.is_budget_crisis())
 
     def _draw_crisis_banner(self, screen, w, h):
-        if not self._insufficient_funds_flash and not self.game.economy.is_budget_crisis():
+        eco = self.game.economy
+        insolvent = eco.is_insolvent() and not eco.has_lost
+        if not self._crisis_banner_visible():
             return
         ui = self.ui
-        text = "Insufficient funds" if self._insufficient_funds_flash else "Budget crisis - overspending detected"
-        bw, bh = 480, 42
+        if self._insufficient_funds_flash:
+            text = "Insufficient funds"
+        elif insolvent:
+            # The lose condition in progress — count down the bank's patience.
+            days = eco.days_until_insolvency_fail()
+            if days is None or days > 1:
+                text = (f"IN THE RED — Section 114 notice in "
+                        f"{days if days is not None else '?'} days unless "
+                        f"the budget recovers")
+            else:
+                text = "IN THE RED — Section 114 notice is being drafted. Act now!"
+        else:
+            text = "Budget crisis - overspending detected"
+        surf = ui.fonts.render("body_b", text, ui.c.STATUS_BAD)
+        bw = max(480, surf.get_width() + 48)
+        bh = 42
         bx = (w - bw) // 2
         by = h - 60
         pygame.draw.rect(screen, (0, 0, 0, 80), pygame.Rect(bx + 2, by + 2, bw, bh), border_radius=6)
         pygame.draw.rect(screen, ui.c.BG_CARD, pygame.Rect(bx, by, bw, bh), border_radius=6)
         pygame.draw.rect(screen, ui.c.STATUS_BAD, pygame.Rect(bx, by, 4, bh), border_radius=6)
         pygame.draw.rect(screen, ui.c.STATUS_BAD, pygame.Rect(bx, by, bw, bh), 1, border_radius=6)
-        surf = ui.fonts.render("body_b", text, ui.c.STATUS_BAD)
         screen.blit(surf, surf.get_rect(center=(w // 2, by + bh // 2)))
 
     def _draw_win_banner(self, screen, w, h):
@@ -1745,7 +1865,10 @@ class UIManager:
         screen.blit(title, title.get_rect(center=(w // 2, by + 40)))
         sub = ui.fonts.render("h2", f"{eco.win_streak_target} consecutive days at full service! Day {eco.win_day}.", ui.c.TEXT_PRIMARY)
         screen.blit(sub, sub.get_rect(center=(w // 2, by + 75)))
-        hint = ui.fonts.render("body_s", "Keep it up to maintain your perfect record!", ui.c.TEXT_MUTED)
+        diff_label = getattr(eco, "difficulty_label", "Comfortable")
+        hint = ui.fonts.render(
+            "body_s", f"Won on {diff_label} difficulty — keep it up to "
+                      f"maintain your perfect record!", ui.c.TEXT_MUTED)
         screen.blit(hint, hint.get_rect(center=(w // 2, by + 100)))
 
     def _draw_inspect_panel(self, screen, w, h):
@@ -1784,7 +1907,8 @@ class UIManager:
         lh = 24
         if area:
             ui.label("Round", rx, row)
-            ui.value(area.name, rr, row, c.ACCENT_TEAL, align="right")
+            ui.value(self._ellipsize(area.name, ui.fonts.get("body_b"), 178),
+                     rr, row, c.ACCENT_TEAL, align="right")
             row += lh
             ui.label("Collection day", rx, row)
             ui.value(DAY_NAMES[area.collection_day], rr, row, c.TEXT_PRIMARY, align="right")
@@ -1892,6 +2016,7 @@ class UIManager:
 
     def _stepper(self, screen, x, y, label, value_str, dec_fn, inc_fn, label_w=190, val_w=92):
         ui = self.ui
+        label = self._ellipsize(label, ui.fonts.get("label"), label_w - 6)
         ui.label(label, x, y + 6)
         minus = pygame.Rect(x + label_w, y, 28, 28)
         valr = pygame.Rect(minus.right + 4, y, val_w, 28)
@@ -1947,7 +2072,9 @@ class UIManager:
             rowrect = pygame.Rect(x, ty - 2, left_cols + sum(rest.values()), 26)
             if st["is_today"]:
                 pygame.draw.rect(screen, (40, 50, 65), rowrect, border_radius=3)
-            ui.text("body_s", area.name, c.TEXT_PRIMARY, x, ty + 2)
+            ui.text("body_s",
+                    self._ellipsize(area.name, ui.fonts.get("body_s"), name_w - 8),
+                    c.TEXT_PRIMARY, x, ty + 2)
             for i in range(7):
                 cell = pygame.Rect(cxp + i * day_w + 3, ty, day_w - 6, 20)
                 if i == area.collection_day:
@@ -1987,8 +2114,11 @@ class UIManager:
         capacity = fleet.estimated_daily_capacity()
         verdict = "within capacity" if demand <= capacity else "OVER CAPACITY"
         vcolor = c.STATUS_GOOD if demand <= capacity else c.STATUS_BAD
-        ui.text("body_s", f"Today: {fleet.active_lorries()} lorries  |  capacity {capacity}  |  demand {demand}  ->  ", c.TEXT_SECONDARY, x, ty + 2)
-        ui.text("body_b", verdict, vcolor, x + 420, ty + 2)
+        info = (f"Today: {fleet.active_lorries()} lorries  |  "
+                f"capacity {capacity}  |  demand {demand}  ->  ")
+        info_w = ui.fonts.size("body_s", info)[0]
+        ui.text("body_s", info, c.TEXT_SECONDARY, x, ty + 2)
+        ui.text("body_b", verdict, vcolor, x + info_w + 6, ty + 2)
 
     def _tab_waste(self, screen, x, y, w, h):
         ui = self.ui
@@ -2007,11 +2137,21 @@ class UIManager:
                 ui.status_pill(tgl.x, tgl.y, "ON", "good")
             name_col = c.TEXT_PRIMARY if on else c.TEXT_DIM
             ui.text("body_b", s.name, name_col, x + 88, ty + 8)
-            ui.text("body_s", s.blurb, c.TEXT_MUTED if on else c.TEXT_DIM, x + 88, ty + 30)
+            # Blurbs word-wrap (max two lines) inside the card, stopping short
+            # of the frequency button on the right.
+            blurb_w = (x + w - 132) - (x + 88)
+            blurb_col = c.TEXT_MUTED if on else c.TEXT_DIM
+            blurb_font = ui.fonts.get("caption")
+            blines = self._wrap_text(s.blurb, blurb_font, blurb_w)
+            if len(blines) > 2:
+                blines = blines[:2]
+                blines[-1] = self._ellipsize(blines[-1] + "…", blurb_font, blurb_w)
+            for i, bl in enumerate(blines):
+                ui.text("caption", bl, blurb_col, x + 88, ty + 28 + i * 13)
             econ = (f"gate £{s.gate_fee:.3f}/u  |  "
                    f"{'credit' if s.id != 'garden' else 'charge'} £{s.credit:.3f}/u  |  "
                    f"+{s.satisfaction} satis")
-            ui.text("caption", econ, c.TEXT_DIM, x + 88, ty + 52)
+            ui.text("caption", econ, c.TEXT_DIM, x + 88, ty + 58)
             frect = pygame.Rect(x + w - 120, ty + 14, 108, 26)
             if on:
                 self._pbtn(screen, frect, s.freq_label, (lambda sid=s.id: self._cycle_stream_freq(sid)), fkey="body_s")
@@ -2091,7 +2231,7 @@ class UIManager:
             adj_price = v.get_price_for_tier(selected_tier) if hasattr(v, 'get_price_for_tier') else v.price
             adj_run = v.get_running_cost_for_tier(selected_tier) if hasattr(v, 'get_running_cost_for_tier') else v.running_cost
             lead = tier.random_lead_time() if tier else v.lead_time
-            card = pygame.Rect(cx, row_y, col_w, 120)
+            card = pygame.Rect(cx, row_y, col_w, 106)
             ui.card(cx, row_y, card.w, card.h)
             ui.text("body_b", v.name, c.TEXT_PRIMARY, cx + 12, row_y + 8)
             ui.text("body_s", f"cap {v.capacity:,}  crew {v.crew_cap}  spd x{v.speed_factor:.2f}", c.TEXT_MUTED, cx + 12, row_y + 28)
@@ -2099,19 +2239,19 @@ class UIManager:
             if selected_tier == "rental":
                 price_label = f"Rent £{adj_price//1000 or 1}k deposit"
                 can_afford = eco.budget >= adj_price
-                btn = pygame.Rect(cx + 12, row_y + 68, col_w - 24, 30)
+                btn = pygame.Rect(cx + 12, row_y + 66, col_w - 24, 28)
                 self._pbtn(screen, btn, price_label, (lambda vid=v.id: self._buy_vehicle(vid, selected_tier, False)), enabled=can_afford, fkey="body_b", accent=True)
             else:
-                buy = pygame.Rect(cx + 12, row_y + 68, (col_w - 32) // 2, 30)
-                lease = pygame.Rect(buy.right + 8, row_y + 68, (col_w - 32) // 2, 30)
+                buy = pygame.Rect(cx + 12, row_y + 66, (col_w - 32) // 2, 28)
+                lease = pygame.Rect(buy.right + 8, row_y + 66, (col_w - 32) // 2, 28)
                 can_buy = eco.budget >= adj_price
                 can_lease = eco.budget >= v.deposit()
                 self._pbtn(screen, buy, f"Buy £{adj_price//1000}k", (lambda vid=v.id: self._buy_vehicle(vid, selected_tier, False)), enabled=can_buy, fkey="body_s")
                 self._pbtn(screen, lease, f"Lease £{v.deposit()//1000 or 1}k", (lambda vid=v.id: self._buy_vehicle(vid, selected_tier, True)), enabled=can_lease, fkey="body_s")
             if idx % 2 == 1:
-                cat_y += 128
+                cat_y += 114
         if len(VEHICLE_CATALOGUE) % 2 == 1:
-            cat_y += 128
+            cat_y += 114
         ty = cat_y + 8
         ui.h_line(x, ty, w)
         ty += 12
@@ -2131,15 +2271,18 @@ class UIManager:
         self._pbtn(screen, hire, "Hire crew £2.5k", self._hire, enabled=eco.budget >= 2500, fkey="body_s")
         self._pbtn(screen, fire, "Release crew", self._fire, enabled=fleet.workers > 0, fkey="body_s")
         ox = x + w - 300
+        order_w = 300
         ui.text("h3", "On order", c.TEXT_PRIMARY, ox, ty)
         oy = ty + 24
         if not fleet.orders:
             ui.text("body_s", "Nothing on order.", c.TEXT_DIM, ox, oy)
         else:
-            for o in fleet.orders[:5]:
+            short_tier = {"factory": "Factory", "dealer": "Dealer",
+                          "rental": "Rental"}
+            shown_orders = fleet.orders[:3]
+            for o in shown_orders:
                 rem = o.days_remaining(eco.day)
-                tier_name = getattr(o, 'display_tier_name', 'Buy') if hasattr(o, 'display_tier_name') else 'Buy'
-                tag = f"{tier_name}"
+                tag = short_tier.get(getattr(o, "tier_id", ""), "Buy")
                 if o.leased:
                     tag += " lease"
                 line = f"{o.vehicle.name} ({tag}) - {rem}d"
@@ -2151,8 +2294,12 @@ class UIManager:
                     col = c.TEXT_MUTED
                 else:
                     col = c.TEXT_MUTED
+                line = self._ellipsize(line, ui.fonts.get("body_s"), order_w)
                 ui.text("body_s", line, col, ox, oy)
                 oy += 20
+            if len(fleet.orders) > len(shown_orders):
+                ui.text("caption", f"+{len(fleet.orders) - len(shown_orders)} "
+                        f"more on order", c.TEXT_DIM, ox, oy)
 
 
     def _tab_staff(self, screen, x, y, w, h):
@@ -2267,21 +2414,21 @@ class UIManager:
         per_ppe     = bd["ppe"]     / n
         per_total   = bd["per_head"]
 
-        # label, per-head value, colour, annotation
+        # Rate detail lives in the label itself — there is no room to the
+        # right of the value column (the vehicle-fleet cards start there).
         bdown_rows = [
-            ("Base wages",    per_base,    c.TEXT_SECONDARY,
-             f"(8h × £{eco.hourly_wage_rate:.2f})"),
-            ("Employer NI",   per_ni,      c.STATUS_WARN,
-             f"(13.8% on earnings above £{eco.ni_secondary_daily:.2f})"),
-            ("Pension",       per_pension, c.TEXT_SECONDARY,
-             f"({eco.pension_rate * 100:.1f}%)"),
-            ("PPE / uniform", per_ppe,     c.TEXT_SECONDARY, ""),
+            (f"Base wages (8h × £{eco.hourly_wage_rate:.2f})",
+             per_base,    c.TEXT_SECONDARY),
+            (f"Employer NI (13.8% over £{eco.ni_secondary_daily:.2f})",
+             per_ni,      c.STATUS_WARN),
+            (f"Pension ({eco.pension_rate * 100:.1f}%)",
+             per_pension, c.TEXT_SECONDARY),
+            ("PPE / uniform", per_ppe, c.TEXT_SECONDARY),
         ]
-        for lbl, val, vcol, note in bdown_rows:
-            ui.label(lbl, x, ty)
+        label_font = ui.fonts.get("label")
+        for lbl, val, vcol in bdown_rows:
+            ui.label(self._ellipsize(lbl, label_font, col1_w - 100), x, ty)
             ui.text("mono", f"£{val:6.2f}", vcol, rx - 2, ty, align="right")
-            if note:
-                ui.text("caption", note, c.TEXT_DIM, rx + 4, ty + 1)
             ty += 22
 
         # Separator + totals
@@ -2612,6 +2759,15 @@ class UIManager:
         # ── Debt & statutory obligations ─────────────────────────────────────
         ui.section_header(gx, ry, "DEBT & STATUTORY", gw)
         ry += 22
+        # How much rope the bank gives this borough (difficulty-dependent).
+        floor_k = abs(int(getattr(eco, "overdraft_floor", -150000))) // 1000
+        grace = int(getattr(eco, "insolvency_grace", 5))
+        tol_line = (f"{getattr(eco, 'difficulty_label', 'Comfortable')} "
+                    f"difficulty — overdraft floor -£{floor_k}k · "
+                    f"S114 after {grace} days in the red")
+        ui.text("caption", self._ellipsize(tol_line, ui.fonts.get("caption"), gw),
+                c.TEXT_DIM, gx, ry)
+        ry += 18
         if not eco.loan_cleared():
             ui.label("Startup loan outstanding", gx, ry)
             ui.text("mono_b", f"£{int(eco.loan_balance()):,}", c.ACCENT_CORAL,
@@ -2654,12 +2810,21 @@ class UIManager:
 
         # ── Achievements ─────────────────────────────────────────────────────
         if eco.achievements:
-            ry += 28
+            ry += 24
             ui.section_header(gx, ry, "ACHIEVEMENTS", gw)
             ry += 22
-            for ach in eco.achievements.values():
+            # Never let the list run past the window body: clamp and summarise.
+            bottom = y + h - 16
+            entries = list(eco.achievements.values())
+            for i, ach in enumerate(entries):
+                if ry > bottom - 18 and i < len(entries) - 1:
+                    ui.text("caption", f"+{len(entries) - i} more",
+                            c.TEXT_DIM, gx, ry)
+                    break
                 short_name = ach["name"].replace("Achievement Unlocked: ", "")
-                ui.text("body_s", f"{short_name} — Day {ach['day']}", c.ACCENT_SAGE, gx, ry)
+                line = self._ellipsize(f"{short_name} — Day {ach['day']}",
+                                       ui.fonts.get("body_s"), gw)
+                ui.text("body_s", line, c.ACCENT_SAGE, gx, ry)
                 ry += 18
 
     # ── Financial charts ──────────────────────────────────────────────────
@@ -3235,7 +3400,15 @@ class UIManager:
             self._editor_bar_widgets.append((rect, lambda s=size: self._set_brush_size(s)))
             bx += tw + GAP
 
-        # Status text
+        # Exit button (right-aligned) — placed before the status text so the
+        # status can be trimmed to the space that's actually left.
+        ex_label = "✕ Exit Editor"
+        etw = ui.fonts.size("body_b", ex_label)[0] + 16
+        exit_rect = pygame.Rect(w - etw - 8, r1_y, etw, BTN_H)
+        ui.button(exit_rect, ex_label, hovered=exit_rect.collidepoint(mouse))
+        self._editor_bar_widgets.append((exit_rect, self._editor_exit_clicked))
+
+        # Status text, ellipsized so it never runs under the Exit button.
         bx += 8
         if tool:
             status_text = (f"Tool: {self._editor_tool_label(tool)}"
@@ -3244,15 +3417,12 @@ class UIManager:
         else:
             status_text = "Pick a tool, then drag on the map to paint  ·  right-drag pans  ·  ESC exits"
             status_col  = c.TEXT_DIM
-        ssurf = ui.fonts.render("body_s", status_text, status_col)
-        screen.blit(ssurf, (bx, r1_y + (BTN_H - ssurf.get_height()) // 2))
-
-        # Exit button (right-aligned)
-        ex_label = "✕ Exit Editor"
-        etw = ui.fonts.size("body_b", ex_label)[0] + 16
-        exit_rect = pygame.Rect(w - etw - 8, r1_y, etw, BTN_H)
-        ui.button(exit_rect, ex_label, hovered=exit_rect.collidepoint(mouse))
-        self._editor_bar_widgets.append((exit_rect, self._editor_exit_clicked))
+        avail = exit_rect.x - 10 - bx
+        if avail > 30:
+            status_text = self._ellipsize(status_text, ui.fonts.get("body_s"),
+                                          avail)
+            ssurf = ui.fonts.render("body_s", status_text, status_col)
+            screen.blit(ssurf, (bx, r1_y + (BTN_H - ssurf.get_height()) // 2))
 
         # ── Row 2: build-style chips ─────────────────────────────────────────
         SHORT = {
@@ -3849,7 +4019,11 @@ class UIManager:
         ok, msg = savegame.load_game(self.game)
         self.game.set_toast(msg)
 
-    def _draw_wrapped_text(self, screen, text, x, y, max_width, font, colour):
+    @staticmethod
+    def _wrap_text(text, font, max_width):
+        """Greedy word-wrap of `text` to fit `max_width` px in `font`.
+        Returns the list of lines. Overlong single words are kept whole (they
+        should be ellipsized by the caller if the column is that tight)."""
         words = text.split(" ")
         lines = []
         current = ""
@@ -3863,10 +4037,35 @@ class UIManager:
                 current = word
         if current:
             lines.append(current)
+        return lines
+
+    @staticmethod
+    def _ellipsize(text, font, max_width):
+        """Truncate `text` with a trailing ellipsis so it renders within
+        `max_width` px. Returns the (possibly shortened) string."""
+        if font.size(text)[0] <= max_width:
+            return text
+        ell = "…"
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font.size(text[:mid].rstrip() + ell)[0] <= max_width:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo].rstrip() + ell if lo > 0 else ell
+
+    def _draw_wrapped_text(self, screen, text, x, y, max_width, font, colour,
+                           max_lines=None):
+        lines = self._wrap_text(text, font, max_width)
+        if max_lines is not None and len(lines) > max_lines:
+            lines = lines[:max_lines]
+            lines[-1] = self._ellipsize(lines[-1] + "…", font, max_width)
         for line in lines:
             surf = font.render(line, True, colour)
             screen.blit(surf, (x, y))
             y += font.get_height() + 2
+        return y
 
     def update(self, dt):
         if self._event_visible:

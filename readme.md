@@ -47,6 +47,13 @@ import/export) are optional and degrade gracefully; everything else is Python
 standard library. On some Linux distros you may need python3-tk for the file
 dialogs.
 
+### Android
+
+The same codebase builds for Android with Buildozer (SDL2). Tap to select, drag
+to pan, pinch to zoom, and use the on-screen toolbar for windows and speed. See
+[docs/ANDROID.md](docs/ANDROID.md) for build instructions — or grab the APK from
+the **Build Android APK** GitHub Actions workflow.
+
 
 -------
 ## Controls

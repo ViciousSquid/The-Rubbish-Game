@@ -46,10 +46,13 @@ INSOLVENCY_GRACE_DAYS = 5         # consecutive days at/below £0 before a Secti
 COUNCIL_YEAR_DAYS = SEASON_LENGTH * 4     # 112 in-game days
 
 # ── Starting position & startup loan ─────────────────────────────────────────
-# The borough no longer starts with a free fleet. The four starter RCVs are
+# The borough no longer starts with a free fleet. The starter RCVs are
 # financed by a startup loan that must be repaid daily, with interest, over six
 # council years. Early game is therefore a balancing act: loan repayment plus
 # fixed overheads and maintenance against the revenue from good service.
+# These figures are the EASY baseline; DIFFICULTY_PRESETS below overrides the
+# cash, principal and APR per difficulty (and doubles as the fallback for
+# saves made before difficulty existed).
 STARTING_CASH            = 220000
 STARTUP_LOAN_PRINCIPAL   = 620000         # ~4 financed 26t RCVs
 STARTUP_LOAN_ANNUAL_RATE = 0.075          # 7.5% APR
@@ -86,6 +89,117 @@ WIN_SAT_FLOOR      = 75.0
 STATUTORY_DIVERSION_TARGET = 0.50         # 50% diverted from landfill
 DIVERSION_FINE_PER_PCT     = 2600         # £ per percentage point short
 DIVERSION_FINE_CAP         = 150000
+
+# ── Difficulty presets ───────────────────────────────────────────────────────
+# Three starting positions for the borough, chosen on the New Game screen.
+# Every number stays inside the same realistic council-finance model — harder
+# settings don't cheat, they just hand you the kind of borough that actually
+# ends up on the news: thinner reserves, dearer legacy debt, a clapped-out
+# fleet, a less patient bank and a stricter DEFRA settlement.
+#
+#   easy   "Comfortable" — the current, forgiving baseline. Healthy reserves,
+#          a brand-new financed fleet, and residents inclined to like you.
+#   medium "Stretched"   — reserves half spent, part-worn lorries, a worse
+#          credit rating and stiffer DEFRA fines. You must actually manage.
+#   hard   "Crisis"      — a borough one bad month from a Section 114: tiny
+#          reserves, three high-mileage lorries, 9.9% APR legacy debt, a 52%
+#          diversion quota and a bank that pulls the plug at -£60k. Winning
+#          means rebuilding service quality AND the balance sheet at once.
+DIFFICULTY_PRESETS = {
+    "easy": {
+        "label": "Comfortable",
+        "blurb": "Healthy reserves, a new fleet and forgiving lenders. "
+                 "Learn the ropes; the win comes to those who keep it tidy.",
+        "starting_cash": 220000,
+        "loan_principal": 620000,
+        "loan_apr": 0.075,
+        "overdraft_floor": -150000,
+        "insolvency_grace": 5,
+        "start_lorries": 4,
+        "start_crew": 16,
+        "fleet_age_years": 0.0,
+        "win_streak": 14,
+        "win_sat_floor": 75.0,
+        "start_satisfaction": 88.0,
+        "sat_recovery": 1.25,
+        "karen_mult": 1.0,
+        "diversion_target": 0.50,
+        "diversion_fine_per_pct": 2600,
+        "diversion_fine_cap": 150000,
+        "landfill_rise": 0.06,
+        "inspection_bonus": 22000,
+        "inspection_fine": 18000,
+        "grant_mult": 1.0,
+        "penalty_mult": 1.0,
+    },
+    "medium": {
+        "label": "Stretched",
+        "blurb": "Reserves half spent, two part-worn lorries, a weaker credit "
+                 "rating and stiffer DEFRA fines. The books need watching.",
+        "starting_cash": 150000,
+        "loan_principal": 660000,
+        "loan_apr": 0.084,
+        "overdraft_floor": -100000,
+        "insolvency_grace": 4,
+        "start_lorries": 4,
+        "start_crew": 14,
+        "fleet_age_years": 2.5,       # two of the four arrive part-worn
+        "win_streak": 17,
+        # The floor sits strictly above the bare-bones service ceiling (78 —
+        # clean-day recovery can never push past the ceiling), and the term
+        # starts below it: a winning streak only becomes possible once the
+        # service is broadened (food/garden caddies lift the ceiling).
+        "win_sat_floor": 79.0,
+        "start_satisfaction": 76.0,
+        "sat_recovery": 1.15,
+        "karen_mult": 1.2,
+        "diversion_target": 0.50,
+        "diversion_fine_per_pct": 3200,
+        "diversion_fine_cap": 180000,
+        "landfill_rise": 0.07,
+        "inspection_bonus": 16000,
+        "inspection_fine": 24000,
+        "grant_mult": 0.85,
+        "penalty_mult": 1.1,
+    },
+    # Note on diversion targets: with every kerbside stream enabled and clean
+    # loads, the policy model tops out at ~52.6% diversion — so 52% on hard is
+    # the ceiling of what a flawless borough can deliver, not an impossible
+    # quota. Anything less than a full, well-run service eats a DEFRA fine.
+    "hard": {
+        "label": "Crisis",
+        "blurb": "Tiny reserves, three clapped-out lorries, 9.9% APR legacy "
+                 "debt, a 52% diversion quota and a bank that bolts at "
+                 "-£60k. One bad month from a Section 114.",
+        "starting_cash": 70000,
+        "loan_principal": 680000,
+        "loan_apr": 0.099,
+        "overdraft_floor": -60000,
+        "insolvency_grace": 3,
+        "start_lorries": 3,
+        "start_crew": 10,
+        "fleet_age_years": 4.5,       # the whole fleet is on its last legs
+        "win_streak": 21,
+        "win_sat_floor": 80.0,
+        "start_satisfaction": 72.0,
+        "sat_recovery": 1.0,
+        "karen_mult": 1.5,
+        "diversion_target": 0.52,
+        "diversion_fine_per_pct": 4000,
+        "diversion_fine_cap": 220000,
+        "landfill_rise": 0.08,
+        "inspection_bonus": 12000,
+        "inspection_fine": 30000,
+        "grant_mult": 0.6,
+        "penalty_mult": 1.25,
+    },
+}
+DIFFICULTY_ORDER = ["easy", "medium", "hard"]
+
+
+def get_difficulty(diff_id):
+    """Preset dict for a difficulty id, falling back to easy."""
+    return DIFFICULTY_PRESETS.get(diff_id, DIFFICULTY_PRESETS["easy"])
 
 
 class StartupLoan:
@@ -160,17 +274,63 @@ class Economy:
         ("diversion_fines",  "Recycling diversion fines"),
     ]
 
-    def __init__(self):
-        self.budget = STARTING_CASH
+    # ── Difficulty-tuned fields ──────────────────────────────────────────────
+    # Class-level defaults double as fallbacks for economies unpickled from
+    # saves made before difficulty existed (their instance __dict__ lacks these
+    # attributes, so lookups fall through to the class — i.e. old saves behave
+    # as "easy", which is exactly what they were).
+    difficulty        = "easy"
+    difficulty_label  = DIFFICULTY_PRESETS["easy"]["label"]
+    overdraft_floor   = OVERDRAFT_FLOOR
+    insolvency_grace  = INSOLVENCY_GRACE_DAYS
+    landfill_rise     = LANDFILL_TAX_ANNUAL_RISE
+    diversion_fine_per_pct = DIVERSION_FINE_PER_PCT
+    diversion_fine_cap     = DIVERSION_FINE_CAP
+    sat_recovery      = 1.25
+    karen_mult        = 1.0
+    inspection_bonus  = 22000
+    inspection_fine   = 18000
+    start_lorries     = 4
+    start_crew        = 16
+    fleet_age_years   = 0.0
+
+    def __init__(self, difficulty="easy"):
+        preset = get_difficulty(difficulty)
+        self.difficulty       = difficulty if difficulty in DIFFICULTY_PRESETS else "easy"
+        self.difficulty_label = preset["label"]
+
+        self.budget = preset["starting_cash"]
         self.council_tax_rate = 0.45
         self.business_rates = 2.20
         self.hourly_wage_rate = 16.50
         self.truck_maintenance = 45.00
 
         # ── Startup loan financing the initial fleet ─────────────────────────
-        self.loan = StartupLoan(STARTUP_LOAN_PRINCIPAL,
-                                STARTUP_LOAN_ANNUAL_RATE,
+        self.loan = StartupLoan(preset["loan_principal"],
+                                preset["loan_apr"],
                                 STARTUP_LOAN_TERM_DAYS)
+
+        # ── Fail-condition tolerances (bank patience shrinks with difficulty)
+        self.overdraft_floor  = preset["overdraft_floor"]
+        self.insolvency_grace = preset["insolvency_grace"]
+
+        # ── Statutory / escalator severity ───────────────────────────────────
+        self.landfill_rise          = preset["landfill_rise"]
+        self.diversion_fine_per_pct = preset["diversion_fine_per_pct"]
+        self.diversion_fine_cap     = preset["diversion_fine_cap"]
+
+        # ── Public-mood tuning ───────────────────────────────────────────────
+        self.sat_recovery = preset["sat_recovery"]
+        self.karen_mult   = preset["karen_mult"]
+
+        # ── Event severity ───────────────────────────────────────────────────
+        self.inspection_bonus = preset["inspection_bonus"]
+        self.inspection_fine  = preset["inspection_fine"]
+
+        # ── Starting fleet shape (read by FleetManager.setup_initial_fleet) ──
+        self.start_lorries   = preset["start_lorries"]
+        self.start_crew      = preset["start_crew"]
+        self.fleet_age_years = preset["fleet_age_years"]
 
         # ── Recurring fixed overheads ────────────────────────────────────────
         self.depot_rent_daily = DEPOT_RENT_DAILY
@@ -198,7 +358,7 @@ class Economy:
         self.week_index = 0
 
         self.budget_trend = 0
-        self.last_day_budget = STARTING_CASH
+        self.last_day_budget = self.budget
         self.daily_revenue = 0
         self.daily_expenses = 0
 
@@ -206,7 +366,7 @@ class Economy:
         self.history = []
         self.budget_history = []   # daily closing budget snapshots (charts window)
 
-        self.satisfaction = 88.0
+        self.satisfaction = preset["start_satisfaction"]
         self.complaints_total = 0
         self.complaints_today = 0
         # Baseline "you can't please everyone" gripes — a trickle of complaints
@@ -222,8 +382,8 @@ class Economy:
 
         # Editable difficulty levers
         self.event_chance = 0.30
-        self.win_streak_target = WIN_STREAK_DEFAULT
-        self.win_sat_floor = WIN_SAT_FLOOR
+        self.win_streak_target = preset["win_streak"]
+        self.win_sat_floor = preset["win_sat_floor"]
 
         # Notices raised during a day-rollover (loan cleared, diversion fines),
         # drained by the game loop and shown in the event banner.
@@ -237,7 +397,7 @@ class Economy:
         self.achievements = {}
 
         # ── Statutory recycling diversion tracking ───────────────────────────
-        self.diversion_target       = STATUTORY_DIVERSION_TARGET
+        self.diversion_target       = preset["diversion_target"]
         self.residual_volume_year   = 0.0
         self.diverted_volume_year   = 0.0
         self._diversion_year_index  = 0
@@ -305,15 +465,23 @@ class Economy:
              "desc": "Housing demand surges -- business rates up 50% for 3 days.",
              "duration": 3, "effect": "businessRate", "value": 1.5},
             # ---- money (instant) ----------------------------------------------
+            # Windfalls shrink and one-off bills grow with difficulty — a
+            # struggling borough gets leaner grants and nastier surprises.
             {"id": "recycling_grant", "name": "Recycling Grant",
-             "desc": "Awarded a GBP 75,000 sustainability grant from Westminster!",
-             "duration": 0, "effect": "money", "value": 75000},
+             "desc": (f"Awarded a GBP {int(75000 * preset['grant_mult']):,} "
+                      "sustainability grant from Westminster!"),
+             "duration": 0, "effect": "money",
+             "value": int(75000 * preset["grant_mult"])},
             {"id": "fleet_breakdown", "name": "Fleet Breakdown",
-             "desc": "Emergency RCV maintenance bill: GBP 20,000.",
-             "duration": 0, "effect": "money", "value": -20000},
+             "desc": (f"Emergency RCV maintenance bill: "
+                      f"GBP {int(20000 * preset['penalty_mult']):,}."),
+             "duration": 0, "effect": "money",
+             "value": -int(20000 * preset["penalty_mult"])},
             {"id": "fly_tipping", "name": "Fly-Tipping Complaint",
-             "desc": "Illegal dumping reported. Council clean-up bill: GBP 12,000.",
-             "duration": 0, "effect": "money", "value": -12000},
+             "desc": (f"Illegal dumping reported. Council clean-up bill: "
+                      f"GBP {int(12000 * preset['penalty_mult']):,}."),
+             "duration": 0, "effect": "money",
+             "value": -int(12000 * preset["penalty_mult"])},
             # ---- recycling bonus ----------------------------------------------
             {"id": "recycling_drive", "name": "Recycling Drive",
              "desc": "Community campaign. Recycling material credits up 80% for 2 days.",
@@ -451,8 +619,8 @@ class Economy:
             self.budget += (recycle + garden - gate)
         # The budget is allowed to dip into the red (emergency borrowing), but a
         # hard overdraft floor exists. Reaching it is instant insolvency.
-        if self.budget <= OVERDRAFT_FLOOR:
-            self.budget = OVERDRAFT_FLOOR
+        if self.budget <= self.overdraft_floor:
+            self.budget = self.overdraft_floor
             self._trigger_bankruptcy(
                 "Overdraft limit breached — the bank has called in the "
                 "borough's debts.")
@@ -495,7 +663,7 @@ class Economy:
         # forces a Section 114 notice once the grace period is exhausted.
         if self.budget <= 0:
             self.insolvent_days += 1
-            if self.insolvent_days >= INSOLVENCY_GRACE_DAYS:
+            if self.insolvent_days >= self.insolvency_grace:
                 self._trigger_bankruptcy(
                     f"Insolvent for {self.insolvent_days} consecutive days — "
                     "the borough has issued a Section 114 notice.")
@@ -561,14 +729,14 @@ class Economy:
                     fleet.on_strike = True
                 elif effect == "councilInspection":
                     if self.satisfaction >= 70:
-                        bonus = 22000
+                        bonus = self.inspection_bonus
                         self.budget += bonus
                         self.ledger["grants"] += bonus
                         evt["desc"] = (f"Inspection passed! Performance rated "
                                        f"\"{self.satisfaction_label()}\". "
                                        f"GBP {bonus:,} bonus grant awarded.")
                     else:
-                        fine = 18000
+                        fine = self.inspection_fine
                         self.budget -= fine
                         evt["desc"] = (f"Inspection failed! Service rated "
                                        f"\"{self.satisfaction_label()}\". "
@@ -788,14 +956,14 @@ class Economy:
             fleet.on_strike = True
         elif effect == "councilInspection":
             if self.satisfaction >= 70:
-                bonus = 22000
+                bonus = self.inspection_bonus
                 self.budget += bonus
                 self.ledger["grants"] += bonus
                 evt["desc"] = (f"Inspection passed! Performance rated "
                                f"\"{self.satisfaction_label()}\". "
                                f"GBP {bonus:,} bonus grant awarded.")
             else:
-                fine = 18000
+                fine = self.inspection_fine
                 self.budget -= fine
                 evt["desc"] = (f"Inspection failed! Service rated "
                                f"\"{self.satisfaction_label()}\". "
@@ -876,9 +1044,10 @@ class Economy:
 
     def landfill_tax_multiplier(self):
         """Escalator applied to the residual gate fee. Landfill tax rises each
-        council year; year 0 = 1.0, compounding by LANDFILL_TAX_ANNUAL_RISE."""
+        council year; year 0 = 1.0, compounding by the difficulty's annual
+        rise (6-8%)."""
         year = (self.day - 1) // COUNCIL_YEAR_DAYS
-        return (1.0 + LANDFILL_TAX_ANNUAL_RISE) ** year
+        return (1.0 + self.landfill_rise) ** year
 
     def landfill_tax_pct_increase(self):
         """How much dearer landfill is now vs year one, as a percentage."""
@@ -901,7 +1070,8 @@ class Economy:
             self.last_diversion_pct = rate * 100.0
             if rate < self.diversion_target:
                 short_pp = (self.diversion_target - rate) * 100.0
-                fine = int(min(DIVERSION_FINE_CAP, short_pp * DIVERSION_FINE_PER_PCT))
+                fine = int(min(self.diversion_fine_cap,
+                               short_pp * self.diversion_fine_per_pct))
                 if fine > 0:
                     self.budget -= fine
                     self.ledger["diversion_fines"] += fine
@@ -1037,11 +1207,19 @@ class Economy:
         karen = 0
         if city.property_count > 0:
             dissat = (100.0 - self.satisfaction) / 100.0
-            base_rate = 0.0009 * (0.45 + dissat)        # per property per day
+            # A tetchier local press on harder settings (karen_mult ≥ 1).
+            base_rate = 0.0009 * (0.45 + dissat) * self.karen_mult
             expected = city.property_count * base_rate
             karen = int(expected + random.random())     # stochastic rounding
         self.karen_complaints_today = karen
         self.complaints_total += karen
+
+        # Where satisfaction can settle: the waste-policy ceiling minus any
+        # rate-pressure drag. Computed up front because clean-day recovery is
+        # capped here — residents will not rate a bare-bones service
+        # "excellent" no matter how punctually it runs, so broadening the
+        # service (food caddies, garden bins) is what raises the ceiling.
+        effective_ceiling = max(20.0, service_ceiling - self.tax_satisfaction_penalty())
 
         if city.property_count > 0:
             overflow_ratio = daily_complaints / city.property_count
@@ -1049,7 +1227,13 @@ class Economy:
                 # Recovery is deliberately slow: a clean day nudges satisfaction
                 # up only a little, so clawing back from a bad week takes
                 # sustained good service rather than a single tidy day.
-                self.satisfaction = min(100.0, self.satisfaction + 1.25)
+                # (Slower still on harder settings — trust is earned.)
+                # Recovery never pushes above the service ceiling; if the mood
+                # already sits higher (honeymoon start, ceiling just lowered),
+                # the downward drift below handles the decline gently.
+                if self.satisfaction < effective_ceiling:
+                    self.satisfaction = min(effective_ceiling,
+                                            self.satisfaction + self.sat_recovery)
             else:
                 # Decay bites harder than recovery heals — one bad day can undo
                 # a week of clean ones.
@@ -1071,6 +1255,13 @@ class Economy:
             self.has_won      = True
             self.win_day      = self.day
             self.win_celebration_timer = 10.0
+            # Quiet, per-difficulty record (the win banner does the fanfare);
+            # shows up in the Finance window's achievements list.
+            self._unlock_achievement(
+                f"champion_{self.difficulty}",
+                f"Achievement Unlocked: Borough Champion ({self.difficulty_label})",
+                f"Held a {self.win_streak_target}-day perfect service streak "
+                f"on {self.difficulty_label} difficulty.")
 
         # A gentle drag from baseline gripes — small enough that good service
         # still climbs, but it stops satisfaction sitting pinned at a flawless
@@ -1085,7 +1276,6 @@ class Economy:
         # Rate pressure (council tax / business rates pushed above baseline)
         # pulls the ceiling itself down, so a high-tax borough settles at a
         # permanently lower satisfaction even on otherwise-perfect days.
-        effective_ceiling = max(20.0, service_ceiling - self.tax_satisfaction_penalty())
         self.satisfaction += (effective_ceiling - self.satisfaction) * 0.04
         self.satisfaction  = max(0.0, min(100.0, self.satisfaction))
 
@@ -1200,4 +1390,4 @@ class Economy:
         None when solvent."""
         if self.budget > 0:
             return None
-        return max(0, INSOLVENCY_GRACE_DAYS - self.insolvent_days)
+        return max(0, self.insolvency_grace - self.insolvent_days)

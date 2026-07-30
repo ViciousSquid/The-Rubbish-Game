@@ -62,12 +62,32 @@ class FleetManager:
         self.on_strike = False       # True while a crew strike event is active
 
     # ------------------------------------------------------------ initial fleet
-    def setup_initial_fleet(self, lorries=4, crew=16):
+    def setup_initial_fleet(self, lorries=None, crew=None):
         """Spawn the council's starting fleet. No direct cash hit here -- the
         vehicles are financed by the startup loan held in the Economy, which is
-        paid back daily with interest (see economy.StartupLoan)."""
-        for _ in range(lorries):
-            self.purchase_truck(DEFAULT_MODEL)
+        paid back daily with interest (see economy.StartupLoan).
+
+        Fleet size, crew headcount and vehicle age come from the economy's
+        difficulty preset (explicit arguments override it): a comfortable
+        borough starts with new lorries, a crisis borough inherits a small,
+        high-mileage fleet that costs more to run and breaks down often."""
+        eco = getattr(self.game, "economy", None)
+        if lorries is None:
+            lorries = getattr(eco, "start_lorries", 4)
+        if crew is None:
+            crew = getattr(eco, "start_crew", 16)
+        age_years = getattr(eco, "fleet_age_years", 0.0)
+
+        for i in range(lorries):
+            truck = self.purchase_truck(DEFAULT_MODEL)
+            if age_years > 0:
+                # Medium hands over a half-worn fleet (every second lorry is
+                # aged); hard wears the whole fleet, with per-vehicle jitter so
+                # they don't all fall apart in the same week.
+                whole_fleet_worn = age_years >= 4.0
+                if whole_fleet_worn or i % 2 == 1:
+                    jitter = random.uniform(0.80, 1.15)
+                    truck["age_days"] = int(age_years * DAYS_PER_YEAR * jitter)
         for _ in range(crew):
             self.hire_worker()
 

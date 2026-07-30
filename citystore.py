@@ -40,8 +40,20 @@ def save_city(city, name):
         state = city.to_state()
         state["_name"] = stem
         state["_saved"] = time.time()
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(state, f)
+        # Atomic write: dump to a tmp sibling then rename over the target, so
+        # a crash mid-dump can never corrupt an existing city file.
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+            os.replace(tmp, path)
+        except Exception:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            raise
         return True, f"Saved city '{stem}'."
     except Exception as e:                     # pragma: no cover - IO guard
         return False, f"Save failed: {e}"

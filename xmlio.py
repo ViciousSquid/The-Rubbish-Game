@@ -104,6 +104,9 @@ LV_TARGET_CREW = "Target crew headcount"
 LV_DAY_LENGTH = "Day length (seconds)"
 LV_EVENT_CHANCE = "Random event chance (0-1 per day)"
 LV_WIN_TARGET = "Win: consecutive clean days needed"
+# Informational only — the difficulty preset is chosen at new-game time and
+# is deliberately not applied on import (its label doesn't parse as a number).
+LV_DIFFICULTY = "Difficulty preset (info)"
 
 
 # ===========================================================================
@@ -293,6 +296,7 @@ def _build_ods_data(game):
     # -- Config (editable difficulty / pacing levers) -----------------------
     config = [
         ["Item", "Value"],
+        [LV_DIFFICULTY, getattr(eco, "difficulty_label", "Comfortable")],
         [LV_DAY_LENGTH, round(eco.day_duration, 1)],
         [LV_EVENT_CHANCE, round(eco.event_chance, 2)],
         [LV_WIN_TARGET, eco.win_streak_target],
@@ -661,6 +665,8 @@ def build_workbook_xml(game):
 
     # -- Config (editable difficulty / pacing levers) -----------------------
     rows = [_header_row(["Item", "Value"], numeric_cols=(1,))]
+    rows.append(_row([_cell(LV_DIFFICULTY, "label"),
+                      _cell(getattr(eco, "difficulty_label", "Comfortable"))]))
     rows.append(_row([_cell(LV_DAY_LENGTH, "label"),
                       _cell(round(eco.day_duration, 1))]))
     rows.append(_row([_cell(LV_EVENT_CHANCE, "label"),
