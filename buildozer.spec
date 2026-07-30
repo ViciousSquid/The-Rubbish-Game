@@ -40,14 +40,15 @@ android.allow_backup = True
 # pin it here so the build is explicit and reproducible.
 p4a.bootstrap = sdl2
 
-# Pin python-for-android instead of tracking its master branch. Current
-# master hardcodes CPython 3.14.2 for the on-device Python while still
-# building its bundled pygame recipe at 2.1.0, and that pygame release
-# predates Python 3.11's removal of the private `longintrepr.h` header, so
-# the build fails with "fatal error: 'longintrepr.h' file not found" while
-# compiling pygame's _sdl2 module. v2024.01.21 pairs Python 3.11.5 with the
-# same pygame 2.1.0 recipe, a combination that builds cleanly.
-p4a.branch = v2024.01.21
+# Pin python-for-android instead of tracking its master branch. p4a's
+# bundled pygame recipe is stuck at 2.1.0, and that pygame release's
+# generated _sdl2 module still references the private CPython header
+# `longintrepr.h`, which was removed starting with Python 3.11 (confirmed:
+# pinning to Python 3.11.5 via v2024.01.21 still hits
+# "fatal error: 'longintrepr.h' file not found"). v2023.09.16 targets
+# Python 3.10.10 with the same pygame 2.1.0 recipe, the last combination
+# where that header still exists and the build succeeds.
+p4a.branch = v2023.09.16
 
 
 [buildozer]
