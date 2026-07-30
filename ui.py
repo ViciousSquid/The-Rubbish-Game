@@ -130,8 +130,14 @@ class ColorSystem:
 
 
 class FontSystem:
-    """Centralized font management with better sizing and fallbacks."""
-    def __init__(self):
+    """Centralized font management with better sizing and fallbacks.
+
+    `scale` magnifies the fixed UI point sizes (used on Android, where the whole
+    frame is later upscaled to the device screen — larger glyphs read bigger and
+    sharper there). The dynamically-sized menu title/`custom` faces are left
+    unscaled since they're already sized to the screen."""
+    def __init__(self, scale=1.0):
+        self.scale = scale if (scale and scale > 0) else 1.0
         self._fonts = {}
         self._load_fonts()
     def _load_fonts(self):
@@ -176,8 +182,10 @@ class FontSystem:
             "caption": (base_font, 10, False),
             "badge": (base_font, 10, True),
         }
+        s = self.scale
         for key, (name, size, bold) in specs.items():
-            self._fonts[key] = pygame.font.SysFont(name, size, bold=bold)
+            self._fonts[key] = pygame.font.SysFont(
+                name, max(1, round(size * s)), bold=bold)
     def get(self, key):
         return self._fonts.get(key, self._fonts["body"])
 
@@ -441,7 +449,13 @@ class UIManager:
         self._insufficient_funds_flash = False
         self._flash_timer = 0
         self._flash_duration = 2.2
-        self.fonts = FontSystem()
+        # On Android the whole frame is rendered small and upscaled, so bump the
+        # UI point sizes for legibility (see android_compat.FONT_SCALE); desktop
+        # renders 1:1 and stays at 1.0.
+        import android_compat
+        font_scale = (android_compat.FONT_SCALE
+                      if getattr(game, "android", None) else 1.0)
+        self.fonts = FontSystem(scale=font_scale)
         self.ui = None
         self._hovered_button = None
         self._pressed_button = None

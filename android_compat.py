@@ -43,8 +43,22 @@ IS_ANDROID = _detect_android()
 # baseline; 680 was too close to it to read as scaled up at all -- on a
 # typical 1080px-tall landscape phone that's only ~1.6x, well under
 # Android's 48dp minimum touch target once real screen density is factored
-# in. 480 gives ~2.25x on a 1080px-tall phone and ~3x on a 1440px one.
-LOGICAL_H = 480
+# in.
+#
+# 540 gives 2.0x on a 1080px-tall phone and ~2.67x on a 1440px one -- still
+# comfortably above the touch-target floor, while rendering ~12% more pixels
+# than the old 480 so the final upscale blurs the map and text noticeably
+# less. The UI text is bumped up separately (FONT_SCALE, applied in ui.py) so
+# it ends up slightly larger *and* sharper rather than smaller at this higher
+# resolution.
+LOGICAL_H = 540
+
+# Font magnification for the on-screen UI, applied only on Android (see
+# ui.FontSystem). Rendering glyphs at a larger point size makes them crisper in
+# their own right, not just enlarged by the bilinear upscale, so this lifts both
+# size and sharpness. Kept modest so text grows a little without reflowing the
+# fixed-width management windows.
+FONT_SCALE = 1.2
 
 # Pinch sensitivity: how far the two fingers must spread/close (as a ratio of the
 # last measured distance) before we emit one zoom step.
