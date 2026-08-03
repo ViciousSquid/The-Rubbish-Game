@@ -8,6 +8,7 @@ import citystore
 from economy import DIFFICULTY_PRESETS, DIFFICULTY_ORDER, get_difficulty
 from procurement import VEHICLE_CATALOGUE
 from assets import asset_path
+import device
 
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 HUD_W = 280
@@ -82,6 +83,12 @@ class FloatingWindow:
         self.scroll     = 0        # vertical body scroll offset (px)
         self.max_scroll = 0        # set each frame from content vs body height
         self.scrollable = False    # True while the body overflows the frame
+        # Horizontal scroll — used by full-screen mobile sheets, where a wide
+        # desktop tab (e.g. the rounds grid) is wider than a phone and pans
+        # sideways rather than losing its right-hand columns.
+        self.hscroll     = 0
+        self.max_hscroll = 0
+        self.hscrollable = False
         self.widgets = []      # (rect, fn) click targets collected during draw
         self.cells   = []      # (rect, area_id, day) round-day cells
         self.close_rect = None
@@ -449,13 +456,28 @@ class UIManager:
         self._insufficient_funds_flash = False
         self._flash_timer = 0
         self._flash_duration = 2.2
-        # On Android the whole frame is rendered small and upscaled, so bump the
-        # UI point sizes for legibility (see android_compat.FONT_SCALE); desktop
-        # renders 1:1 and stays at 1.0.
-        import android_compat
-        font_scale = (android_compat.FONT_SCALE
-                      if getattr(game, "android", None) else 1.0)
-        self.fonts = FontSystem(scale=font_scale)
+        # DPI-aware device metrics drive both the font bump and the whole mobile
+        # layout. On a phone the frame is rendered on a physically-sized logical
+        # canvas (see device.py / android_compat.py) and upscaled, so glyphs get
+        # a modest point-size lift for legibility; desktop stays 1:1 at 1.0.
+        self.metrics = device.metrics()
+        self.fonts = FontSystem(scale=self.metrics.font_scale())
+
+        # ── Mobile (touch, DPI-aware) mode ───────────────────────────────────
+        # On a phone the desktop's fixed side-HUD + tiny top toolbar is replaced
+        # by a touch-first shell: a compact status strip across the top and a
+        # thumb-reachable navigation bar across the bottom, with management
+        # panels opening as full-screen sheets. Everything below is gated on
+        # `self.mobile`, so the desktop path is byte-for-byte unchanged.
+        self.mobile = self.metrics.is_mobile
+        # No side column on mobile — the status strip spans the full width.
+        self.hud_w = 0 if self.mobile else HUD_W
+        # Bar heights and touch metrics are specified in Android dp so they come
+        # out the same physical size on every handset (see device.Metrics.dp).
+        self._m_topbar_h = max(40, self._dp(56)) if self.mobile else 0
+        self._m_nav_h = max(50, self._dp(64)) if self.mobile else 0
+        self._m_nav_buttons = []      # (rect, action) rebuilt each nav draw
+        self._m_topbar_buttons = []   # (rect, action) rebuilt each strip draw
         self.ui = None
         self._hovered_button = None
         self._pressed_button = None
@@ -543,6 +565,20 @@ class UIManager:
         # the live window width); nothing to pre-build here. Kept as a method so
         # the existing VIDEORESIZE hook in main.py stays valid.
         self.toolbar_buttons = []
+
+    # ---- DPI-aware touch sizing ------------------------------------------
+    def _dp(self, value):
+        """Round a density-independent (dp) measurement to logical pixels.
+
+        On mobile this yields a consistent *physical* size across densities; on
+        desktop `device.Metrics.dp` is the identity, so callers can use it
+        freely without a mobile branch."""
+        return max(1, round(self.metrics.dp(value)))
+
+    def _bottom_reserved(self):
+        """Vertical space taken by the mobile bottom navigation bar (0 on
+        desktop), so bottom-anchored overlays clear the nav."""
+        return self._m_nav_h if self.mobile else 0
 
     # =====================================================================
     #  Floating-window management
@@ -819,6 +855,17 @@ class UIManager:
     def _clamp_window(self, win):
         w, h = self._screen_size
         r = win.rect
+
+        # Mobile: a management panel is a full-screen sheet filling the gap
+        # between the top status strip and the bottom nav bar. Its body scrolls,
+        # so the same tab content that fills a desktop window still fits.
+        if self.mobile:
+            top = self._m_topbar_h
+            r.x, r.w = 0, w
+            r.y = top
+            r.h = max(WINDOW_TITLEBAR_H + 60, h - top - self._m_nav_h)
+            return
+
         top = self._toolbar_h + 4
         # If the editor bar is visible, leave room for it too.
         bottom_margin = (EDITOR_BAR_H + 4) if self._editor_mode else 4
@@ -849,6 +896,8 @@ class UIManager:
         return None
 
     def _in_toolbar(self, pos):
+        if self.mobile:
+            return False
         return pos[1] < self._toolbar_h and pos[0] >= HUD_W
 
     # ----- mouse routing (called from main.py) -----------------------------
@@ -864,18 +913,29 @@ class UIManager:
             # begin a drag; the actual close happens on mouse-up.
             if win.close_rect and win.close_rect.collidepoint(pos):
                 return True
-            if win.titlebar_rect().collidepoint(pos):
+            # Full-screen mobile sheets don't move, so a title-bar press there
+            # does nothing (drag is desktop-only); the body still flick-scrolls.
+            if (not self.mobile) and win.titlebar_rect().collidepoint(pos):
                 self._win_drag = (win, pos[0] - win.rect.x, pos[1] - win.rect.y)
-            elif win.scrollable and win.body_rect().collidepoint(pos):
+            elif ((win.scrollable or win.hscrollable)
+                    and win.body_rect().collidepoint(pos)):
                 # A press-drag inside a scrolling body flicks the content (touch
-                # scroll). A press with no drag still resolves as a tap on-up.
-                self._win_scroll = [win, pos[1], False]
+                # scroll, either axis). A press with no drag still resolves as a
+                # tap on-up.
+                self._win_scroll = [win, pos[0], pos[1], False]
             return True
+        if self.mobile:
+            # The top status strip and bottom nav bar consume presses (act on
+            # release); a press on the map falls through to a pan/select.
+            h = self._screen_size[1]
+            if pos[1] < self._m_topbar_h or pos[1] >= h - self._m_nav_h:
+                return True
+            return False
         if self._in_editor_bar(pos):
             return True            # consume so it doesn't start a camera drag
         if self._in_toolbar(pos):
             return True            # consume; act on release
-        if pos[0] < HUD_W:
+        if pos[0] < self.hud_w:
             # Consume; act on release. A drag on the overflowing HUD scrolls it.
             if self._hud_max_scroll > 0:
                 self._hud_scroll_drag = [pos[1], False]
@@ -892,11 +952,15 @@ class UIManager:
             self._clamp_window(win)
             return True
         if self._win_scroll is not None:
-            win, last_y, _moved = self._win_scroll
+            win, last_x, last_y, _moved = self._win_scroll
+            dx = pos[0] - last_x
             dy = pos[1] - last_y
             if dy:
                 win.scroll = max(0, min(win.max_scroll, win.scroll - dy))
-            self._win_scroll = [win, pos[1], _moved or abs(dy) > 2]
+            if dx:
+                win.hscroll = max(0, min(win.max_hscroll, win.hscroll - dx))
+            moved = _moved or abs(dx) > 2 or abs(dy) > 2
+            self._win_scroll = [win, pos[0], pos[1], moved]
             return True
         if self._hud_scroll_drag is not None:
             last_y, _moved = self._hud_scroll_drag
@@ -914,7 +978,7 @@ class UIManager:
         self._win_drag = None
         # A flicked scroll (moved) consumes the release; a tap falls through so
         # the button/cell under the finger still resolves.
-        scroll_moved = self._win_scroll is not None and self._win_scroll[2]
+        scroll_moved = self._win_scroll is not None and self._win_scroll[3]
         self._win_scroll = None
         hud_scroll_moved = (self._hud_scroll_drag is not None
                             and self._hud_scroll_drag[1])
@@ -929,12 +993,21 @@ class UIManager:
         if win is not None:
             self._resolve_window_click(win, pos)
             return True
+        if self.mobile:
+            h = self._screen_size[1]
+            if pos[1] < self._m_topbar_h:
+                self._mobile_topbar_click(pos)
+                return True
+            if pos[1] >= h - self._m_nav_h:
+                self._mobile_nav_click(pos)
+                return True
+            return False
         if self._in_editor_bar(pos):
             self._editor_bar_resolve(pos)
             return True
         if self._toolbar_click(pos):
             return True
-        if pos[0] < HUD_W:
+        if pos[0] < self.hud_w:
             return True            # clicked the HUD status panel — no map action
         return False
 
@@ -957,7 +1030,7 @@ class UIManager:
                 return True
             return False
         # HUD wheel scroll (when its status column overflows the viewport).
-        if pos[0] < HUD_W and self._hud_max_scroll > 0:
+        if pos[0] < self.hud_w and self._hud_max_scroll > 0:
             delta = -46 if button == 4 else 46
             self._hud_scroll = max(0, min(self._hud_max_scroll,
                                           self._hud_scroll + delta))
@@ -972,9 +1045,15 @@ class UIManager:
         # clicks that fall outside it (e.g. on a widget scrolled up under the
         # title bar) so scrolled-off controls can't be triggered by an invisible
         # hit-box. Horizontal position is already inside the window frame.
-        if win.scrollable:
+        if win.scrollable or win.hscrollable:
             body = win.body_rect()
-            if not (body.y <= pos[1] < body.bottom):
+            if self.mobile:
+                # A panned sheet clips both axes, so ignore taps anywhere
+                # outside the visible body (a widget scrolled under the frame
+                # must not keep an invisible hit-box).
+                if not body.collidepoint(pos):
+                    return
+            elif not (body.y <= pos[1] < body.bottom):
                 return
         # Resolve against THIS window's collected click targets.
         self.planner_widgets = win.widgets
@@ -1476,8 +1555,13 @@ class UIManager:
         self.ui = UIPrimitives(screen, self.fonts)
         w, h = screen.get_size()
         self._screen_size = (w, h)
-        self._draw_hud(screen, w, h)
-        self._draw_toolbar(screen, w, h)
+        if self.mobile:
+            # Touch-first shell: status strip on top, nav bar on the bottom.
+            self._draw_mobile_topbar(screen, w, h)
+            self._draw_mobile_nav(screen, w, h)
+        else:
+            self._draw_hud(screen, w, h)
+            self._draw_toolbar(screen, w, h)
         self._draw_conditions_strip(screen, w, h)
         self._draw_crisis_banner(screen, w, h)
         self._draw_win_banner(screen, w, h)
@@ -1553,6 +1637,138 @@ class UIManager:
                       accent=accent, pressed=pressed)
             self.toolbar_buttons.append((rect, action))
 
+    # =====================================================================
+    #  Mobile touch shell (status strip + bottom navigation + sheets)
+    # =====================================================================
+    def _draw_mobile_topbar(self, screen, w, h):
+        """Compact, DPI-sized status strip across the top: the numbers you must
+        watch (day, cash, satisfaction, overflows) plus the pause/speed time
+        controls as proper thumb-sized buttons."""
+        ui = self.ui
+        c = ui.c
+        eco = self.game.economy
+        fleet = self.game.fleet
+        bar_h = self._m_topbar_h
+        pygame.draw.rect(screen, c.BG_DEEP, pygame.Rect(0, 0, w, bar_h))
+        pygame.draw.line(screen, c.BORDER_SUBTLE, (0, bar_h), (w, bar_h), 1)
+        self._m_topbar_buttons = []
+
+        pad = self._dp(10)
+        inset = self._dp(6)
+        btn_h = bar_h - inset * 2
+        mouse = pygame.mouse.get_pos()
+
+        # Right cluster: pause/resume + speed, sized to Android's touch minimum.
+        right_limit = w - pad
+        if not eco.has_lost:
+            running = self.game.running
+            p_label = "Pause" if running else "Resume"
+            p_w = max(self._dp(64), ui.fonts.size("body_b", p_label)[0] + self._dp(22))
+            p_rect = pygame.Rect(w - pad - p_w, inset, p_w, btn_h)
+            ui.button(p_rect, p_label, accent=not running,
+                      hovered=p_rect.collidepoint(mouse))
+            self._m_topbar_buttons.append((p_rect, "pause"))
+
+            s_label = f"{self.game.speed}x"
+            s_w = max(self._dp(52), ui.fonts.size("body_b", s_label)[0] + self._dp(16))
+            s_rect = pygame.Rect(p_rect.x - self._dp(8) - s_w, inset, s_w, btn_h)
+            ui.button(s_rect, s_label, hovered=s_rect.collidepoint(mouse))
+            self._m_topbar_buttons.append((s_rect, "speed"))
+            right_limit = s_rect.x - self._dp(10)
+
+        # Left → right info segments (label over value), clipped to the space
+        # left of the time controls.
+        crisis = eco.is_budget_crisis()
+        sat = int(eco.satisfaction)
+        sat_col = (c.STATUS_GOOD if sat >= 70 else
+                   c.STATUS_WARN if sat >= 40 else c.STATUS_BAD)
+        overflow = fleet.get_unscheduled_overflows()
+        segs = [
+            ("DAY", f"{eco.day} {DAY_NAMES[eco.get_day_of_week()]}", c.TEXT_PRIMARY),
+            ("CASH", f"£{int(eco.budget):,}",
+             c.STATUS_BAD if crisis else c.TEXT_PRIMARY),
+            ("HAPPY", f"{sat}%", sat_col),
+            ("OVERFLOW", str(overflow),
+             c.STATUS_BAD if overflow > 0 else c.TEXT_SECONDARY),
+        ]
+        ly = (bar_h - self._dp(30)) // 2
+        vy = ly + self._dp(13)
+        gap = self._dp(16)
+        cxp = pad
+        for label, value, col in segs:
+            lsurf = ui.fonts.render("caption", label, c.TEXT_DIM)
+            vsurf = ui.fonts.render("body_b", value, col)
+            seg_w = max(lsurf.get_width(), vsurf.get_width())
+            if cxp + seg_w > right_limit:
+                break
+            screen.blit(lsurf, (cxp, ly))
+            screen.blit(vsurf, (cxp, vy))
+            cxp += seg_w + gap
+
+    def _draw_mobile_nav(self, screen, w, h):
+        """Thumb-reachable bottom navigation: one big tab per management panel,
+        highlighted while its sheet is open."""
+        ui = self.ui
+        c = ui.c
+        nav_h = self._m_nav_h
+        ny = h - nav_h
+        pygame.draw.rect(screen, c.BG_PANEL, pygame.Rect(0, ny, w, nav_h))
+        pygame.draw.line(screen, c.BORDER_SUBTLE, (0, ny), (w, ny), 1)
+        self._m_nav_buttons = []
+        if self.game.economy.has_lost:
+            return
+
+        tabs = WINDOW_DEFS
+        n = len(tabs)
+        mouse = pygame.mouse.get_pos()
+        for i, (key, short, title, ww, hh) in enumerate(tabs):
+            cx = int(round(i * w / n))
+            cw = int(round((i + 1) * w / n)) - cx
+            rect = pygame.Rect(cx, ny, cw, nav_h)
+            is_open = any(win.key == key for win in self.windows)
+            if is_open:
+                pygame.draw.rect(screen, c.BG_ACTIVE, rect)
+                pygame.draw.rect(screen, c.ACCENT_AMBER,
+                                 pygame.Rect(rect.x, ny, rect.w, self._dp(3)))
+            elif rect.collidepoint(mouse):
+                pygame.draw.rect(screen, c.BG_HOVER, rect)
+            col = c.ACCENT_AMBER if is_open else c.TEXT_SECONDARY
+            label = self._ellipsize(short, ui.fonts.get("body_b"), cw - self._dp(6))
+            ui.text("body_b", label, col, rect.centerx,
+                    ny + (nav_h - ui.fonts.get("body_b").get_height()) // 2,
+                    align="center")
+            if i > 0:
+                pygame.draw.line(screen, c.BORDER_SUBTLE,
+                                 (cx, ny + self._dp(8)), (cx, h - self._dp(8)), 1)
+            self._m_nav_buttons.append((rect, key))
+
+    def _mobile_topbar_click(self, pos):
+        for rect, action in self._m_topbar_buttons:
+            if rect.collidepoint(pos):
+                if action == "pause":
+                    self.game.running = not self.game.running
+                elif action == "speed":
+                    self.game.speed = {1: 2, 2: 5, 5: 10}.get(self.game.speed, 1)
+                return
+
+    def _mobile_nav_click(self, pos):
+        for rect, key in self._m_nav_buttons:
+            if rect.collidepoint(pos):
+                self._toggle_mobile_sheet(key)
+                return
+
+    def _toggle_mobile_sheet(self, key):
+        """Mobile shows one full-screen sheet at a time: tapping the open tab
+        closes it; tapping another swaps to it."""
+        if any(win.key == key for win in self.windows):
+            for win in list(self.windows):
+                if win.key == key:
+                    self.close_window(win)
+            return
+        for win in list(self.windows):
+            self.close_window(win)
+        self.open_window(key)
+
     def _draw_windows(self, screen, w, h):
         self._prune_truck_windows()
         for win in self.windows:
@@ -1579,15 +1795,22 @@ class UIManager:
                          tb, border_radius=8)
         pygame.draw.rect(screen, c.BG_ACTIVE if focused else c.BG_CARD,
                          pygame.Rect(tb.x, tb.y + tb.h - 10, tb.w, 10))
+        # Close box — a fat, DPI-sized tap target on mobile (it extends a little
+        # below the title bar into the padding gap so a finger clears it), a
+        # tidy 24px icon on desktop.
+        mouse = pygame.mouse.get_pos()
+        if self.mobile:
+            cb_w = self._dp(52)
+            cb = pygame.Rect(tb.right - cb_w, tb.y, cb_w, tb.h + self._dp(6))
+            reserve = cb_w + 8
+        else:
+            cb = pygame.Rect(tb.right - 30, tb.y + 5, 24, 24)
+            reserve = 52
         # Trim the caption so it can never run under the close box.
-        title = self._ellipsize(win.title, ui.fonts.get("body_b"), tb.w - 52)
+        title = self._ellipsize(win.title, ui.fonts.get("body_b"), tb.w - reserve)
         ui.text("body_b", title,
                 c.ACCENT_AMBER if focused else c.TEXT_SECONDARY,
                 tb.x + 14, tb.y + 9)
-
-        # Close box
-        cb = pygame.Rect(tb.right - 30, tb.y + 5, 24, 24)
-        mouse = pygame.mouse.get_pos()
         ui.icon_button(cb, "X", hovered=cb.collidepoint(mouse))
         win.close_rect = cb
 
@@ -1609,27 +1832,43 @@ class UIManager:
         win.scrollable = win.max_scroll > 0
         win.scroll = max(0, min(win.scroll, win.max_scroll))
 
+        # Horizontal overflow only happens on mobile full-screen sheets, where a
+        # tab laid out for a wide desktop window can be wider than the phone;
+        # the body then pans sideways instead of clipping its right columns.
+        natural_body_w = win.natural_w - 2 * WINDOW_PAD
+        win.max_hscroll = max(0, natural_body_w - body.w) if self.mobile else 0
+        win.hscrollable = win.max_hscroll > 0
+        win.hscroll = max(0, min(win.hscroll, win.max_hscroll))
+
         content_h = natural_body_h if win.scrollable else body.h
+        content_w = natural_body_w if win.hscrollable else body.w
         content_y = body.y - win.scroll
+        content_x = body.x - win.hscroll
 
         prev_clip = screen.get_clip()
-        if win.scrollable:
-            # Clip vertically to the body (so scrolled content can't spill onto
-            # the title bar or past the frame) but horizontally to the whole
-            # window interior — tabs right-align content to the body edge and
-            # rely on the window's side padding for breathing room, exactly as
-            # on desktop.
+        if win.hscrollable:
+            # Pan both axes: clip tightly to the body so panned content can't
+            # spill onto the frame, title bar or scrollbars.
+            screen.set_clip(body)
+        elif win.scrollable:
+            # Vertical-only (desktop): clip vertically to the body but leave the
+            # horizontal padding free, so right-aligned content keeps its
+            # breathing room exactly as before.
             screen.set_clip(pygame.Rect(r.x + 2, body.y, r.w - 4, body.h))
         renderer = self._content_renderers.get(win.key)
         if renderer:
-            renderer(screen, body.x, content_y, body.w, content_h)
+            renderer(screen, content_x, content_y, content_w, content_h)
         elif win.key.startswith("truck_"):
-            self._truck_window_content(screen, body.x, content_y, body.w,
+            self._truck_window_content(screen, content_x, content_y, content_w,
                                        content_h, int(win.key.split("_", 1)[1]))
-        if win.scrollable:
+        if win.scrollable or win.hscrollable:
             screen.set_clip(prev_clip)
+        if win.scrollable:
             self._draw_window_scrollbar(screen, r, body, win.scroll,
                                         win.max_scroll, natural_body_h)
+        if win.hscrollable:
+            self._draw_window_hscrollbar(screen, r, body, win.hscroll,
+                                         win.max_hscroll, natural_body_w)
 
     def _draw_window_scrollbar(self, screen, frame, body, scroll, max_scroll,
                                content_h):
@@ -1648,20 +1887,37 @@ class UIManager:
         pygame.draw.rect(screen, c.ACCENT_AMBER_DIM, thumb,
                          border_radius=sb_w // 2)
 
+    def _draw_window_hscrollbar(self, screen, frame, body, hscroll, max_hscroll,
+                                content_w):
+        """Slim horizontal scrollbar along the bottom of a panned mobile sheet."""
+        ui = self.ui
+        c = ui.c
+        sb_h = 5
+        sb_y = frame.bottom - sb_h - 4
+        track = pygame.Rect(body.x, sb_y, body.w, sb_h)
+        pygame.draw.rect(screen, c.BG_DEEP, track, border_radius=sb_h // 2)
+        ratio = body.w / max(1, content_w)
+        thumb_w = max(24, int(body.w * ratio))
+        thumb_x = body.x + int(hscroll / max(1, max_hscroll)
+                               * max(0, body.w - thumb_w))
+        pygame.draw.rect(screen, c.ACCENT_AMBER_DIM,
+                         pygame.Rect(thumb_x, sb_y, thumb_w, sb_h),
+                         border_radius=sb_h // 2)
+
     def _draw_toast(self, screen, w, h):
         if not getattr(self.game, "toast", "") or self.game.toast_timer <= 0:
             return
         ui = self.ui
         pad = 16
         # Never wider than the map area — long messages get an ellipsis.
-        max_w = max(160, w - HUD_W - 24)
+        max_w = max(160, w - self.hud_w - 24)
         msg = self._ellipsize(self.game.toast, ui.fonts.get("body_b"),
                               max_w - pad * 2)
         surf = ui.fonts.render("body_b", msg, ui.c.TEXT_PRIMARY)
         bw = surf.get_width() + pad * 2
         bh = 40
-        bx = HUD_W + (w - HUD_W - bw) // 2
-        by = h - 80
+        bx = self.hud_w + (w - self.hud_w - bw) // 2
+        by = h - 80 - self._bottom_reserved()
         pygame.draw.rect(screen, (0, 0, 0, 60), pygame.Rect(bx + 2, by + 2, bw, bh), border_radius=6)
         pygame.draw.rect(screen, ui.c.BG_CARD, pygame.Rect(bx, by, bw, bh), border_radius=6)
         pygame.draw.rect(screen, ui.c.ACCENT_AMBER, pygame.Rect(bx, by, 4, bh), border_radius=6)
@@ -1757,11 +2013,13 @@ class UIManager:
         bh = 36
         bx = (w - bw) // 2
 
-        # Anchor to the very bottom of the window with a 10px margin; step up
-        # out of the way when the crisis/S114 banner occupies that band.
-        by = screen.get_height() - bh - 10
+        # Anchor to the very bottom of the window with a 10px margin (clearing
+        # the mobile nav bar); step up out of the way when the crisis/S114
+        # banner occupies that band.
+        reserve = self._bottom_reserved()
+        by = screen.get_height() - bh - 10 - reserve
         if self._crisis_banner_visible():
-            by = screen.get_height() - 60 - bh - 8
+            by = screen.get_height() - 60 - bh - 8 - reserve
 
         # Background
         pygame.draw.rect(screen, (0, 0, 0, 80), pygame.Rect(bx + 2, by + 2, bw, bh), border_radius=6)
@@ -2022,7 +2280,7 @@ class UIManager:
         bw = max(480, surf.get_width() + 48)
         bh = 42
         bx = (w - bw) // 2
-        by = h - 60
+        by = h - 60 - self._bottom_reserved()
         pygame.draw.rect(screen, (0, 0, 0, 80), pygame.Rect(bx + 2, by + 2, bw, bh), border_radius=6)
         pygame.draw.rect(screen, ui.c.BG_CARD, pygame.Rect(bx, by, bw, bh), border_radius=6)
         pygame.draw.rect(screen, ui.c.STATUS_BAD, pygame.Rect(bx, by, 4, bh), border_radius=6)
@@ -2064,7 +2322,7 @@ class UIManager:
         c = ui.c
         pw, ph = 280, 260
         px = w - pw - 20
-        py = h - ph - 20
+        py = h - ph - 20 - self._bottom_reserved()
         pygame.draw.rect(screen, (0, 0, 0, 60), pygame.Rect(px + 3, py + 3, pw, ph), border_radius=8)
         ui.card(px, py, pw, ph)
         tile = self.game.selected_tile["tile"]
@@ -2176,7 +2434,7 @@ class UIManager:
 
         bh = 46
         bx = w - total_w - 20
-        by = h - bh - 20
+        by = h - bh - 20 - self._bottom_reserved()
         pygame.draw.rect(screen, (0, 0, 0, 70), pygame.Rect(bx + 2, by + 2, total_w, bh), border_radius=8)
         pygame.draw.rect(screen, c.BG_CARD, pygame.Rect(bx, by, total_w, bh), border_radius=8)
         pygame.draw.rect(screen, c.BORDER, pygame.Rect(bx, by, total_w, bh), 1, border_radius=8)

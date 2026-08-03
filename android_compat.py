@@ -21,44 +21,26 @@ On desktop ``setup()`` returns ``None`` and nothing here is used, so importing
 this module is harmless everywhere.
 """
 
-import os
-
 import pygame
 
-
-def _detect_android():
-    # python-for-android sets ANDROID_ARGUMENT for the app; ANDROID_APP_PATH /
-    # ANDROID_PRIVATE are also present in the packaged environment.
-    return (
-        "ANDROID_ARGUMENT" in os.environ
-        or "ANDROID_APP_PATH" in os.environ
-        or "ANDROID_PRIVATE" in os.environ
-    )
+import device
 
 
-IS_ANDROID = _detect_android()
+# Kept for backwards-compatibility / introspection. The real platform detection
+# now lives in `device` so the whole game shares one source of truth.
+IS_ANDROID = device.IS_ANDROID
 
-# Logical design height.  Smaller values magnify the UI more (bigger touch
-# targets) at the cost of showing less of the map.  720 matches the desktop
-# baseline; 680 was too close to it to read as scaled up at all -- on a
-# typical 1080px-tall landscape phone that's only ~1.6x, well under
-# Android's 48dp minimum touch target once real screen density is factored
-# in.
-#
-# 540 gives 2.0x on a 1080px-tall phone and ~2.67x on a 1440px one -- still
-# comfortably above the touch-target floor, while rendering ~12% more pixels
-# than the old 480 so the final upscale blurs the map and text noticeably
-# less. The UI text is bumped up separately (FONT_SCALE, applied in ui.py) so
-# it ends up slightly larger *and* sharper rather than smaller at this higher
-# resolution.
+# Nominal fallback logical height. The *actual* height is now computed per
+# device from its physical DPI (see `AndroidPlatform.__init__` /
+# `device.Metrics.logical_height`) so touch targets stay a consistent physical
+# size instead of shrinking on dense panels. This constant only survives as a
+# sane default for any old caller that still reads it.
 LOGICAL_H = 540
 
-# Font magnification for the on-screen UI, applied only on Android (see
-# ui.FontSystem). Rendering glyphs at a larger point size makes them crisper in
-# their own right, not just enlarged by the bilinear upscale, so this lifts both
-# size and sharpness. Kept modest so text grows a little without reflowing the
-# fixed-width management windows.
-FONT_SCALE = 1.2
+# Font magnification for the on-screen UI (see ui.FontSystem). Sourced from the
+# shared device metrics so desktop stays 1.0 and mobile bumps text a little for
+# legibility and sharpness after the upscale.
+FONT_SCALE = device.metrics().font_scale()
 
 # Pinch sensitivity: how far the two fingers must spread/close (as a ratio of the
 # last measured distance) before we emit one zoom step.
@@ -75,11 +57,18 @@ class AndroidPlatform:
         self.real = pygame.display.get_surface()
         self.real_w, self.real_h = self.real.get_size()
 
+        # DPI-aware logical height: sized from the panel's *physical* density so
+        # a given logical size maps to a fixed real-world size on every device
+        # (a dense 5" phone and a coarse 7" tablet get the same thumb-sized
+        # controls, not wildly different ones). Falls back gracefully when the
+        # density can't be read. See device.Metrics.logical_height.
+        self.metrics = device.metrics()
+        self.logical_h = self.metrics.logical_height(self.real_w, self.real_h)
+
         # Uniform scale keeps the aspect ratio, so the scaled logical surface
         # fills the screen exactly with no letterboxing or distortion.
-        self.scale = self.real_h / float(LOGICAL_H)
+        self.scale = self.real_h / float(self.logical_h)
         self.logical_w = max(1, round(self.real_w / self.scale))
-        self.logical_h = LOGICAL_H
         self.logical = pygame.Surface((self.logical_w, self.logical_h)).convert()
 
         # Active touch points, keyed by finger id -> (norm_x, norm_y).

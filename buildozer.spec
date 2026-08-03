@@ -24,10 +24,13 @@ source.exclude_dirs = bin, .buildozer, .git, .github, __pycache__
 icon.filename = _internal/icon.png
 
 # ── Requirements ──────────────────────────────────────────────────────────
-# Only pygame is needed. Pillow and pyexcel-ods are desktop-only extras that
-# the game degrades gracefully without (truck sprite falls back to pygame's
-# PNG loader; spreadsheet import/export and native file dialogs are disabled).
-requirements = python3,pygame
+# pygame drives the game; pyjnius lets device.py read the panel's real
+# densityDpi from Android's DisplayMetrics so the UI is sized in physical
+# (density-independent) units rather than raw pixels — the DPI-aware mobile
+# layout. If pyjnius is ever unavailable the density query fails soft and a
+# sane phone default is used, so the app still runs. Pillow and pyexcel-ods
+# stay desktop-only extras the game degrades gracefully without.
+requirements = python3,pygame,pyjnius
 
 # ── Display ───────────────────────────────────────────────────────────────
 orientation = landscape
