@@ -1,4 +1,6 @@
-#### Run a UK borough's bin service without going bankrupt.
+### Run a UK borough's bin service without going bankrupt.
+
+A municipal logistics/tycoon simulation where waste generation, collection scheduling, routing and infrastructure interact to create an emergent management problem.
 
 Buy the lorries, hire the crews, choose which waste streams to collect — and keep
 the residents happy and the recycling targets met before the council slides into
