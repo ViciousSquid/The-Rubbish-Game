@@ -506,6 +506,34 @@ class Renderer:
         tile_y = (iy / (self.tile_h / 2) - ix / (self.tile_w / 2)) / 2
         return {"x": round(tile_x), "y": round(tile_y)}
 
+    def landfill_at_screen_pos(self, city, screen_x, screen_y):
+        """Hit-test the drawn landfill mound against a screen click. The mound is
+        rendered as a tall pile centred on the site, so its visible silhouette
+        rises well above the ground tile it sits on — a plain screen->tile
+        lookup there lands on a road behind the pile. Match the click against the
+        mound's screen bounds (mirroring draw_landfill's geometry) so clicking
+        anywhere on the pile selects the site. Returns (cx, cy) tile coords of the
+        landfill centre, or None."""
+        lf = getattr(city, "landfill", None)
+        if not lf:
+            return None
+        cx   = self.screen.get_width() // 2 + self.camera["x"]
+        cy   = 120 + self.camera["y"]
+        zoom = self.camera["zoom"]
+        iso  = self.to_iso(lf["cx"], lf["cy"])
+        x    = cx + iso[0] * zoom
+        y    = cy + iso[1] * zoom
+        hw   = (self.tile_w / 2) * zoom
+        hh   = (self.tile_h / 2) * zoom
+        base_w = hw * 3.0
+        base_h = hh * 3.0
+        # Generous silhouette box: full base width, from the pile's peak down to
+        # the front lip of the base ellipse.
+        if (x - base_w <= screen_x <= x + base_w
+                and y - base_h <= screen_y <= y + base_h * 0.5):
+            return (lf["cx"], lf["cy"])
+        return None
+
     def truck_screen_pos(self, truck):
         """Screen-space (x, y, icon_scale) for a lorry, matching the offsets
         used by draw_truck() so hit-testing lines up with what's on screen."""

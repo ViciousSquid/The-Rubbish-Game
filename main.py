@@ -588,6 +588,20 @@ class WasteCityGame:
             self.ui.apply_editor_brush(coord["x"], coord["y"])
             return
 
+        # The landfill pile is drawn tall, so a click on it resolves (via
+        # screen->tile) to a road behind the mound; and the site's own centre is
+        # the access road at its gate, not a landfill tile. Hit-test the pile's
+        # screen silhouette (or a direct click on one of its tiles) and select a
+        # representative landfill tile so the site — not the road — is selected.
+        lf_hit = self.renderer.landfill_at_screen_pos(self.city, screen_x, screen_y)
+        raw_tile = self.city.get_tile(coord["x"], coord["y"])
+        if lf_hit is None and raw_tile and raw_tile.type == "landfill":
+            lf_hit = (coord["x"], coord["y"])
+        if lf_hit is not None:
+            rep = self._landfill_select_tile()
+            if rep is not None:
+                coord = {"x": rep[0], "y": rep[1]}
+
         tile = self.city.get_tile(coord["x"], coord["y"])
         if not tile:
             self.clear_selection()
@@ -597,6 +611,23 @@ class WasteCityGame:
             self.clear_selection()
         else:
             self.selected_tile = {"x": coord["x"], "y": coord["y"], "tile": tile}
+
+    def _landfill_select_tile(self):
+        """A representative landfill tile to stand in for the whole site when it
+        is selected — the site's own tile nearest the pile centre, so the map
+        highlight sits under the mound. Returns (x, y) or None."""
+        lf = getattr(self.city, "landfill", None)
+        if not lf or not lf.get("tiles"):
+            return None
+        cx, cy = lf["cx"], lf["cy"]
+        landfill_tiles = [
+            (x, y) for (x, y) in lf["tiles"]
+            if (t := self.city.get_tile(x, y)) and t.type == "landfill"
+        ]
+        if not landfill_tiles:
+            return None
+        return min(landfill_tiles,
+                   key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
 
     def clear_selection(self):
         self.selected_tile = None

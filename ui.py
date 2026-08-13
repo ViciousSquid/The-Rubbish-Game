@@ -577,6 +577,7 @@ class UIManager:
         self.buttons = []
         self.planner_cells = []
         self.planner_widgets = []
+        self._inspect_widgets = []   # (rect, fn) click targets in the inspect panel
         self._planner_close = None
         # Truck rename state
         self._renaming_truck_id = None
@@ -1081,6 +1082,11 @@ class UIManager:
         if win is not None:
             self._resolve_window_click(win, pos)
             return True
+        # Buttons drawn on the (non-window) inspect panel, e.g. Expand landfill.
+        for rect, fn in self._inspect_widgets:
+            if rect.collidepoint(pos):
+                fn()
+                return True
         if self.mobile:
             h = self._screen_size[1]
             if pos[1] < self._m_topbar_h:
@@ -2489,18 +2495,21 @@ class UIManager:
         screen.blit(hint, hint.get_rect(center=(w // 2, by + 110)))
 
     def _draw_inspect_panel(self, screen, w, h):
+        self._inspect_widgets = []
         if not self.game.selected_tile:
             self._draw_bottom_right_conditions(screen, w, h)
             return
         ui = self.ui
         c = ui.c
-        pw, ph = 280, 260
+        tile = self.game.selected_tile["tile"]
+        tx, ty = self.game.selected_tile["x"], self.game.selected_tile["y"]
+        # The landfill readout carries more detail (and the Expand button), so it
+        # gets a taller panel.
+        pw, ph = 280, (320 if tile.type == "landfill" else 260)
         px = w - pw - 20
         py = h - ph - 20 - self._bottom_reserved()
         pygame.draw.rect(screen, c.SHADOW, pygame.Rect(px + 3, py + 3, pw, ph))
         ui.panel(px, py, pw, ph)
-        tile = self.game.selected_tile["tile"]
-        tx, ty = self.game.selected_tile["x"], self.game.selected_tile["y"]
         rx = px + 16
         rr = px + pw - 16
         if tile.type == "road":
@@ -2512,9 +2521,7 @@ class UIManager:
             ui.text("body_s", "Park or garden area.", c.TEXT_MUTED, rx, py + 44)
             return
         if tile.type == "landfill":
-            ui.text("h2", "Landfill Site", c.TEXT_PRIMARY, rx, py + 14)
-            ui.text("body_s", "Where full lorries tip their loads.", c.TEXT_MUTED, rx, py + 44)
-            ui.text("body_xs", "Disposal gate fees charged here.", c.TEXT_DIM, rx, py + 66)
+            self._draw_landfill_inspect(screen, px, py, pw, ph, rx, rr)
             return
         label = STYLE_LABELS.get(tile.building_style, tile.type.title())
         ui.text("h2", label, c.TEXT_PRIMARY, rx, py + 12)
@@ -2562,6 +2569,76 @@ class UIManager:
             ui.value(str(tile.population), rr, row, c.TEXT_SECONDARY, align="right")
             row += lh
         ui.text("body_xs", "Open the Rounds window to reschedule.", c.TEXT_DIM, rx, py + ph - 24)
+
+    def _draw_landfill_inspect(self, screen, px, py, pw, ph, rx, rr):
+        """Detailed landfill readout shown when the site is selected on the map:
+        capacity used, remaining vs maximum, projected life and disposal-cost
+        factor, plus the Expand landfill action (registered as a click target)."""
+        ui = self.ui
+        c = ui.c
+        eco = self.game.economy
+        ui.text("h2", "Landfill Site", c.TEXT_PRIMARY, rx, py + 14)
+        ui.text("body_s", "Where full lorries tip their loads.",
+                c.TEXT_MUTED, rx, py + 40)
+
+        st = eco.landfill_status()
+        row = py + 66
+        if not st:
+            ui.text("body_xs", "Disposal gate fees charged here.",
+                    c.TEXT_DIM, rx, row)
+            return
+
+        fill = st["fill_pct"]
+        fcol = (c.STATUS_GOOD if fill < 50 else
+                c.STATUS_WARN if fill < 80 else c.STATUS_BAD)
+        ui.label("Capacity used", rx, row)
+        extra = " — FULL" if st["is_full"] else ""
+        ui.value(f"{fill:.0f}%{extra}", rr, row, fcol, align="right")
+        row += 18
+        ui.progress_bar(rx, row, pw - 32, 8, int(fill), 100,
+                        color=fcol, show_text=False)
+        row += 20
+
+        cap = st["capacity"]
+        used = max(0.0, cap - st["remaining"])
+        ui.label("Filled / capacity", rx, row)
+        ui.value(f"{used/1000:.0f}k / {cap/1000:.0f}k", rr, row,
+                 c.TEXT_PRIMARY, align="right")
+        row += 20
+        ui.label("Space remaining", rx, row)
+        ui.value(f"{st['remaining']/1000:.0f}k units", rr, row,
+                 c.TEXT_SECONDARY, align="right")
+        row += 20
+
+        yl = st["years_left"]
+        if yl is not None and not st["is_full"]:
+            ylcol = (c.STATUS_BAD if yl < 0.5 else
+                     c.STATUS_WARN if yl < 1.2 else c.TEXT_SECONDARY)
+            ui.label("Estimated life", rx, row)
+            ui.value(f"{yl:.1f} yrs", rr, row, ylcol, align="right")
+            row += 20
+
+        gm = st["gate_mult"]
+        gmcol = (c.STATUS_GOOD if gm < 1.15 else
+                 c.STATUS_WARN if gm < 1.8 else c.STATUS_BAD)
+        ui.label("Disposal cost factor", rx, row)
+        ui.value(f"x{gm:.2f}", rr, row, gmcol, align="right")
+        row += 24
+
+        fac = eco.facilities
+        added = fac.default_expansion()
+        cost = fac.expansion_cost(added)
+        can = eco.can_expand_landfill()
+        exp_rect = pygame.Rect(rx, py + ph - 44, pw - 32, 30)
+        mouse = pygame.mouse.get_pos()
+        # Drawn (and click-registered) directly rather than via _pbtn, which
+        # targets the per-window widget list; the inspect panel has its own.
+        ui.button(exp_rect,
+                  f"Expand landfill (+{added/1000:.0f}k units, £{cost:,.0f})",
+                  enabled=can, accent=can,
+                  hovered=can and exp_rect.collidepoint(mouse))
+        if can:
+            self._inspect_widgets.append((exp_rect, self._expand_landfill))
 
     def _draw_bottom_right_conditions(self, screen, w, h):
         """Alternative readout placed in the bottom-right context when no tile 
@@ -3534,16 +3611,12 @@ class UIManager:
             ui.text("caption",
                     "Recycling diverts waste from the tip and slows the rise in "
                     "disposal cost.", c.TEXT_DIM, gx, ry)
+            ry += 20
+            # Expansion is bought by selecting the landfill site on the map.
+            ui.text("caption",
+                    "Select the landfill site on the map to expand it.",
+                    c.TEXT_DIM, gx, ry)
             ry += 26
-            fac = eco.facilities
-            added = fac.default_expansion()
-            cost = fac.expansion_cost(added)
-            can = eco.can_expand_landfill()
-            exp_rect = pygame.Rect(gx, ry, gw, 28)
-            self._pbtn(screen, exp_rect,
-                       f"Expand landfill (+{added/1000:.0f}k units, £{cost:,.0f})",
-                       self._expand_landfill, enabled=can, accent=can)
-            ry += 36
 
         # ── Achievements ─────────────────────────────────────────────────────
         if eco.achievements:
