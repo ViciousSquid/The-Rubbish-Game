@@ -56,7 +56,7 @@ WINDOW_DEFS = [
     ("waste",   "Waste",   "Waste Streams",        660, 520),
     ("fleet",   "Fleet",   "Fleet & Procurement",  800, 648),
     ("staff",   "Staff",   "Staff & Vehicles",     864, 560),
-    ("finance", "Finance", "Finance",              788, 664),
+    ("finance", "Finance", "Finance",              788, 700),
     ("charts",  "Charts",  "Financial Charts",     760, 560),
     ("data",    "Data",    "Data & Plan I/O",      620, 508),
 ]
@@ -108,91 +108,150 @@ class FloatingWindow:
 
 
 class ColorSystem:
-    """A cohesive, accessible color palette inspired by modern dark-mode games."""
-    BG_DEEP = (14, 16, 22)
-    BG_PANEL = (24, 28, 36)
-    BG_CARD = (32, 38, 48)
-    BG_HOVER = (42, 50, 64)
-    BG_ACTIVE = (52, 62, 80)
-    BORDER_SUBTLE = (48, 56, 72)
-    BORDER = (72, 84, 108)
-    BORDER_BRIGHT = (120, 140, 170)
-    # Body text is white across the board — the old grey tiers were hard to
-    # read on the dark panels. TEXT_DIM stays a whisper softer than white so
-    # disabled controls still read as disabled, but it remains bright enough
-    # to read comfortably.
-    TEXT_PRIMARY = (255, 255, 255)
-    TEXT_SECONDARY = (255, 255, 255)
-    TEXT_MUTED = (255, 255, 255)
-    TEXT_DIM = (218, 224, 236)
-    ACCENT_AMBER = (255, 190, 80)
-    ACCENT_AMBER_DIM = (200, 150, 60)
-    ACCENT_TEAL = (80, 200, 190)
-    ACCENT_CORAL = (255, 120, 100)
-    ACCENT_CORAL_DIM = (200, 90, 80)
-    ACCENT_SAGE = (140, 200, 130)
-    STATUS_GOOD = (120, 210, 130)
-    STATUS_WARN = (255, 180, 80)
-    STATUS_BAD = (255, 100, 100)
+    """A Windows-95 desktop palette: light-grey 3D chrome, navy title bars,
+    white sunken fields, and hard black text.
+
+    The whole UI used to be light-on-dark. Flipping it to the classic Win95
+    look is done here, at the palette, so the hundreds of call sites that name
+    these constants recolour in one move: every ``TEXT_*`` that was near-white
+    becomes near-black, every ``BG_*`` that was a dark panel becomes a grey
+    face or a white well, and the status/accent colours are darkened so they
+    stay legible on a light ground instead of a dark one.
+
+    The dedicated bevel colours (LIGHT / FACE / SHADOW / DKSHADOW) drive the
+    raised/sunken 3D edges in :class:`UIPrimitives`. Title bars use the
+    navy→blue gradient (a nod to OpenTTD's window captions) rather than a flat
+    fill, which reads a touch richer while staying period-correct."""
+
+    # ── Win95 3D bevel ramp ──────────────────────────────────────────────
+    LIGHT     = (255, 255, 255)   # top/left outer highlight
+    FACE      = (198, 198, 198)   # the button/window face grey
+    FACE_LIT  = (222, 222, 222)   # a lighter face for hovered controls
+    SHADOW    = (128, 128, 128)   # bottom/right inner shadow
+    DKSHADOW  = (72, 72, 72)      # bottom/right outer shadow (softened black)
+    FIELD     = (255, 255, 255)   # sunken well: list boxes, text fields, charts
+    # Title bar (active) — navy→blue gradient; inactive — grey gradient.
+    TITLE_A1  = (0, 24, 120)
+    TITLE_A2  = (26, 92, 190)
+    TITLE_I1  = (122, 122, 122)
+    TITLE_I2  = (160, 160, 160)
+
+    # ── Legacy names, remapped to the Win95 ground ───────────────────────
+    BG_DEEP = (255, 255, 255)     # sunken wells / progress troughs / insets
+    BG_PANEL = (198, 198, 198)    # window / panel face
+    BG_CARD = (198, 198, 198)     # cards are raised grey tiles
+    BG_HOVER = (222, 222, 222)    # hovered tile
+    BG_ACTIVE = (0, 24, 120)      # selection / focused title navy
+    BORDER_SUBTLE = (128, 128, 128)
+    BORDER = (128, 128, 128)
+    BORDER_BRIGHT = (0, 0, 0)
+    # Text: hard, crisp, dark-on-light.
+    TEXT_PRIMARY = (0, 0, 0)
+    TEXT_SECONDARY = (24, 24, 24)
+    TEXT_MUTED = (72, 72, 80)
+    TEXT_DIM = (120, 120, 124)    # disabled / de-emphasised
+    # Accents & status — darkened so they carry on a light ground.
+    ACCENT_AMBER = (150, 92, 0)
+    ACCENT_AMBER_DIM = (120, 74, 0)
+    ACCENT_TEAL = (0, 96, 128)
+    ACCENT_CORAL = (176, 40, 32)
+    ACCENT_CORAL_DIM = (132, 30, 24)
+    ACCENT_SAGE = (24, 112, 40)
+    STATUS_GOOD = (24, 120, 40)
+    STATUS_WARN = (176, 108, 0)
+    STATUS_BAD = (184, 36, 32)
 
 
 class FontSystem:
-    """Centralized font management with better sizing and fallbacks.
+    """Centralized font management with a crisp, Windows-95-style pixel look.
+
+    The old build rendered the whole UI with anti-aliased *system* fonts, which
+    looked soft and — worse — different on every machine (and different again on
+    Android, where the requested system faces simply don't exist). Both problems
+    are fixed here by **bundling** the UI typeface in ``_internal`` and rendering
+    it with anti-aliasing switched OFF. That gives hard-edged, pixel-crisp text
+    that is byte-for-byte identical on desktop and on the Android client.
+
+    The bundled faces are Liberation Sans / Liberation Mono — Liberation Sans is
+    metric-compatible with Arial, i.e. the same proportional sans Windows 95's
+    "MS Sans Serif" chrome was built around, so it carries the era's look while
+    staying perfectly legible for the game's dense data tables.
 
     `scale` magnifies the fixed UI point sizes (used on Android, where the whole
     frame is later upscaled to the device screen — larger glyphs read bigger and
-    sharper there). The dynamically-sized menu title/`custom` faces are left
-    unscaled since they're already sized to the screen."""
+    sharper there). The dynamically-sized menu title/`custom` faces (Anton) are
+    left unscaled and still anti-aliased — the main-menu title stays as it was.
+    """
+
+    # Global switch: UI body text is drawn 1-bit (no anti-aliasing) for the
+    # crisp bitmap-font look. Only the Anton menu title opts back into AA.
+    ANTIALIAS = False
+
     def __init__(self, scale=1.0):
         self.scale = scale if (scale and scale > 0) else 1.0
         self._fonts = {}
         self._load_fonts()
+
+    def _bundled(self, filename, fallback_sysfonts):
+        """Resolve a bundled TTF in ``_internal``; fall back to a system face
+        only if the bundle is missing (should never happen in a real build)."""
+        p = asset_path(filename)
+        if os.path.isfile(p):
+            return ("file", p)
+        for name in fallback_sysfonts:
+            try:
+                pygame.font.SysFont(name, 12)
+                return ("sys", name)
+            except Exception:
+                continue
+        return ("sys", None)
+
+    def _mkfont(self, spec, size, bold):
+        kind, ref = spec
+        if kind == "file":
+            f = pygame.font.Font(ref, size)
+            f.set_bold(False)  # bold comes from the dedicated bold TTF
+            return f
+        return pygame.font.SysFont(ref, size, bold=bold)
+
     def _load_fonts(self):
-        font_names = ["segoeui", "arial", "helvetica", "liberationsans", "dejavusans"]
-        base_font = None
-        for name in font_names:
-            try:
-                base_font = name
-                pygame.font.SysFont(name, 12)
-                break
-            except:
-                continue
-        if base_font is None:
-            base_font = "freesans"
-        mono_names = ["consolas", "couriernew", "liberationmono", "dejavusansmono"]
-        mono_font = None
-        for name in mono_names:
-            try:
-                mono_font = name
-                pygame.font.SysFont(name, 12)
-                break
-            except:
-                continue
-        if mono_font is None:
-            mono_font = base_font
-        self.base = base_font
-        self.mono = mono_font
+        # Bundled faces (identical on desktop + Android). Bold and regular are
+        # separate real weights so glyph stems stay crisp at small sizes rather
+        # than being synthetically smeared.
+        self._sans   = self._bundled("UISans-Regular.ttf",
+                                     ["liberationsans", "arial", "dejavusans"])
+        self._sans_b = self._bundled("UISans-Bold.ttf",
+                                     ["liberationsans", "arial", "dejavusans"])
+        self._mono   = self._bundled("UIMono-Regular.ttf",
+                                     ["liberationmono", "dejavusansmono", "couriernew"])
+        self._mono_b = self._bundled("UIMono-Bold.ttf",
+                                     ["liberationmono", "dejavusansmono", "couriernew"])
+        # Kept for callers that read .base / .mono (e.g. ellipsize helpers).
+        self.base = "liberationsans"
+        self.mono = "liberationmono"
+        # (face-spec, size, bold-face?). Sizes nudged so the crisp pixel faces
+        # land on clean stem heights.
         specs = {
-            "display": (base_font, 28, True),
-            "display_sub": (base_font, 18, True),
-            "h1": (base_font, 20, True),
-            "h2": (base_font, 16, True),
-            "h3": (base_font, 14, True),
-            "body": (base_font, 14, False),
-            "body_b": (base_font, 14, True),
-            "body_s": (base_font, 12, False),
-            "body_xs": (base_font, 11, False),
-            "mono": (mono_font, 13, False),
-            "mono_b": (mono_font, 13, True),
-            "mono_s": (mono_font, 11, False),
-            "label": (base_font, 11, True),
-            "caption": (base_font, 10, False),
-            "badge": (base_font, 10, True),
+            "display":     (self._sans_b, 26, True),
+            "display_sub": (self._sans_b, 18, True),
+            "h1":          (self._sans_b, 20, True),
+            "h2":          (self._sans_b, 16, True),
+            "h3":          (self._sans_b, 13, True),
+            "body":        (self._sans,   13, False),
+            "body_b":      (self._sans_b, 13, True),
+            "body_s":      (self._sans,   12, False),
+            "body_xs":     (self._sans,   11, False),
+            "mono":        (self._mono,   13, False),
+            "mono_b":      (self._mono_b, 13, True),
+            "mono_s":      (self._mono,   11, False),
+            "label":       (self._sans_b, 11, True),
+            "caption":     (self._sans,   11, False),
+            "badge":       (self._sans_b, 10, True),
         }
         s = self.scale
-        for key, (name, size, bold) in specs.items():
-            self._fonts[key] = pygame.font.SysFont(
-                name, max(1, round(size * s)), bold=bold)
+        for key, (spec, size, bold) in specs.items():
+            self._fonts[key] = self._mkfont(spec, max(1, round(size * s)), bold)
+
     def get(self, key):
         return self._fonts.get(key, self._fonts["body"])
 
@@ -236,48 +295,87 @@ class FontSystem:
             self._fonts[key] = f
         return f
     def render(self, key, text, color):
-        return self._fonts[key].render(text, True, color)
+        return self._fonts[key].render(text, self.ANTIALIAS, color)
     def size(self, key, text):
         return self._fonts[key].size(text)
 
 
+def _lum(color):
+    """Rough perceived luminance 0..255 — picks black/white text over a fill."""
+    r, g, b = color[0], color[1], color[2]
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
 class UIPrimitives:
-    """Low-level drawing primitives for consistent UI styling."""
+    """Low-level drawing primitives — Windows-95 hard-edged 3D chrome.
+
+    Everything is square. Raised controls (buttons, panels, tiles) get a
+    light top-left / dark bottom-right bevel; sunken wells (fields, charts,
+    progress troughs) get the inverse. ``border_radius`` is accepted for
+    call-site compatibility but ignored — rounded corners are exactly the
+    "soft" look we're replacing."""
+
     def __init__(self, screen, fonts):
         self.screen = screen
         self.fonts = fonts
         self.c = ColorSystem
-    def panel(self, x, y, w, h, fill=None, border=True, border_radius=4):
-        color = fill or self.c.BG_PANEL
-        rect = pygame.Rect(x, y, w, h)
-        pygame.draw.rect(self.screen, color, rect, border_radius=border_radius)
-        if border:
-            pygame.draw.rect(self.screen, self.c.BORDER_SUBTLE, rect, 1, border_radius=border_radius)
-        return rect
-    def card(self, x, y, w, h, hover=False, selected=False):
-        if selected:
-            fill = self.c.BG_ACTIVE
-            border_color = self.c.ACCENT_AMBER
-            border_width = 2
-        elif hover:
-            fill = self.c.BG_HOVER
-            border_color = self.c.BORDER
-            border_width = 1
+
+    # ── 3D bevel core ────────────────────────────────────────────────────
+    def _edge(self, rect, hi, lo):
+        """One 1px bevel ring: top+left in `hi`, bottom+right in `lo`."""
+        s = self.screen
+        x, y, w, h = rect.x, rect.y, rect.w, rect.h
+        pygame.draw.line(s, hi, (x, y), (x + w - 2, y))                 # top
+        pygame.draw.line(s, hi, (x, y), (x, y + h - 2))                 # left
+        pygame.draw.line(s, lo, (x, y + h - 1), (x + w - 1, y + h - 1)) # bottom
+        pygame.draw.line(s, lo, (x + w - 1, y), (x + w - 1, y + h - 1)) # right
+
+    def bevel(self, rect, raised=True, depth=2, fill=None):
+        """Draw a Win95 raised/sunken box. Returns the interior rect."""
+        c = self.c
+        rect = pygame.Rect(rect)
+        if fill is not None:
+            pygame.draw.rect(self.screen, fill, rect)
+        if raised:
+            self._edge(rect, c.LIGHT, c.DKSHADOW)
+            if depth >= 2:
+                self._edge(rect.inflate(-2, -2), c.FACE_LIT, c.SHADOW)
         else:
-            fill = self.c.BG_CARD
-            border_color = self.c.BORDER_SUBTLE
-            border_width = 1
+            self._edge(rect, c.SHADOW, c.LIGHT)
+            if depth >= 2:
+                self._edge(rect.inflate(-2, -2), c.DKSHADOW, c.FACE_LIT)
+        inset = 2 if depth >= 2 else 1
+        return rect.inflate(-inset * 2, -inset * 2)
+
+    def panel(self, x, y, w, h, fill=None, border=True, border_radius=4):
         rect = pygame.Rect(x, y, w, h)
-        pygame.draw.rect(self.screen, fill, rect, border_radius=6)
-        pygame.draw.rect(self.screen, border_color, rect, border_width, border_radius=6)
+        color = fill or self.c.BG_PANEL
+        if border:
+            self.bevel(rect, raised=True, depth=2, fill=color)
+        else:
+            pygame.draw.rect(self.screen, color, rect)
         return rect
+
+    def card(self, x, y, w, h, hover=False, selected=False):
+        rect = pygame.Rect(x, y, w, h)
+        if selected:
+            # Chosen tile reads as pressed-in, with a navy keyline so it stands
+            # out while its (dark) content text stays legible on the grey face.
+            self.bevel(rect, raised=False, depth=2, fill=self.c.FACE_LIT)
+            pygame.draw.rect(self.screen, self.c.BG_ACTIVE,
+                             rect.inflate(-2, -2), 1)
+        elif hover:
+            self.bevel(rect, raised=True, depth=2, fill=self.c.FACE_LIT)
+        else:
+            self.bevel(rect, raised=True, depth=1, fill=self.c.BG_CARD)
+        return rect
+
     def inset_panel(self, x, y, w, h):
+        """A sunken white well — list boxes, chart backgrounds, readouts."""
         rect = pygame.Rect(x, y, w, h)
-        pygame.draw.rect(self.screen, self.c.BG_DEEP, rect, border_radius=3)
-        pygame.draw.rect(self.screen, self.c.BORDER_SUBTLE, rect, 1, border_radius=3)
-        inner = rect.inflate(-2, -2)
-        pygame.draw.rect(self.screen, (30, 35, 45), inner, border_radius=2)
+        self.bevel(rect, raised=False, depth=2, fill=self.c.FIELD)
         return rect
+
     def text(self, key, text, color, x, y, align="left"):
         surf = self.fonts.render(key, text, color)
         if align == "left":
@@ -292,88 +390,73 @@ class UIPrimitives:
     def value(self, text, x, y, color=None, align="left"):
         return self.text("body_b", text, color or self.c.TEXT_PRIMARY, x, y, align)
     def button(self, rect, label, enabled=True, accent=False, hovered=False, pressed=False, icon=None, color=None):
+        rect = pygame.Rect(rect)
+        c = self.c
+        # Choose the face colour first, then the appropriate text colour.
         if not enabled:
-            fill = self.c.BG_PANEL
-            border = self.c.BORDER_SUBTLE
-            text_color = self.c.TEXT_DIM
-        elif pressed:
-            fill = self.c.BG_ACTIVE
-            border = self.c.ACCENT_AMBER
-            text_color = self.c.ACCENT_AMBER
-        elif accent and color:
-            # Selected state with custom colour — brighten it and add amber border
-            fill = tuple(min(255, int(c * 1.3)) for c in color)
-            border = self.c.ACCENT_AMBER
-            text_color = self.c.BG_DEEP
-        elif accent:
-            fill = self.c.ACCENT_AMBER_DIM if hovered else (220, 165, 70)
-            border = self.c.ACCENT_AMBER
-            text_color = self.c.BG_DEEP
+            face = c.FACE
+            text_color = c.TEXT_DIM
         elif color:
-            if hovered:
-                fill = tuple(min(255, int(c * 1.15)) for c in color)
-                border = tuple(min(255, int(c * 1.35)) for c in color)
-            else:
-                fill = color
-                border = tuple(min(255, int(c * 1.25)) for c in color)
-            text_color = self.c.TEXT_PRIMARY
+            # A custom-coloured control (round/category swatches). Brighten a
+            # touch on hover; pick black or white text for contrast.
+            face = tuple(min(255, int(v * 1.12)) for v in color) if hovered else color
+            text_color = c.TEXT_PRIMARY if _lum(face) > 140 else c.LIGHT
+        elif accent:
+            # The default/primary button — Win95 gives it a hard black keyline.
+            face = c.FACE_LIT if hovered else c.FACE
+            text_color = c.TEXT_PRIMARY
         elif hovered:
-            fill = self.c.BG_HOVER
-            border = self.c.BORDER_BRIGHT
-            text_color = self.c.TEXT_PRIMARY
+            face = c.FACE_LIT
+            text_color = c.TEXT_PRIMARY
         else:
-            fill = self.c.BG_CARD
-            border = self.c.BORDER
-            text_color = self.c.TEXT_SECONDARY
-        pygame.draw.rect(self.screen, fill, rect, border_radius=5)
-        pygame.draw.rect(self.screen, border, rect, 1, border_radius=5)
-        if enabled and not pressed:
-            highlight = pygame.Rect(rect.x + 1, rect.y + 1, rect.w - 2, rect.h // 3)
-            hl_surf = pygame.Surface((highlight.w, highlight.h), pygame.SRCALPHA)
-            hl_surf.fill((255, 255, 255, 15))
-            self.screen.blit(hl_surf, highlight)
+            face = c.FACE
+            text_color = c.TEXT_SECONDARY
+
+        if accent and enabled:
+            pygame.draw.rect(self.screen, (0, 0, 0), rect, 1)
+            self.bevel(rect.inflate(-2, -2), raised=not pressed, depth=2, fill=face)
+        else:
+            self.bevel(rect, raised=not pressed, depth=2, fill=face)
+
         surf = self.fonts.render("body_b", label, text_color)
-        text_x = rect.centerx - surf.get_width() // 2
-        text_y = rect.centery - surf.get_height() // 2
+        off = 1 if pressed else 0
+        text_x = rect.centerx - surf.get_width() // 2 + off
+        text_y = rect.centery - surf.get_height() // 2 + off
+        if not enabled:
+            # Engraved disabled label: white shadow, grey face (Win95 style).
+            hi = self.fonts.render("body_b", label, c.LIGHT)
+            self.screen.blit(hi, (text_x + 1, text_y + 1))
         self.screen.blit(surf, (text_x, text_y))
         return rect
+
     def icon_button(self, rect, icon_text, tooltip="", enabled=True, hovered=False, pressed=False):
-        if not enabled:
-            fill = self.c.BG_PANEL
-            text_color = self.c.TEXT_DIM
-        elif pressed:
-            fill = self.c.BG_ACTIVE
-            text_color = self.c.ACCENT_AMBER
-        elif hovered:
-            fill = self.c.BG_HOVER
-            text_color = self.c.TEXT_PRIMARY
-        else:
-            fill = self.c.BG_CARD
-            text_color = self.c.TEXT_SECONDARY
-        pygame.draw.rect(self.screen, fill, rect, border_radius=4)
-        pygame.draw.rect(self.screen, self.c.BORDER_SUBTLE, rect, 1, border_radius=4)
+        rect = pygame.Rect(rect)
+        c = self.c
+        face = c.FACE if not hovered else c.FACE_LIT
+        text_color = c.TEXT_DIM if not enabled else c.TEXT_PRIMARY
+        self.bevel(rect, raised=not (pressed and enabled), depth=2, fill=face)
+        off = 1 if (pressed and enabled) else 0
         surf = self.fonts.render("body_b", icon_text, text_color)
-        self.screen.blit(surf, surf.get_rect(center=rect.center))
+        self.screen.blit(surf, surf.get_rect(
+            center=(rect.centerx + off, rect.centery + off)))
         return rect
+
     def progress_bar(self, x, y, w, h, value, max_value, color=None, bg_color=None, show_text=True):
-        color = color or self.c.ACCENT_AMBER
-        bg = bg_color or self.c.BG_DEEP
+        color = color or self.c.ACCENT_TEAL
         rect = pygame.Rect(x, y, w, h)
-        pygame.draw.rect(self.screen, bg, rect, border_radius=h // 2)
+        # Sunken white trough.
+        self.bevel(rect, raised=False, depth=1, fill=self.c.FIELD)
+        pct = 0.0
         if max_value > 0:
             pct = min(1.0, max(0.0, value / max_value))
-            fill_w = int(w * pct)
+            fill_w = int((w - 2) * pct)
             if fill_w > 0:
-                fill_rect = pygame.Rect(x, y, fill_w, h)
-                pygame.draw.rect(self.screen, color, fill_rect, border_radius=h // 2)
-                shine = pygame.Surface((fill_w, h // 2), pygame.SRCALPHA)
-                shine.fill((255, 255, 255, 30))
-                self.screen.blit(shine, (x, y))
-        pygame.draw.rect(self.screen, self.c.BORDER_SUBTLE, rect, 1, border_radius=h // 2)
+                pygame.draw.rect(self.screen, color,
+                                 pygame.Rect(x + 1, y + 1, fill_w, h - 2))
         if show_text:
             pct_text = f"{int(pct * 100)}%"
             surf = self.fonts.render("mono_s", pct_text, self.c.TEXT_PRIMARY)
-            self.screen.blit(surf, (x + w + 6, y))
+            self.screen.blit(surf, (x + w + 6, y + (h - surf.get_height()) // 2))
     def stat_bar(self, x, y, w, value, max_value, low_color=None, mid_color=None, high_color=None):
         if max_value <= 0:
             return
@@ -386,28 +469,32 @@ class UIPrimitives:
             color = high_color or self.c.STATUS_GOOD
         self.progress_bar(x, y, w, 6, value, max_value, color, show_text=False)
     def badge(self, x, y, text, color=None, bg_color=None):
+        # A flat, square Win95 tag: 1px framed chip, dark text on a light face.
         color = color or self.c.TEXT_PRIMARY
-        bg = bg_color or self.c.BG_ACTIVE
+        bg = bg_color if bg_color is not None else self.c.FACE
         surf = self.fonts.render("badge", text, color)
-        pad_x, pad_y = 8, 3
+        pad_x, pad_y = 7, 2
         bw, bh = surf.get_width() + pad_x * 2, surf.get_height() + pad_y * 2
         rect = pygame.Rect(x, y, bw, bh)
-        pygame.draw.rect(self.screen, bg, rect, border_radius=bh // 2)
+        pygame.draw.rect(self.screen, bg, rect)
+        pygame.draw.rect(self.screen, color, rect, 1)
         self.screen.blit(surf, (x + pad_x, y + pad_y))
         return rect
     def status_pill(self, x, y, status_text, status_type="neutral"):
         colors = {
-            "good": (self.c.STATUS_GOOD, (30, 60, 35)),
-            "warn": (self.c.STATUS_WARN, (60, 50, 30)),
-            "bad": (self.c.STATUS_BAD, (60, 35, 35)),
-            "neutral": (self.c.TEXT_MUTED, self.c.BG_ACTIVE),
-            "info": (self.c.ACCENT_TEAL, (30, 50, 55)),
+            "good": self.c.STATUS_GOOD,
+            "warn": self.c.STATUS_WARN,
+            "bad": self.c.STATUS_BAD,
+            "neutral": self.c.TEXT_MUTED,
+            "info": self.c.ACCENT_TEAL,
         }
-        text_color, bg_color = colors.get(status_type, colors["neutral"])
-        return self.badge(x, y, status_text, text_color, bg_color)
+        col = colors.get(status_type, colors["neutral"])
+        return self.badge(x, y, status_text, col, self.c.FACE)
     def h_line(self, x, y, w, color=None):
-        color = color or self.c.BORDER_SUBTLE
-        pygame.draw.line(self.screen, color, (x, y), (x + w, y), 1)
+        # Etched groove: a shadow line with a light line just beneath it.
+        pygame.draw.line(self.screen, color or self.c.SHADOW, (x, y), (x + w, y), 1)
+        if color is None:
+            pygame.draw.line(self.screen, self.c.LIGHT, (x, y + 1), (x + w, y + 1), 1)
     def section_header(self, x, y, label, w=None):
         self.text("h3", label, self.c.TEXT_MUTED, x, y)
         if w:
@@ -438,11 +525,12 @@ class UIPrimitives:
         if rect.bottom > self.screen.get_height():
             rect.y = self.screen.get_height() - th - 10
         shadow = pygame.Rect(rect.x + 2, rect.y + 2, rect.w, rect.h)
-        pygame.draw.rect(self.screen, (0, 0, 0, 100), shadow, border_radius=4)
-        pygame.draw.rect(self.screen, self.c.BG_CARD, rect, border_radius=4)
-        pygame.draw.rect(self.screen, self.c.BORDER, rect, 1, border_radius=4)
+        pygame.draw.rect(self.screen, self.c.SHADOW, shadow)
+        # The classic Win95 "info tip": pale yellow ground, 1px black frame.
+        pygame.draw.rect(self.screen, (255, 255, 225), rect)
+        pygame.draw.rect(self.screen, (0, 0, 0), rect, 1)
         for i, line in enumerate(lines):
-            surf = self.fonts.render("body_s", line, self.c.TEXT_SECONDARY)
+            surf = self.fonts.render("body_s", line, (0, 0, 0))
             self.screen.blit(surf, (rect.x + 8, rect.y + 4 + i * line_h))
 
 
@@ -1625,10 +1713,12 @@ class UIManager:
 
         self._toolbar_h = (row + 1) * TOOLBAR_H
 
-        # Background band + bottom divider, then the buttons.
+        # Background band + etched bottom divider, then the buttons.
         pygame.draw.rect(screen, c.BG_PANEL,
                          pygame.Rect(x0, 0, w - x0, self._toolbar_h))
-        pygame.draw.line(screen, c.BORDER_SUBTLE,
+        pygame.draw.line(screen, c.SHADOW,
+                         (x0, self._toolbar_h - 1), (w, self._toolbar_h - 1), 1)
+        pygame.draw.line(screen, c.LIGHT,
                          (x0, self._toolbar_h), (w, self._toolbar_h), 1)
 
         self.toolbar_buttons = []
@@ -1781,37 +1871,57 @@ class UIManager:
         r = win.rect
         focused = self.windows and self.windows[-1] is win
 
-        # Drop shadow + body
+        # Hard drop shadow (offset, semi-opaque) — depth without a soft blur.
         shadow = pygame.Surface((r.w, r.h), pygame.SRCALPHA)
-        shadow.fill((0, 0, 0, 70))
-        screen.blit(shadow, (r.x + 4, r.y + 5))
-        pygame.draw.rect(screen, c.BG_PANEL, r, border_radius=8)
-        border_col = c.ACCENT_AMBER if focused else c.BORDER
-        pygame.draw.rect(screen, border_col, r, 2 if focused else 1, border_radius=8)
+        shadow.fill((0, 0, 0, 90))
+        screen.blit(shadow, (r.x + 5, r.y + 5))
+        # Window body: raised grey face, Win95 double bevel.
+        ui.bevel(r, raised=True, depth=2, fill=c.BG_PANEL)
 
-        # Title bar
+        # Title bar — inset inside the window bevel, navy→blue gradient when
+        # focused, grey when not. Bold caption, engraved app glyph on the left.
         tb = win.titlebar_rect()
-        pygame.draw.rect(screen, c.BG_ACTIVE if focused else c.BG_CARD,
-                         tb, border_radius=8)
-        pygame.draw.rect(screen, c.BG_ACTIVE if focused else c.BG_CARD,
-                         pygame.Rect(tb.x, tb.y + tb.h - 10, tb.w, 10))
+        tb = pygame.Rect(tb.x + 4, tb.y + 4, tb.w - 8, tb.h - 6)
+        if focused:
+            self._gradient_h(screen, tb, c.TITLE_A1, c.TITLE_A2)
+            title_col = c.LIGHT
+        else:
+            self._gradient_h(screen, tb, c.TITLE_I1, c.TITLE_I2)
+            title_col = (232, 232, 232)
+
         # Close box — a fat, DPI-sized tap target on mobile (it extends a little
         # below the title bar into the padding gap so a finger clears it), a
-        # tidy 24px icon on desktop.
+        # tidy Win95 caption button on desktop.
         mouse = pygame.mouse.get_pos()
         if self.mobile:
-            cb_w = self._dp(52)
-            cb = pygame.Rect(tb.right - cb_w, tb.y, cb_w, tb.h + self._dp(6))
-            reserve = cb_w + 8
+            cb_w = self._dp(46)
+            cb = pygame.Rect(tb.right - cb_w - 2, tb.y + 2, cb_w, tb.h - 4)
+            reserve = cb_w + 12
         else:
-            cb = pygame.Rect(tb.right - 30, tb.y + 5, 24, 24)
-            reserve = 52
+            cb = pygame.Rect(tb.right - 22, tb.y + 3, 18, tb.h - 6)
+            reserve = 44
+        # Little window icon (a bin) on the far left of the caption.
+        icon_x = tb.x + 5
+        pygame.draw.rect(screen, c.FACE, pygame.Rect(icon_x, tb.y + 4, 12, tb.h - 8))
+        pygame.draw.rect(screen, (0, 0, 0), pygame.Rect(icon_x, tb.y + 4, 12, tb.h - 8), 1)
+        pygame.draw.line(screen, (0, 0, 0), (icon_x + 3, tb.y + 7),
+                         (icon_x + 3, tb.y + tb.h - 7), 1)
+        pygame.draw.line(screen, (0, 0, 0), (icon_x + 8, tb.y + 7),
+                         (icon_x + 8, tb.y + tb.h - 7), 1)
         # Trim the caption so it can never run under the close box.
-        title = self._ellipsize(win.title, ui.fonts.get("body_b"), tb.w - reserve)
-        ui.text("body_b", title,
-                c.ACCENT_AMBER if focused else c.TEXT_SECONDARY,
-                tb.x + 14, tb.y + 9)
-        ui.icon_button(cb, "X", hovered=cb.collidepoint(mouse))
+        cap_x = icon_x + 20
+        title = self._ellipsize(win.title, ui.fonts.get("body_b"),
+                                tb.right - reserve - cap_x)
+        ui.text("body_b", title, title_col, cap_x,
+                tb.y + (tb.h - ui.fonts.get("body_b").get_height()) // 2)
+        ui.icon_button(cb, "", hovered=cb.collidepoint(mouse))
+        # A crisp 2px 'X' drawn with lines (font glyphs blur at this size).
+        xr = cb.inflate(-cb.w // 2 + 4, -cb.h // 2 + 4)
+        for dx in (0, 1):
+            pygame.draw.line(screen, (0, 0, 0), (xr.left + dx, xr.top),
+                             (xr.right - 2 + dx, xr.bottom - 2), 1)
+            pygame.draw.line(screen, (0, 0, 0), (xr.right - 2 + dx, xr.top),
+                             (xr.left + dx, xr.bottom - 2), 1)
         win.close_rect = cb
 
         # Content — point the shared widget lists at THIS window, then render.
@@ -1870,39 +1980,55 @@ class UIManager:
             self._draw_window_hscrollbar(screen, r, body, win.hscroll,
                                          win.max_hscroll, natural_body_w)
 
+    def _gradient_h(self, screen, rect, col1, col2):
+        """Fill `rect` with a left→right gradient (title bars)."""
+        rect = pygame.Rect(rect)
+        if rect.w <= 0 or rect.h <= 0:
+            return
+        r1, g1, b1 = col1
+        r2, g2, b2 = col2
+        w = rect.w
+        for i in range(w):
+            t = i / max(1, w - 1)
+            col = (int(r1 + (r2 - r1) * t),
+                   int(g1 + (g2 - g1) * t),
+                   int(b1 + (b2 - b1) * t))
+            pygame.draw.line(screen, col, (rect.x + i, rect.y),
+                             (rect.x + i, rect.bottom - 1))
+
     def _draw_window_scrollbar(self, screen, frame, body, scroll, max_scroll,
                                content_h):
-        """Slim scrollbar tucked into the window's right padding."""
+        """Win95 vertical scrollbar: sunken track, raised thumb."""
         ui = self.ui
         c = ui.c
-        sb_w = 5
-        sb_x = frame.right - sb_w - 4
+        sb_w = self._dp(14) if self.mobile else 13
+        sb_x = frame.right - sb_w - 3
         track = pygame.Rect(sb_x, body.y, sb_w, body.h)
-        pygame.draw.rect(screen, c.BG_DEEP, track, border_radius=sb_w // 2)
+        pygame.draw.rect(screen, c.FACE_LIT, track)
+        pygame.draw.rect(screen, c.SHADOW, track, 1)
         ratio = body.h / max(1, content_h)
         thumb_h = max(24, int(body.h * ratio))
         thumb_y = body.y + int(scroll / max(1, max_scroll)
                                * max(0, body.h - thumb_h))
-        thumb = pygame.Rect(sb_x, thumb_y, sb_w, thumb_h)
-        pygame.draw.rect(screen, c.ACCENT_AMBER_DIM, thumb,
-                         border_radius=sb_w // 2)
+        ui.bevel(pygame.Rect(sb_x, thumb_y, sb_w, thumb_h),
+                 raised=True, depth=2, fill=c.FACE)
 
     def _draw_window_hscrollbar(self, screen, frame, body, hscroll, max_hscroll,
                                 content_w):
-        """Slim horizontal scrollbar along the bottom of a panned mobile sheet."""
+        """Win95 horizontal scrollbar: sunken track, raised thumb."""
         ui = self.ui
         c = ui.c
-        sb_h = 5
-        sb_y = frame.bottom - sb_h - 4
+        sb_h = self._dp(14) if self.mobile else 13
+        sb_y = frame.bottom - sb_h - 3
         track = pygame.Rect(body.x, sb_y, body.w, sb_h)
-        pygame.draw.rect(screen, c.BG_DEEP, track, border_radius=sb_h // 2)
+        pygame.draw.rect(screen, c.FACE_LIT, track)
+        pygame.draw.rect(screen, c.SHADOW, track, 1)
         ratio = body.w / max(1, content_w)
         thumb_w = max(24, int(body.w * ratio))
         thumb_x = body.x + int(hscroll / max(1, max_hscroll)
                                * max(0, body.w - thumb_w))
-        pygame.draw.rect(screen, c.ACCENT_AMBER_DIM,
-                         pygame.Rect(thumb_x, sb_y, thumb_w, sb_h),
-                         border_radius=sb_h // 2)
+        ui.bevel(pygame.Rect(thumb_x, sb_y, thumb_w, sb_h),
+                 raised=True, depth=2, fill=c.FACE)
 
     def _draw_toast(self, screen, w, h):
         if not getattr(self.game, "toast", "") or self.game.toast_timer <= 0:
@@ -1918,10 +2044,9 @@ class UIManager:
         bh = 40
         bx = self.hud_w + (w - self.hud_w - bw) // 2
         by = h - 80 - self._bottom_reserved()
-        pygame.draw.rect(screen, (0, 0, 0, 60), pygame.Rect(bx + 2, by + 2, bw, bh), border_radius=6)
-        pygame.draw.rect(screen, ui.c.BG_CARD, pygame.Rect(bx, by, bw, bh), border_radius=6)
-        pygame.draw.rect(screen, ui.c.ACCENT_AMBER, pygame.Rect(bx, by, 4, bh), border_radius=6)
-        pygame.draw.rect(screen, ui.c.BORDER, pygame.Rect(bx, by, bw, bh), 1, border_radius=6)
+        pygame.draw.rect(screen, ui.c.SHADOW, pygame.Rect(bx + 2, by + 2, bw, bh))
+        ui.bevel(pygame.Rect(bx, by, bw, bh), raised=True, depth=2, fill=ui.c.BG_CARD)
+        pygame.draw.rect(screen, ui.c.ACCENT_AMBER, pygame.Rect(bx + 3, by + 3, 4, bh - 6))
         screen.blit(surf, (bx + pad, by + (bh - surf.get_height()) // 2))
 
     def _draw_conditions_strip(self, screen, w, h):
@@ -1947,24 +2072,25 @@ class UIManager:
         bh = 300
         bx = (w - bw) // 2
         by = (h - bh) // 2
-        pygame.draw.rect(screen, (28, 20, 22), pygame.Rect(bx, by, bw, bh), border_radius=12)
-        pygame.draw.rect(screen, c.STATUS_BAD, pygame.Rect(bx, by, bw, bh), 2, border_radius=12)
-        pygame.draw.rect(screen, c.STATUS_BAD, pygame.Rect(bx, by, bw, 6), border_radius=12)
+        # A Win95 error dialog: grey face, red caption bar, hard black body text.
+        ui.bevel(pygame.Rect(bx, by, bw, bh), raised=True, depth=2, fill=c.BG_PANEL)
+        tb = pygame.Rect(bx + 4, by + 4, bw - 8, 26)
+        self._gradient_h(screen, tb, (140, 12, 12), (196, 48, 40))
+        ui.text("body_b", "Section 114 Notice", c.LIGHT, tb.x + 8,
+                tb.y + (tb.h - ui.fonts.get("body_b").get_height()) // 2)
 
-        title = ui.fonts.render("display", "SECTION 114 NOTICE", c.STATUS_BAD)
-        screen.blit(title, title.get_rect(center=(w // 2, by + 44)))
+        title = ui.fonts.render("display", "THE BOROUGH IS BANKRUPT", c.STATUS_BAD)
+        screen.blit(title, title.get_rect(center=(w // 2, by + 62)))
         diff_label = getattr(eco, "difficulty_label", "Comfortable")
-        sub = ui.fonts.render(
-            "h2", f"The borough is bankrupt.  ({diff_label} difficulty)",
-            c.TEXT_PRIMARY)
-        screen.blit(sub, sub.get_rect(center=(w // 2, by + 78)))
+        sub = ui.fonts.render("h3", f"({diff_label} difficulty)", c.TEXT_MUTED)
+        screen.blit(sub, sub.get_rect(center=(w // 2, by + 88)))
 
         reason = (getattr(eco, "lost_reason", "") or
                   "The council can no longer meet its financial obligations.")
-        self._draw_wrapped_text(screen, reason, bx + 40, by + 104, bw - 80,
+        self._draw_wrapped_text(screen, reason, bx + 40, by + 110, bw - 80,
                                 ui.fonts.get("body"), c.TEXT_SECONDARY)
 
-        sy = by + 170
+        sy = by + 176
         stats = [
             ("DAYS IN OFFICE",      str(getattr(eco, "lost_day", eco.day))),
             ("FINAL SATISFACTION",  f"{int(eco.satisfaction)}%"),
@@ -1980,8 +2106,8 @@ class UIManager:
 
         prompt = ui.fonts.render(
             "body_b", "Press  R  to start a new term      ·      Esc  to quit",
-            c.ACCENT_AMBER)
-        screen.blit(prompt, prompt.get_rect(center=(w // 2, by + bh - 24)))
+            c.BG_ACTIVE)
+        screen.blit(prompt, prompt.get_rect(center=(w // 2, by + bh - 22)))
 
 
     def _draw_procurement_bar(self, screen, w):
@@ -2022,10 +2148,9 @@ class UIManager:
             by = screen.get_height() - 60 - bh - 8 - reserve
 
         # Background
-        pygame.draw.rect(screen, (0, 0, 0, 80), pygame.Rect(bx + 2, by + 2, bw, bh), border_radius=6)
-        pygame.draw.rect(screen, c.BG_CARD, pygame.Rect(bx, by, bw, bh), border_radius=6)
-        pygame.draw.rect(screen, c.ACCENT_TEAL, pygame.Rect(bx, by, 4, bh), border_radius=6)
-        pygame.draw.rect(screen, c.BORDER, pygame.Rect(bx, by, bw, bh), 1, border_radius=6)
+        pygame.draw.rect(screen, c.SHADOW, pygame.Rect(bx + 2, by + 2, bw, bh))
+        ui.bevel(pygame.Rect(bx, by, bw, bh), raised=True, depth=2, fill=c.BG_CARD)
+        pygame.draw.rect(screen, c.ACCENT_TEAL, pygame.Rect(bx + 3, by + 3, 4, bh - 6))
 
         # Truncate text if too wide
         text_x = bx + pad
@@ -2049,8 +2174,12 @@ class UIManager:
         c = ui.c
         x = 14
         right = HUD_W - 14
-        pygame.draw.rect(screen, c.BG_DEEP, pygame.Rect(0, 0, HUD_W, h))
-        pygame.draw.line(screen, c.BORDER_SUBTLE, (HUD_W, 0), (HUD_W, h), 1)
+        # Docked status panel — a raised grey Win95 face with a bevelled right
+        # edge separating it from the map (the "desktop").
+        pygame.draw.rect(screen, c.BG_PANEL, pygame.Rect(0, 0, HUD_W, h))
+        pygame.draw.line(screen, c.LIGHT, (0, 0), (0, h), 1)
+        pygame.draw.line(screen, c.LIGHT, (HUD_W - 2, 0), (HUD_W - 2, h), 1)
+        pygame.draw.line(screen, c.DKSHADOW, (HUD_W - 1, 0), (HUD_W - 1, h), 1)
         # The status column is taller than a landscape-phone viewport, so its
         # content scrolls inside the fixed HUD panel. Clip to the column and
         # shift everything up by the scroll offset; the panel background and
@@ -2282,10 +2411,9 @@ class UIManager:
         bx = (w - bw) // 2
         by = int(-(bh + 20) + ((bh + 50) * progress))
 
-        pygame.draw.rect(screen, (0, 0, 0, 80), pygame.Rect(bx + 3, by + 3, bw, bh), border_radius=8)
-        pygame.draw.rect(screen, c.BG_CARD,     pygame.Rect(bx, by, bw, bh),         border_radius=8)
-        pygame.draw.rect(screen, accent,         pygame.Rect(bx, by, 5, bh),          border_radius=8)
-        pygame.draw.rect(screen, c.BORDER,       pygame.Rect(bx, by, bw, bh), 1,      border_radius=8)
+        pygame.draw.rect(screen, c.SHADOW, pygame.Rect(bx + 3, by + 3, bw, bh))
+        ui.bevel(pygame.Rect(bx, by, bw, bh), raised=True, depth=2, fill=c.BG_CARD)
+        pygame.draw.rect(screen, accent, pygame.Rect(bx + 3, by + 3, 5, bh - 6))
 
         ui.text("h2", title, accent, bx + pad_x, by + 14)
         ty = by + 44
@@ -2323,10 +2451,9 @@ class UIManager:
         bh = 42
         bx = (w - bw) // 2
         by = h - 60 - self._bottom_reserved()
-        pygame.draw.rect(screen, (0, 0, 0, 80), pygame.Rect(bx + 2, by + 2, bw, bh), border_radius=6)
-        pygame.draw.rect(screen, ui.c.BG_CARD, pygame.Rect(bx, by, bw, bh), border_radius=6)
-        pygame.draw.rect(screen, ui.c.STATUS_BAD, pygame.Rect(bx, by, 4, bh), border_radius=6)
-        pygame.draw.rect(screen, ui.c.STATUS_BAD, pygame.Rect(bx, by, bw, bh), 1, border_radius=6)
+        pygame.draw.rect(screen, ui.c.SHADOW, pygame.Rect(bx + 2, by + 2, bw, bh))
+        ui.bevel(pygame.Rect(bx, by, bw, bh), raised=True, depth=2, fill=ui.c.BG_CARD)
+        pygame.draw.rect(screen, ui.c.STATUS_BAD, pygame.Rect(bx + 3, by + 3, 4, bh - 6))
         screen.blit(surf, surf.get_rect(center=(w // 2, by + bh // 2)))
 
     def _draw_win_banner(self, screen, w, h):
@@ -2340,21 +2467,26 @@ class UIManager:
         if alpha <= 0:
             return
         ui = self.ui
+        c = ui.c
         bw = min(600, w - 100)
         bh = 130
         bx = (w - bw) // 2
         by = (h - bh) // 2 - 50
-        pygame.draw.rect(screen, (35, 30, 18), pygame.Rect(bx, by, bw, bh), border_radius=10)
-        pygame.draw.rect(screen, ui.c.ACCENT_AMBER, pygame.Rect(bx, by, bw, bh), 2, border_radius=10)
-        title = ui.fonts.render("display", "BOROUGH CHAMPION", ui.c.ACCENT_AMBER)
-        screen.blit(title, title.get_rect(center=(w // 2, by + 40)))
-        sub = ui.fonts.render("h2", f"{eco.win_streak_target} consecutive days at full service! Day {eco.win_day}.", ui.c.TEXT_PRIMARY)
-        screen.blit(sub, sub.get_rect(center=(w // 2, by + 75)))
+        # A celebratory Win95 dialog: grey face, gold caption bar.
+        ui.bevel(pygame.Rect(bx, by, bw, bh), raised=True, depth=2, fill=c.BG_PANEL)
+        tb = pygame.Rect(bx + 4, by + 4, bw - 8, 26)
+        self._gradient_h(screen, tb, (150, 92, 0), (216, 160, 40))
+        ui.text("body_b", "Borough Champion", c.LIGHT, tb.x + 8,
+                tb.y + (tb.h - ui.fonts.get("body_b").get_height()) // 2)
+        title = ui.fonts.render("display", "BOROUGH CHAMPION", c.ACCENT_AMBER)
+        screen.blit(title, title.get_rect(center=(w // 2, by + 56)))
+        sub = ui.fonts.render("h2", f"{eco.win_streak_target} consecutive days at full service! Day {eco.win_day}.", c.TEXT_PRIMARY)
+        screen.blit(sub, sub.get_rect(center=(w // 2, by + 86)))
         diff_label = getattr(eco, "difficulty_label", "Comfortable")
         hint = ui.fonts.render(
             "body_s", f"Won on {diff_label} difficulty — keep it up to "
-                      f"maintain your perfect record!", ui.c.TEXT_MUTED)
-        screen.blit(hint, hint.get_rect(center=(w // 2, by + 100)))
+                      f"maintain your perfect record!", c.TEXT_MUTED)
+        screen.blit(hint, hint.get_rect(center=(w // 2, by + 110)))
 
     def _draw_inspect_panel(self, screen, w, h):
         if not self.game.selected_tile:
@@ -2365,8 +2497,8 @@ class UIManager:
         pw, ph = 280, 260
         px = w - pw - 20
         py = h - ph - 20 - self._bottom_reserved()
-        pygame.draw.rect(screen, (0, 0, 0, 60), pygame.Rect(px + 3, py + 3, pw, ph), border_radius=8)
-        ui.card(px, py, pw, ph)
+        pygame.draw.rect(screen, c.SHADOW, pygame.Rect(px + 3, py + 3, pw, ph))
+        ui.panel(px, py, pw, ph)
         tile = self.game.selected_tile["tile"]
         tx, ty = self.game.selected_tile["x"], self.game.selected_tile["y"]
         rx = px + 16
@@ -2488,9 +2620,8 @@ class UIManager:
         bh = 46
         bx = w - total_w - 20
         by = h - bh - 20 - self._bottom_reserved()
-        pygame.draw.rect(screen, (0, 0, 0, 70), pygame.Rect(bx + 2, by + 2, total_w, bh), border_radius=8)
-        pygame.draw.rect(screen, c.BG_CARD, pygame.Rect(bx, by, total_w, bh), border_radius=8)
-        pygame.draw.rect(screen, c.BORDER, pygame.Rect(bx, by, total_w, bh), 1, border_radius=8)
+        pygame.draw.rect(screen, c.SHADOW, pygame.Rect(bx + 2, by + 2, total_w, bh))
+        ui.bevel(pygame.Rect(bx, by, total_w, bh), raised=True, depth=2, fill=c.BG_PANEL)
 
         cxp = bx + pad
         for i, (lsurf, vsurf, sw) in enumerate(seg_surfs):
@@ -2499,8 +2630,8 @@ class UIManager:
             cxp += sw + gap
             if i < len(seg_surfs) - 1:
                 dxp = cxp - gap // 2
-                pygame.draw.line(screen, c.BORDER_SUBTLE,
-                                 (dxp, by + 8), (dxp, by + bh - 8), 1)
+                pygame.draw.line(screen, c.SHADOW, (dxp, by + 9), (dxp, by + bh - 9), 1)
+                pygame.draw.line(screen, c.LIGHT, (dxp + 1, by + 9), (dxp + 1, by + bh - 9), 1)
 
     def _pbtn(self, screen, rect, label, fn, enabled=True, fkey="body_b", fill=None, accent=False):
         ui = self.ui
@@ -2546,8 +2677,8 @@ class UIManager:
         for i, d in enumerate(DAY_NAMES):
             cell = pygame.Rect(cxp + i * day_w, ty - 2, day_w, 18)
             if i == today:
-                pygame.draw.rect(screen, c.BG_ACTIVE, cell, border_radius=3)
-            ui.text("caption", d, c.ACCENT_AMBER if i == today else c.TEXT_DIM, cell.centerx, ty, align="center")
+                pygame.draw.rect(screen, c.BG_ACTIVE, cell)
+            ui.text("caption", d, c.LIGHT if i == today else c.TEXT_DIM, cell.centerx, ty, align="center")
         fx = cxp + 7 * day_w
         ui.text("caption", "FREQ", c.TEXT_DIM, fx + freq_w // 2, ty, align="center")
         tx = fx + freq_w
@@ -2567,18 +2698,21 @@ class UIManager:
             per_day_rounds[area.collection_day] += 1
             rowrect = pygame.Rect(x, ty - 2, left_cols + sum(rest.values()), 26)
             if st["is_today"]:
-                pygame.draw.rect(screen, (40, 50, 65), rowrect, border_radius=3)
+                # A pale "attention" tint keeps the dark row text legible while
+                # flagging today's collections (a navy selection bar would bury
+                # the multi-coloured status columns).
+                pygame.draw.rect(screen, (250, 242, 200), rowrect)
             ui.text("body_s",
                     self._ellipsize(area.name, ui.fonts.get("body_s"), name_w - 8),
                     c.TEXT_PRIMARY, x, ty + 2)
             for i in range(7):
                 cell = pygame.Rect(cxp + i * day_w + 3, ty, day_w - 6, 20)
                 if i == area.collection_day:
-                    pygame.draw.rect(screen, c.ACCENT_AMBER, cell, border_radius=4)
-                    ui.text("body_b", "o", c.BG_DEEP, cell.centerx, ty + 2, align="center")
+                    # Chosen collection day: pressed-in amber cell with a dot.
+                    ui.bevel(cell, raised=False, depth=2, fill=c.ACCENT_AMBER)
+                    pygame.draw.circle(screen, c.LIGHT, cell.center, 3)
                 else:
-                    pygame.draw.rect(screen, c.BG_CARD, cell, border_radius=4)
-                    pygame.draw.rect(screen, c.BORDER_SUBTLE, cell, 1, border_radius=4)
+                    ui.bevel(cell, raised=True, depth=1, fill=c.FACE)
                 self.planner_cells.append((cell, area.id, i))
             frect = pygame.Rect(fx + 6, ty + 1, freq_w - 12, 20)
             self._pbtn(screen, frect, st["freq_label"], (lambda a=area.id: self._cycle_round_freq(a)), fkey="caption")
@@ -3239,35 +3373,42 @@ class UIManager:
         gx = x + 360
         gw = w - 360
         ui.text("h3", "Net trend (14 days)", c.TEXT_PRIMARY, gx, y + 26)
+        # Compact +/- bar chart sitting in its own fixed band. Bars grow up
+        # (green) or down (red) from a centred zero line, so a negative trend
+        # can never spill over the readouts beneath it.
+        chart_top = y + 48
+        chart_h   = 54
+        base_y    = chart_top + chart_h // 2
+        half      = chart_h // 2 - 2
         hist = eco.history[-14:]
         if hist:
             nets = [eco._ledger_net(d) for d in hist]
             peak = max(1.0, max(abs(n) for n in nets))
-            base_y = y + 160
-            bw = max(8, (gw - (len(nets) - 1) * 4) // max(1, len(nets)))
+            n_bars = len(nets)
+            bw = max(4, (gw - 20 - (n_bars - 1) * 3) // max(1, n_bars))
             bxx = gx
             for n in nets:
-                bh_px = int((abs(n) / peak) * 60)
+                bh_px = max(1, int((abs(n) / peak) * half))
                 if n >= 0:
-                    rect = pygame.Rect(bxx, base_y - bh_px, bw, bh_px)
-                    pygame.draw.rect(screen, c.STATUS_GOOD, rect, border_radius=3)
-                    shine = pygame.Rect(bxx, base_y - bh_px, bw, bh_px // 2)
-                    s_surf = pygame.Surface((shine.w, shine.h), pygame.SRCALPHA)
-                    s_surf.fill((255, 255, 255, 30))
-                    screen.blit(s_surf, shine)
+                    pygame.draw.rect(screen, c.STATUS_GOOD,
+                                     pygame.Rect(bxx, base_y - bh_px, bw, bh_px))
                 else:
-                    rect = pygame.Rect(bxx, base_y, bw, bh_px)
-                    pygame.draw.rect(screen, c.STATUS_BAD, rect, border_radius=3)
-                bxx += bw + 4
-            ui.h_line(gx, base_y, gw - 20)
-            ui.text("caption", "zero", c.TEXT_DIM, gx, base_y + 4)
+                    pygame.draw.rect(screen, c.STATUS_BAD,
+                                     pygame.Rect(bxx, base_y, bw, bh_px))
+                bxx += bw + 3
+            pygame.draw.line(screen, c.SHADOW, (gx, base_y),
+                             (gx + gw - 20, base_y), 1)
+            ui.text("caption", "£0", c.TEXT_DIM, gx + gw - 20, base_y - 6,
+                    align="right")
         else:
-            ui.text("body_s", "Trend builds after a few days.", c.TEXT_DIM, gx, y + 60)
-        ui.label("Budget", gx, y + 200)
-        ui.text("display", f"£{int(eco.budget):,}", c.TEXT_PRIMARY, gx, y + 218)
+            ui.text("body_s", "Trend builds after a few days.", c.TEXT_DIM,
+                    gx, base_y - 8)
+        budget_y = chart_top + chart_h + 8
+        ui.label("Budget", gx, budget_y)
+        ui.text("display", f"£{int(eco.budget):,}", c.TEXT_PRIMARY, gx, budget_y + 16)
 
         # (Developer options have moved to the Debug Tools window, Ctrl+Shift+D)
-        ry = y + 278 + 30
+        ry = budget_y + 56
 
         # ── Diesel market readout ────────────────────────────────────────────
         ry += 4
@@ -3680,22 +3821,25 @@ class UIManager:
         pw, ph = 620, 486
         px = (w - pw) // 2
         py = max(self.MENU_BAR_H + 12, (h - ph) // 2)
-        ui.panel(px, py, pw, ph, border=True)
-        pygame.draw.line(screen, c.ACCENT_AMBER, (px, py + 52), (px + pw, py + 52), 2)
+        ui.bevel(pygame.Rect(px, py, pw, ph), raised=True, depth=2, fill=c.BG_PANEL)
+        # Navy Win95 caption bar to match the game's floating windows.
+        tb = pygame.Rect(px + 4, py + 4, pw - 8, 28)
+        self._gradient_h(screen, tb, c.TITLE_A1, c.TITLE_A2)
+        ui.text("body_b", "City Editor", c.LIGHT, tb.x + 10,
+                tb.y + (tb.h - ui.fonts.get("body_b").get_height()) // 2)
 
-        ui.text("h1", "City Editor", c.ACCENT_AMBER, px + 24, py + 16)
-
-        # Close button (✕) top-right.
-        cb = pygame.Rect(px + pw - 40, py + 12, 28, 28)
+        # Close button (X) at the right of the caption bar.
+        cb = pygame.Rect(tb.right - 22, tb.y + 3, 18, tb.h - 6)
         hov = cb.collidepoint(mouse)
-        pygame.draw.rect(screen, (70, 40, 40) if hov else c.BG_PANEL, cb, border_radius=4)
-        pygame.draw.rect(screen, c.ACCENT_AMBER if hov else c.BORDER_SUBTLE, cb, 1, border_radius=4)
-        xs = ui.fonts.render("body_b", "✕", c.TEXT_PRIMARY)
-        screen.blit(xs, (cb.centerx - xs.get_width() // 2, cb.centery - xs.get_height() // 2))
+        ui.icon_button(cb, "", hovered=hov)
+        xr = cb.inflate(-cb.w // 2 + 4, -cb.h // 2 + 4)
+        for dx in (0, 1):
+            pygame.draw.line(screen, (0, 0, 0), (xr.left + dx, xr.top), (xr.right - 2 + dx, xr.bottom - 2), 1)
+            pygame.draw.line(screen, (0, 0, 0), (xr.right - 2 + dx, xr.top), (xr.left + dx, xr.bottom - 2), 1)
         self._editor_help_close_rect = cb
 
         x = px + 24
-        y = py + 66
+        y = py + 52
         for line in (
             "Drag on the map to paint. Pick a tool from the bottom bar, then hold the",
             "left mouse button and drag to lay it down. Place a Landfill site, then hit",
@@ -3731,16 +3875,15 @@ class UIManager:
             cx0 = x + col * col_w
             cy0 = y + row * row_h
             chip = pygame.Rect(cx0, cy0, key_w - 10, 20)
-            pygame.draw.rect(screen, (18, 20, 26), chip, border_radius=4)
-            pygame.draw.rect(screen, c.BORDER_SUBTLE, chip, 1, border_radius=4)
-            ks = ui.fonts.render("body_s", key, c.ACCENT_AMBER)
+            ui.bevel(chip, raised=True, depth=2, fill=c.FACE)
+            ks = ui.fonts.render("body_s", key, c.TEXT_PRIMARY)
             screen.blit(ks, (chip.centerx - ks.get_width() // 2,
                              chip.centery - ks.get_height() // 2))
             ui.text("body_s", desc, c.TEXT_PRIMARY, cx0 + key_w, cy0 + 2)
 
         yb = y + ((len(shortcuts) + 1) // 2) * row_h + 12
-        pygame.draw.rect(screen, (220, 50, 45), pygame.Rect(x, yb + 2, 14, 14), border_radius=3)
-        pygame.draw.rect(screen, (240, 70, 60), pygame.Rect(x, yb + 2, 14, 14), 1, border_radius=3)
+        pygame.draw.rect(screen, (220, 50, 45), pygame.Rect(x, yb + 2, 14, 14))
+        pygame.draw.rect(screen, (0, 0, 0), pygame.Rect(x, yb + 2, 14, 14), 1)
         ui.text("body_s",
                 "Red squares: buildings no lorry can reach (too far from a connected road).",
                 c.TEXT_PRIMARY, x + 22, yb)
@@ -3753,10 +3896,9 @@ class UIManager:
         c = ui.c
         mouse = pygame.mouse.get_pos()
         bar_h = self.MENU_BAR_H
-        bar = pygame.Surface((w, bar_h), pygame.SRCALPHA)
-        bar.fill((14, 16, 22, 236))
-        screen.blit(bar, (0, 0))
-        pygame.draw.line(screen, c.ACCENT_AMBER, (0, bar_h), (w, bar_h), 2)
+        pygame.draw.rect(screen, c.BG_PANEL, pygame.Rect(0, 0, w, bar_h))
+        pygame.draw.line(screen, c.SHADOW, (0, bar_h - 1), (w, bar_h - 1), 1)
+        pygame.draw.line(screen, c.LIGHT, (0, bar_h), (w, bar_h), 1)
 
         label = f"CITY EDITOR  ·  {self._editor_source_label()}"
         lsurf = ui.fonts.render("body_b", label, c.ACCENT_AMBER)
@@ -3783,8 +3925,8 @@ class UIManager:
         pill = pygame.Rect(24 + lsurf.get_width(), (bar_h - 24) // 2,
                            psz[0] + 22, 24)
         hovp = pill.collidepoint(mouse)
-        pygame.draw.rect(screen, pill_bg, pill, border_radius=12)
-        pygame.draw.rect(screen, pill_fg if hovp else pill_bg, pill, 1, border_radius=12)
+        pygame.draw.rect(screen, pill_bg, pill)
+        pygame.draw.rect(screen, (0, 0, 0), pill, 1)
         ps = ui.fonts.render("body_s", pill_txt, pill_fg)
         screen.blit(ps, (pill.centerx - ps.get_width() // 2,
                          pill.centery - ps.get_height() // 2))
@@ -4703,7 +4845,7 @@ class UIManager:
             lines = lines[:max_lines]
             lines[-1] = self._ellipsize(lines[-1] + "…", font, max_width)
         for line in lines:
-            surf = font.render(line, True, colour)
+            surf = font.render(line, FontSystem.ANTIALIAS, colour)
             screen.blit(surf, (x, y))
             y += font.get_height() + 2
         return y
