@@ -8,6 +8,8 @@ from ui import UIManager
 from fleet import FleetManager
 from waste import WastePolicy
 from ambient import AmbientState
+import wastestreams
+import boroughsim
 from assets import asset_path
 import savegame
 import citystore
@@ -142,6 +144,10 @@ class WasteCityGame:
             self.city = CityGenerator(CITY_W, CITY_H)
             self.city.generate()
         self.fleet.setup_initial_fleet()
+        # Seed the per-round social model (cohorts, satisfaction, contamination).
+        boroughsim.init_borough(self.city, self.economy.satisfaction)
+        # Size the finite landfill / disposal network to the borough.
+        self.economy.init_facilities(self.city)
         self.ambient = AmbientState()
         # Reset any open floating windows for a clean fresh term.
         self.ui.windows.clear()
@@ -303,6 +309,8 @@ class WasteCityGame:
         self.waste = WastePolicy()
         self.fleet = FleetManager(self)
         self.fleet.setup_initial_fleet()
+        boroughsim.init_borough(self.city, self.economy.satisfaction)
+        self.economy.init_facilities(self.city)
         self.ambient = AmbientState()
         self._apply_settings()
         self.ui.exit_editor_state()
@@ -489,7 +497,7 @@ class WasteCityGame:
         cy = self.city.height * 0.5 + math.cos(self._menu_cam_t * 0.07) * self.city.height * 0.22
         self.center_camera_on(cx, cy)
 
-        self.city.update(dt, self.waste.fill_multiplier())
+        self._generate_waste(dt)
         self.fleet.update(dt)
         self.ambient.update(dt, self.city, self.fleet, self.economy)
 
@@ -628,14 +636,31 @@ class WasteCityGame:
         self.ui.update(dt)
         self._clamp_camera()
 
+    # Sim-seconds of waste generation batched into one accumulate() call. Waste
+    # accumulation is a slow process, so updating the bins a few times a second
+    # (rather than every 60 Hz tick) is visually identical and much cheaper — the
+    # per-tile inner loop is the game's biggest simulation cost on a full map.
+    GEN_INTERVAL = 0.2
+
+    def _generate_waste(self, dt):
+        self._gen_accum = getattr(self, "_gen_accum", 0.0) + dt
+        if self._gen_accum < self.GEN_INTERVAL:
+            return
+        step = self._gen_accum
+        self._gen_accum = 0.0
+        ctx = wastestreams.GenContext(
+            self.waste, self.economy.season_name(), self.economy.weather,
+            event_mult=self.economy.get_event_bin_multiplier())
+        wastestreams.accumulate(self.city, step, ctx, self.economy.day_duration)
+
     def _step_sim(self, sim_dt):
         """One fixed-size simulation tick. The game loop calls this N times per
         frame at Nx speed, so the sim is deterministic and independent of frame
         rate; only this pass advances game time."""
-        bin_mult = (self.economy.get_bin_rate_multiplier()
-                    * self.waste.fill_multiplier()
-                    * self.economy.seasonal_fill_mult())
-        self.city.update(sim_dt, bin_mult)
+        # Per-stream waste generation (residual/recycling/food/garden accumulate
+        # independently). Batched to a coarse cadence for efficiency — see
+        # _generate_waste.
+        self._generate_waste(sim_dt)
         self.fleet.update(sim_dt)
         new_day = self.economy.update(sim_dt, self.city, self.fleet, self.waste)
 
@@ -661,7 +686,13 @@ class WasteCityGame:
                 self.ui.show_event(ev)
             # Once-per-day service-quality snapshot (one scan, not per frame).
             self.economy.register_day_quality(
-            self.city, self.waste.satisfaction_ceiling())
+                self.city, self.waste, self.waste.satisfaction_ceiling())
+            # Emergent-crisis assessment: narrate situations that have arisen
+            # from the simulation itself (autumn surge, fleet stretched, landfill
+            # crunch...). Runs after the day's quality snapshot so it reads fresh
+            # satisfaction/complaint state.
+            for ev in self.economy.crisis_monitor.assess(self):
+                self.ui.show_event(ev)
 
         if self.economy.pending_event:
             self.ui.show_event(self.economy.pending_event)

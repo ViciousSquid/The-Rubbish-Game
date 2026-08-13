@@ -167,6 +167,67 @@ def _backfill(data):
     Runs for every load regardless of version -- cheap and defensive."""
     fleet = data.get("fleet")
     _ensure(fleet, "_dist_fields", dict)
+    # Per-stream waste model (added after the single-bin era).
+    _ensure(fleet, "_pending_streams", lambda: [0.0, 0.0, 0.0, 0.0])
+    _ensure(fleet, "_pending_reject", float)
+    _ensure(fleet, "_due_cache", dict)
+    if fleet is not None and getattr(fleet, "traffic", None) is None:
+        import congestion
+        fleet.traffic = congestion.TrafficField()
+    for t in (getattr(fleet, "trucks", None) or []):
+        if "load_streams" not in t:
+            t["load_streams"] = [0.0, 0.0, 0.0, 0.0]
+        if "load_reject" not in t:
+            t["load_reject"] = 0.0
+        # Usage-based wear + crew fatigue/experience fields (Phase 3).
+        for k, dv in (("mileage", 0.0), ("op_hours", 0.0), ("load_cycles", 0),
+                      ("overload", 0), ("maint_deferred", 0),
+                      ("crew_experience", 0.55), ("fatigue", 0.0),
+                      ("work_today", 0.0), ("battery", 1.0)):
+            t.setdefault(k, dv)
+
+    eco = data.get("economy")
+    _ensure(eco, "_event_bin_mult", lambda: 1)
+    # Spatial social model (Phase 2). Area social fields are migrated lazily by
+    # boroughsim.ensure_area on the first day; just seed the borough caches.
+    _ensure(eco, "borough_contamination", lambda: 0.06)
+    _ensure(eco, "worst_area", lambda: None)
+    _ensure(eco, "_residual_day_accum", float)
+    _ensure(eco, "residual_per_day_est", float)
+    # Politics / endogenous economy (Phase 4).
+    _ensure(eco, "reputation", lambda: 60.0)
+    _ensure(eco, "administration", lambda: "balanced")
+    _ensure(eco, "term_number", lambda: 0)
+    _ensure(eco, "business_relief", float)
+    _ensure(eco, "procurement_market", lambda: "normal")
+    _ensure(eco, "_market_timer", lambda: 25)
+    if eco is not None and getattr(eco, "crisis_monitor", None) is None:
+        import crises
+        eco.crisis_monitor = crises.CrisisMonitor()
+    if eco is not None:
+        _ensure(eco, "grant_mult_base", lambda: 1.0)
+        _ensure(eco, "diversion_target_base",
+                lambda: getattr(eco, "diversion_target", 0.50))
+        _ensure(eco, "win_sat_floor_base",
+                lambda: getattr(eco, "win_sat_floor", 75.0))
+    # Disposal-facility network (Phase 2): size it to the loaded borough.
+    city = data.get("city")
+    if eco is not None and getattr(eco, "facilities", None) is None:
+        import facilities as _fac
+        eco.facilities = _fac.FacilityNetwork(getattr(city, "property_count", 1500))
+
+    # Migrate every building tile to the per-stream model, seeding each stream
+    # from the old aggregate bin_fill so the borough carries its state forward.
+    city = data.get("city")
+    if city is not None:
+        import wastestreams
+        for area in getattr(city, "areas", []):
+            for (x, y) in getattr(area, "building_tiles", []):
+                try:
+                    tile = city.tiles[y][x]
+                except (IndexError, AttributeError):
+                    continue
+                wastestreams.ensure_streams(tile)
 
 
 def _migrate(data):

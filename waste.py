@@ -202,6 +202,69 @@ class WastePolicy:
                 recycle += units * s.credit
         return gate, recycle, garden
 
+    def disposal_economics_streams(self, masses, landfill_tax_mult=1.0,
+                                   reject_mass=None):
+        """Stream-accurate disposal ledger.
+
+        ``masses`` is ``[residual, recycling, food, garden]`` disposal mass as
+        actually collected (see wastestreams). This replaces the old approach of
+        re-splitting a mixed volume by policy share — the composition now comes
+        from what the trucks really lifted, so a food-heavy round costs
+        differently from a garden-heavy one.
+
+        ``reject_mass`` is recycling mass already flagged contaminated at
+        collection (rejected at the MRF, landfilled at the residual gate fee,
+        earns no credit, counts against diversion). If None it's derived from
+        the borough contamination rate.
+
+        Returns ``(gate_fees, recycling_credit, garden_charges, residual_units,
+        diverted_units)`` — the first three GBP, the last two disposal units for
+        the statutory diversion review. gate_fees is a cost; the credits are
+        income."""
+        res_m = masses[0] if len(masses) > 0 else 0.0
+        rec_m = masses[1] if len(masses) > 1 else 0.0
+        food_m = masses[2] if len(masses) > 2 else 0.0
+        gar_m = masses[3] if len(masses) > 3 else 0.0
+
+        residual_stream = self.get("residual")
+        residual_gate = (residual_stream.gate_fee * landfill_tax_mult
+                         if residual_stream else 0.0)
+
+        gate = recycle = garden = 0.0
+        residual_units = diverted_units = 0.0
+
+        # Residual → landfill/EfW, dominated by landfill tax.
+        gate += res_m * residual_gate
+        residual_units += res_m
+
+        # Recycling, less the contaminated fraction rejected at the MRF.
+        if rec_m > 0:
+            s = self.get("recycling")
+            if reject_mass is None:
+                reject_mass = rec_m * self.contamination_rate()
+            rej = max(0.0, min(rec_m, reject_mass))
+            clean = rec_m - rej
+            gate += clean * (s.gate_fee if s else 0.0) + rej * residual_gate
+            recycle += clean * (s.credit if s else 0.0)
+            residual_units += rej
+            diverted_units += clean
+
+        # Food caddy → anaerobic digestion.
+        if food_m > 0:
+            s = self.get("food")
+            gate += food_m * (s.gate_fee if s else 0.0)
+            recycle += food_m * (s.credit if s else 0.0)
+            diverted_units += food_m
+
+        # Garden → composting (chargeable subscription income).
+        if gar_m > 0:
+            s = self.get("garden")
+            gate += gar_m * (s.gate_fee if s else 0.0)
+            garden += gar_m * (s.credit if s else 0.0)
+            diverted_units += gar_m
+
+        return gate, recycle, garden, residual_units, diverted_units
+
     def diversion_split(self, volume):
         """Apportion `volume` into (residual_units, diverted_units), where
         diverted = recycling + food + garden. Drives the statutory recycling

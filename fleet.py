@@ -2,6 +2,8 @@ import math
 import random
 from collections import deque
 
+import wastestreams
+import congestion
 from procurement import get_vehicle, Order, get_tier
 
 # --- Tuning -----------------------------------------------------------------
@@ -19,10 +21,34 @@ BREAKDOWN_QUAD       = 0.0035    # added per year^2 of age
 BREAKDOWN_CAP        = 0.060     # hard ceiling on daily breakdown chance
 REPAIR_DAYS_MIN      = 2
 REPAIR_DAYS_MAX      = 5
+# --- Usage-based wear weights (Phase 3) -------------------------------------
+# Combine the running usage totals into one "load" figure. NORMAL_USAGE_PER_YEAR
+# is what that figure reaches per council year for a typical, well-utilised
+# lorry, so usage_factor() sits near 1.0 for normal use and the classic
+# age-based breakdown balance is preserved; harder use pushes it up.
+USAGE_MILEAGE_W  = 1.0 / 1000.0   # per tile driven
+USAGE_HOURS_W    = 1.0 / 200.0    # per second in service
+USAGE_CYCLE_W    = 2.0            # per tip / compaction cycle
+USAGE_OVERLOAD_W = 6.0            # per overload event (extra stress)
+NORMAL_USAGE_PER_YEAR = 220.0    # measured normal annual usage load (see tests)
 TRUCK_SPEED = 11.0               # tiles / second (base, scaled by crew + model)
 WORKER_SPEED = 9.0               # tiles / second (loaders, cosmetic)
 PER_BIN_TIME = 0.10              # seconds per bin within a wave of loaders
 STOP_BASE_TIME = 0.05            # fixed overhead per kerbside stop
+LOAD_TIME_PER_FILL = 0.00045     # extra service seconds per fill-% presented
+# Disposal (tip) service time: weigh-in, queue, tipping, manoeuvre out. A dwell
+# timer at the facility so disposal trips cost real time in route planning.
+TIP_BASE_TIME = 0.55             # fixed weigh-in / manoeuvre dwell (seconds)
+TIP_TIME_PER_LOAD = 0.00004      # extra tip seconds per unit of load volume
+# --- Electric RCV battery / range (Phase 4) ---------------------------------
+# An eRCV runs a normal day on one charge and tops up overnight at the depot,
+# but a long/heavy round drains it and forces a mid-shift charge — lost
+# collection time is the price of the cheap running cost. Cold weather cuts
+# range. Diesel lorries ignore all of this.
+EV_DRAIN_PER_TILE = 1.0 / 300.0  # battery fraction drained per tile driven
+EV_COLD_DRAIN_MULT = 1.5         # winter/snow drains the pack faster
+EV_LOW_BATTERY = 0.12            # below this, divert to the depot to charge
+EV_CHARGE_TIME = 6.0             # seconds dwell to recharge at the depot
 TRUCK_CAPACITY = 18000           # default load before a trip to tip (fill units)
 MAX_CREW = 4                     # absolute loader cap per RCV body
 PER_LORRY_DAILY = 300            # rough bins one RCV clears per day (planner est.)
@@ -54,12 +80,22 @@ class FleetManager:
         self.service_threshold = SERVICE_FILL_THRESHOLD  # editable routing lever
         self.orders = []             # vehicles on order awaiting delivery
         self._pending_volume = 0.0   # fill units tipped since economy last read
+        # Per-stream disposal mass tipped since the economy last read it
+        # (residual, recycling, food, garden) plus the recycling mass rejected
+        # as contaminated. Drives stream-accurate gate fees / diversion.
+        self._pending_streams = [0.0, 0.0, 0.0, 0.0]
+        self._pending_reject = 0.0
+        # Per-area due-stream mask cache, rebuilt each update tick.
+        self._due_cache = {}
 
         # Rental tracking for budget impact
         self.rental_daily_cost = 0.0  # accumulated rental costs per day
 
         # Event state
         self.on_strike = False       # True while a crew strike event is active
+
+        # Ambient road congestion (slows lorries in busy areas / near road works).
+        self.traffic = congestion.TrafficField()
 
     # ------------------------------------------------------------ initial fleet
     def setup_initial_fleet(self, lorries=None, crew=None):
@@ -138,7 +174,9 @@ class FleetManager:
             "lease_weekly": model.lease_weekly,
             "leased": leased,
             "tier_id": tier_id,
-            "load": 0.0,
+            "load": 0.0,                # truck body volume in use (vs capacity)
+            "load_streams": [0.0, 0.0, 0.0, 0.0],  # mass onboard per stream
+            "load_reject": 0.0,         # recycling mass flagged contaminated
             "crew": 0,
             "state": "depot",          # depot | to_stop | servicing | to_depot
             "area_id": -1,             # round this lorry is currently working
@@ -155,6 +193,20 @@ class FleetManager:
             "age_days": 0,            # in-service age, ticked once per day
             "broken": False,          # out of action awaiting repair
             "repair_days": 0,         # days left in the repair bay
+            # --- usage-based wear (Phase 3): a hard-worked young lorry can be
+            # less reliable than an old lightly-used one. Compact running totals,
+            # not history. ---
+            "mileage": 0.0,           # tiles driven in service
+            "op_hours": 0.0,          # seconds spent in active (non-depot) states
+            "load_cycles": 0,         # number of tips (compactor/hydraulic cycles)
+            "overload": 0,            # times tipped while near/over capacity
+            "maint_deferred": 0,      # days maintenance has been skipped (unused hook)
+            # --- crew productivity & fatigue (Phase 3) ---
+            "crew_experience": 0.45,  # 0..1, grows with days worked
+            "fatigue": 0.0,           # 0..1, rises on heavy/overtime days
+            "work_today": 0.0,        # fraction of today spent working
+            # --- electric range (only meaningful for the eRCV) ---
+            "battery": 1.0,           # 0..1 state of charge
         }
         self.trucks.append(truck)
         return truck
@@ -181,18 +233,33 @@ class FleetManager:
         if not tier:
             return False, 0, "Unknown procurement tier"
 
-        # Calculate cost based on tier
+        # Current procurement-market conditions (shortage/glut/battery) modify
+        # both price and lead time; rentals are spot-hire and shrug it off.
+        price_mult, lead_mult = self.game.economy.procurement_mods(model_id)
+
+        # Calculate cost based on tier, then the market.
         if leased:
             cost = model.deposit()
         else:
             cost = model.get_price_for_tier(tier_id)
+        if tier_id != "rental":
+            cost = int(cost * price_mult)
 
         order = Order(model, self.game.economy.day, tier_id, leased=leased)
+        # Stretch (or shorten) the quoted delivery by the market lead multiplier.
+        if tier_id != "rental" and abs(lead_mult - 1.0) > 1e-6:
+            base_days = order.arrival_day - order.order_day
+            new_days = max(1, int(round(base_days * lead_mult)))
+            order.arrival_day = order.order_day + new_days
+            order.quoted_arrival = order.arrival_day
         self.orders.append(order)
 
         tier_name = tier.display_name
         arrival = order.arrival_day
         msg = f"{model.name} ordered via {tier_name}, arriving day {arrival}"
+        mkt = self.game.economy.procurement_market_info()
+        if self.game.economy.procurement_market != "normal" and tier_id != "rental":
+            msg += f" [{mkt['label']}]"
 
         if order.event_name:
             msg += f" (\u26a0 {order.event_name}: +{order.event_delay_days} days)"
@@ -266,6 +333,18 @@ class FleetManager:
         v = self._pending_volume
         self._pending_volume = 0.0
         return v
+
+    def take_pending_streams(self):
+        """Return and clear the per-stream disposal mass tipped since the last
+        read: ``(masses[4], reject_mass, total_mass)``. ``masses`` is the mass
+        of each stream sent for disposal; ``reject_mass`` is the recycling mass
+        already flagged contaminated at collection (rejected at the MRF)."""
+        masses = self._pending_streams
+        reject = self._pending_reject
+        self._pending_streams = [0.0, 0.0, 0.0, 0.0]
+        self._pending_reject = 0.0
+        total = masses[0] + masses[1] + masses[2] + masses[3]
+        return masses, reject, total
 
     def hire_worker(self):
         self.workers += 1
@@ -343,16 +422,26 @@ class FleetManager:
 
     def _bin_serviceable(self, x, y, today, area_id=None):
         tile = self.game.city.get_tile(x, y)
-        if tile is None or tile.type in ("road", "green"):
-            return False
-        if tile.bin_fill <= self.service_threshold:
+        if tile is None or tile.type in ("road", "green", "landfill"):
             return False
         area = self.game.city.get_area(tile.area_id)
         if area is None or not area.due_today(today, self._week_index()):
             return False
         if area_id is not None and tile.area_id != area_id:
             return False
-        return True
+        # Serviceable only if a stream that is actually LIFTED this visit is over
+        # threshold. A property whose only full bin is a fortnightly stream not
+        # due this week is left alone (its bin_fill stays high, so it can still
+        # overflow and complain — that's the missed-collection consequence).
+        s = getattr(tile, "streams", None)
+        if s is None:
+            return tile.bin_fill > self.service_threshold
+        due = self._due_mask(area)
+        thr = self.service_threshold
+        for i in range(wastestreams.STREAM_COUNT):
+            if due[i] and s[i] > thr:
+                return True
+        return False
 
     def _adjacent_serviceable_bins(self, rx, ry, today, area_id, skip_claimed=True):
         out = []
@@ -495,7 +584,34 @@ class FleetManager:
     def _truck_speed(self, truck):
         cap = max(1, truck.get("crew_cap", MAX_CREW))
         crew_factor = 0.7 + 0.3 * (truck["crew"] / float(cap))
-        return TRUCK_SPEED * truck.get("speed_factor", 1.0) * crew_factor
+        speed = TRUCK_SPEED * truck.get("speed_factor", 1.0) * crew_factor
+        # Ambient congestion at the truck's current tile slows driving.
+        tx, ty = self._truck_tile(truck)
+        speed *= self.traffic.speed_factor(tx, ty)
+        return speed
+
+    def crew_productivity(self, truck):
+        """0-ish..~1.25 multiplier on how quickly a crew works a stop, from
+        experience, borough morale, fatigue, vehicle condition and weather.
+        Experienced, rested crews on a sound lorry in fair weather are faster and
+        more reliable; a fatigued crew on a clapped-out lorry in the rain crawls.
+        Returns a *productivity* (higher = faster); callers invert it for time."""
+        exp = truck.get("crew_experience", 0.45)      # 0..1
+        fatigue = truck.get("fatigue", 0.0)           # 0..1
+        eco = getattr(self.game, "economy", None)
+        morale = (getattr(eco, "worker_morale", 70.0) / 100.0) if eco else 0.7
+        cond = self.condition_pct(truck) / 100.0      # 0..1
+        prod = 0.72 + 0.40 * exp                       # inexperienced ~0.72, veteran ~1.12
+        prod *= 0.85 + 0.25 * morale                   # low morale drags
+        prod *= 1.0 - 0.22 * fatigue                   # tired crews slow
+        prod *= 0.9 + 0.15 * cond                      # a rattly lorry hampers loading
+        if eco is not None:
+            w = getattr(eco, "weather", "dry")
+            if w == "rain":
+                prod *= 0.90
+            elif w == "snow":
+                prod *= 0.82
+        return max(0.35, prod)
 
     def _follow_path(self, truck, dt):
         # Spend the whole tick's movement budget, crossing as many path nodes as
@@ -506,6 +622,7 @@ class FleetManager:
         if not truck["path"]:
             return True
         budget = self._truck_speed(truck) * dt
+        moved = 0.0
         while truck["path"] and budget > 1e-9:
             tx, ty = truck["path"][0]
             if abs(tx - truck["x"]) > 1e-3:
@@ -516,10 +633,23 @@ class FleetManager:
                 truck["x"], truck["y"] = tx, ty
                 truck["path"].pop(0)
                 budget -= dist
+                moved += dist
             else:
                 truck["x"] += dx / dist * budget
                 truck["y"] += dy / dist * budget
+                moved += budget
                 budget = 0.0
+        # Accumulate mileage for usage-based wear.
+        truck["mileage"] = truck.get("mileage", 0.0) + moved
+        # Electric lorries drain their battery as they drive (faster in the cold).
+        if moved and truck.get("model_id") == "electric":
+            eco = getattr(self.game, "economy", None)
+            cold = EV_COLD_DRAIN_MULT if (eco and getattr(eco, "weather", "dry")
+                                          in ("snow",)) else 1.0
+            if eco and eco.season_name() == "Winter":
+                cold = max(cold, 1.3)
+            truck["battery"] = max(0.0, truck.get("battery", 1.0)
+                                   - moved * EV_DRAIN_PER_TILE * cold)
         return len(truck["path"]) == 0
 
     # ----------------------------------------------------------------- claims
@@ -538,18 +668,44 @@ class FleetManager:
         years = truck.get("age_days", 0) / DAYS_PER_YEAR
         return 1.0 + min(WEAR_COST_CAP, years * WEAR_COST_PER_YEAR)
 
+    def usage_metric(self, truck):
+        """Raw combined usage load: mileage + operating hours + compaction cycles
+        + overloads. Tracked as running totals (not history), so it's cheap."""
+        return (truck.get("mileage", 0.0) * USAGE_MILEAGE_W
+                + truck.get("op_hours", 0.0) * USAGE_HOURS_W
+                + truck.get("load_cycles", 0) * USAGE_CYCLE_W
+                + truck.get("overload", 0) * USAGE_OVERLOAD_W)
+
+    def usage_factor(self, truck):
+        """How hard a lorry has been worked *relative to its age*. ~1.0 for a
+        normally-used vehicle (so the classic age balance is preserved), above
+        1.0 for one run into the ground, below for one that's barely turned a
+        wheel. This is what lets an old, lightly-used lorry outlast a young,
+        hard-driven one."""
+        age = max(0.12, truck.get("age_days", 0) / DAYS_PER_YEAR)
+        expected = age * NORMAL_USAGE_PER_YEAR
+        if expected <= 0:
+            return 1.0
+        return max(0.55, min(1.8, self.usage_metric(truck) / expected))
+
     def breakdown_chance(self, truck):
-        """Daily probability this lorry suffers an age-related breakdown."""
+        """Daily probability this lorry breaks down. Driven by age *and* how hard
+        it's been worked (mileage/hours/load-cycles/overloads), plus a small
+        fatigue contribution (tired crews cause incidents)."""
         years = truck.get("age_days", 0) / DAYS_PER_YEAR
         chance = BREAKDOWN_BASE + BREAKDOWN_LINEAR * years + BREAKDOWN_QUAD * years * years
+        chance *= self.usage_factor(truck)
+        chance += 0.004 * truck.get("fatigue", 0.0)   # fatigue-driven incidents
         if truck.get("model_id") == "electric":
             chance *= 0.70            # fewer moving parts, gentler wear
         return min(BREAKDOWN_CAP, chance)
 
     def condition_pct(self, truck):
-        """Headline 0-100 'condition' for the UI. New ~100, falls with age."""
+        """Headline 0-100 'condition' for the UI. New ~100, falls with age and,
+        more so, with heavy use."""
         years = truck.get("age_days", 0) / DAYS_PER_YEAR
-        return max(8.0, 100.0 - years * 14.0)
+        uf = self.usage_factor(truck)
+        return max(8.0, 100.0 - years * 12.0 * (0.6 + 0.55 * uf))
 
     def condition_label(self, truck):
         c = self.condition_pct(truck)
@@ -584,6 +740,31 @@ class FleetManager:
         for t in self.trucks:
             t["age_days"] = t.get("age_days", 0) + 1
 
+            # --- Crew fatigue & experience (Phase 3) --------------------------
+            # A heavy/overtime day (worked most of the shift) builds fatigue; a
+            # light day lets the crew recover. Overtime buys throughput today at
+            # the cost of a slower, less reliable crew tomorrow. Experience
+            # accrues slowly with days actually worked.
+            work = t.get("work_today", 0.0)
+            fatigue = t.get("fatigue", 0.0)
+            # Only a genuinely long shift (past a normal day) builds fatigue; a
+            # fleet with enough capacity finishes early and the crew recovers, so
+            # fatigue signals an over-stretched operation.
+            if work > 0.82:
+                fatigue += min(0.28, (work - 0.82) * 0.8)
+            else:
+                fatigue -= 0.22
+            t["fatigue"] = max(0.0, min(1.0, fatigue))
+            if work > 0.08 and t.get("crew", 0) >= 1:
+                t["crew_experience"] = min(
+                    1.0, t.get("crew_experience", 0.45) + 0.02)
+            t["work_today"] = 0.0
+
+            # eRCVs charge overnight at the depot, so most days start full; only
+            # a lorry stranded mid-round (rare) misses the top-up.
+            if t.get("model_id") == "electric" and t.get("state") == "depot":
+                t["battery"] = 1.0
+
             # Vehicles in the repair bay count down to roadworthy again. Only
             # age-related breakdowns carry a repair_days countdown; event-driven
             # breakdowns (repair_days == 0) are recovered by the event system,
@@ -613,11 +794,14 @@ class FleetManager:
                 if eco is not None:
                     eco.budget -= bill
                     eco.ledger["repairs"] = eco.ledger.get("repairs", 0.0) + bill
+                cause = ("hard use" if self.usage_factor(t) > 1.2
+                         else "age" if t.get("age_days", 0) > DAYS_PER_YEAR * 2
+                         else "wear")
                 notices.append({
                     "name": "Vehicle Breakdown",
                     "desc": f"{t.get('nickname', 'L' + str(t['id']))} "
-                            f"({t.get('model_name', 'RCV')}) has broken down with "
-                            f"age-related wear -- out for {dur} day"
+                            f"({t.get('model_name', 'RCV')}) has broken down "
+                            f"({cause}) -- out for {dur} day"
                             f"{'s' if dur != 1 else ''}. Repair bill £{bill:,}.",
                     "effect": "truckBreakdown",
                 })
@@ -628,8 +812,22 @@ class FleetManager:
         if self.on_strike:
             return   # crews refuse to work — no trucks move
         self._ensure_road_graph()
+        # Refresh the ambient congestion field (cheap; mostly cached).
+        self.traffic.update(dt, self.game.city,
+                            getattr(self.game, "economy", None), self)
+        # Which streams are lifted this week is constant across the tick; cache
+        # per area and recompute lazily (week/policy can shift between ticks).
+        self._due_cache = {}
         for truck in self.trucks:
             self._update_truck(truck, dt)
+
+    def _due_mask(self, area):
+        """Cached per-area mask of streams that get lifted on this week's visit."""
+        m = self._due_cache.get(area.id)
+        if m is None:
+            m = wastestreams.due_streams(self.game.waste, area, self._week_index())
+            self._due_cache[area.id] = m
+        return m
 
     def _update_truck(self, truck, dt):
         if truck["crew"] < 1:
@@ -639,8 +837,18 @@ class FleetManager:
 
         state = truck["state"]
 
+        # Accumulate operating hours and the day's workload (drives fatigue and
+        # usage-based wear) while the lorry is out of the depot.
+        if state != "depot":
+            truck["op_hours"] = truck.get("op_hours", 0.0) + dt
+            dd = getattr(self.game.economy, "day_duration", 55) or 55
+            truck["work_today"] = truck.get("work_today", 0.0) + dt / dd
+
         if state == "depot":
-            if self._pick_area(truck) is not None:
+            # An eRCV low on charge tops up before starting a round.
+            if self._ev_needs_charge(truck):
+                self._begin_charge(truck)
+            elif self._pick_area(truck) is not None:
                 route = self._route_to_stop(truck)
                 if route is not None:
                     truck["path"] = route
@@ -657,10 +865,58 @@ class FleetManager:
             if self._follow_path(truck, dt):
                 self._arrive_landfill(truck)
 
+        elif state == "tipping":
+            self._tip(truck, dt)
+
+        elif state == "to_charge":
+            if self._follow_path(truck, dt):
+                truck["charge_t"] = 0.0
+                truck["state"] = "charging"
+
+        elif state == "charging":
+            truck["charge_t"] = truck.get("charge_t", 0.0) + dt
+            if truck["charge_t"] >= EV_CHARGE_TIME:
+                truck["battery"] = 1.0
+                truck["state"] = "depot"
+
         elif state == "to_depot":
             if self._follow_path(truck, dt):
                 truck["load"] = 0.0
+                truck["load_streams"] = [0.0, 0.0, 0.0, 0.0]
+                truck["load_reject"] = 0.0
                 truck["state"] = "depot"
+
+    def _stop_presented_fill(self, bins, today):
+        """Sum of the due-stream fills across a stop's bins — the volume the
+        crew actually has to lift, which drives service time."""
+        total = 0.0
+        city = self.game.city
+        for (bx, by) in bins:
+            tile = city.get_tile(bx, by)
+            s = getattr(tile, "streams", None) if tile else None
+            if s is None:
+                continue
+            area = city.get_area(tile.area_id)
+            due = self._due_mask(area) if area else (True,) * wastestreams.STREAM_COUNT
+            for i in range(wastestreams.STREAM_COUNT):
+                if due[i]:
+                    total += s[i]
+        return total
+
+    def _service_time_factor(self, truck):
+        """Multiplier on service time from crew/vehicle/site conditions. 1.0 is
+        a full, experienced, rested crew in fair weather on clear roads; a green,
+        tired or short crew on a worn lorry in a congested, wet street takes
+        markedly longer. Lower crew productivity => higher time factor."""
+        cap = max(1, truck.get("crew_cap", MAX_CREW))
+        crew = max(1, truck["crew"])
+        understaffed = 1.0 + 0.12 * (1.0 - crew / float(cap))
+        # Productivity (>1 fast, <1 slow) inverts into a time multiplier.
+        factor = understaffed / self.crew_productivity(truck)
+        # Threading a congested street costs a little extra dwell.
+        tx, ty = self._truck_tile(truck)
+        factor *= 1.0 + 0.22 * self.traffic.congestion_at(tx, ty)
+        return factor
 
     def _begin_servicing(self, truck):
         today = self._today()
@@ -670,13 +926,32 @@ class FleetManager:
             self._depart_to_landfill(truck)
             return
 
-        bins = [b for b in truck["claimed"]
-                if self._bin_serviceable(b[0], b[1], today, truck["area_id"])]
+        # Keep the bins we can still service; RELEASE any claimed bin that is no
+        # longer serviceable (e.g. the day rolled over mid-round so the area is
+        # no longer due today) rather than leaving its claim dangling. A leaked
+        # claim makes _area_remaining think the work is taken, which idles trucks
+        # while bins sit full — the classic cause of a service death-spiral.
+        bins = []
+        for b in list(truck["claimed"]):
+            if self._bin_serviceable(b[0], b[1], today, truck["area_id"]):
+                bins.append(b)
+            else:
+                self._release_bin(truck, b)
         truck["service_bins"] = bins
         truck["service_t"] = 0.0
         crew = max(1, truck["crew"])
         waves = math.ceil(len(bins) / crew) if bins else 0
-        truck["service_need"] = waves * PER_BIN_TIME + STOP_BASE_TIME
+        # Service time (item 5): fixed per-wave handling plus a loading term that
+        # scales with the volume actually presented at the kerb and is shared out
+        # across the crew. A fuller stop, or a fortnightly round with two weeks of
+        # waste stacked up, genuinely takes longer to empty — and more loaders
+        # speed it up. Productivity/accessibility factors fold in via
+        # _service_time_factor (crew, vehicle, congestion — expanded in later
+        # phases).
+        presented = self._stop_presented_fill(bins, today)
+        base = (waves * PER_BIN_TIME + STOP_BASE_TIME
+                + presented * LOAD_TIME_PER_FILL / crew)
+        truck["service_need"] = base * self._service_time_factor(truck)
 
         # Spawn cosmetic loaders (visual only — throughput is driven by the timer).
         truck["out_workers"] = []
@@ -706,28 +981,48 @@ class FleetManager:
         if truck["service_t"] < truck["service_need"]:
             return
 
-        # Stop complete — empty the bins into the body (respecting capacity).
-        # Disposal volume is metered and charged when the load is tipped at the
-        # landfill, not here, so gate fees follow what actually reaches the tip.
+        # Stop complete — empty the DUE streams into the body. Each stream
+        # contributes body *volume* (bulky garden eats more space than compacted
+        # residual) and disposal *mass* (for economics), tracked separately so
+        # capacity becomes a real logistical constraint. Gate fees/diversion are
+        # charged when the load is tipped, so they follow what reaches the tip.
+        mask = wastestreams.enabled_mask(self.game.waste)
         for (bx, by) in truck["service_bins"]:
             tile = self.game.city.get_tile(bx, by)
             self._release_bin(truck, (bx, by))
-            if tile is None:
+            if tile is None or getattr(tile, "streams", None) is None:
                 continue
-            space = max(0.0, truck["capacity"] - truck["load"])
-            if space <= 0:
-                continue
-            amt = min(tile.bin_fill, space)
-            tile.bin_fill -= amt
-            truck["load"] += amt
-            if amt > 0:
+            area = self.game.city.get_area(tile.area_id)
+            due = self._due_mask(area) if area else mask
+            sf = wastestreams.size_factor(tile)
+            vol, masses = wastestreams.collect_stop(tile, due, sf)
+            if vol > 0:
+                truck["load"] += vol
+                ls = truck["load_streams"]
+                for i in range(wastestreams.STREAM_COUNT):
+                    ls[i] += masses[i]
+                # Contamination is emergent per round: the fraction of this
+                # stop's recycling rejected at the MRF uses the area's own
+                # contamination rate (cohort sorting habits, missed collections,
+                # whether food/garden caddies exist), not one borough number.
+                rec = masses[wastestreams.RECYCLING]
+                if rec > 0:
+                    cont = getattr(area, "contamination", None)
+                    if cont is None:
+                        cont = self._current_contamination()
+                    truck["load_reject"] += rec * cont
                 self.collected_count += 1
+            tile.bin_fill = wastestreams.visible_fill(tile, mask)
         truck["service_bins"] = []
         truck["out_workers"] = []
 
         # Decide what to do next.
         if truck["load"] >= truck["capacity"] * 0.95:
             self._depart_to_landfill(truck)
+            return
+        # An eRCV that has run low breaks off to recharge (losing round time).
+        if self._ev_needs_charge(truck):
+            self._begin_charge(truck)
             return
         route = self._route_to_stop(truck)
         if route is not None:
@@ -748,7 +1043,30 @@ class FleetManager:
         else:
             self._depart_to_depot(truck)
 
+    def _ev_needs_charge(self, truck):
+        """True when an electric lorry has run low enough to need a charge."""
+        return (truck.get("model_id") == "electric"
+                and truck.get("battery", 1.0) < EV_LOW_BATTERY)
+
+    def _begin_charge(self, truck):
+        """Head to the depot to recharge (an eRCV can't finish the round on the
+        charge it has left). Any held load is tipped first if the truck is full;
+        otherwise it carries on to the depot chargers, losing collection time."""
+        self._release_truck_claims(truck)
+        truck["out_workers"] = []
+        truck["service_bins"] = []
+        route = self._route_to_depot(truck)
+        if route is None:
+            # Can't reach the depot — limp on and let normal routing cope.
+            truck["battery"] = max(truck.get("battery", 0.0), EV_LOW_BATTERY)
+            truck["state"] = "depot"
+            return
+        truck["area_id"] = -1
+        truck["path"] = route
+        truck["state"] = "to_charge"
+
     def _depart_to_depot(self, truck):
+        self._release_truck_claims(truck)   # never carry claims home
         truck["area_id"] = -1
         truck["out_workers"] = []
         truck["service_bins"] = []
@@ -757,9 +1075,18 @@ class FleetManager:
 
     # ------------------------------------------------------------- landfill
     def _landfill_gate(self):
-        """Return the centre of the landfill site so trucks drive right in."""
+        """Return the tipping point trucks drive to. This must be a ROAD tile
+        (the site's haul gate) so a truck can road-route back out again after
+        tipping. Driving to the interior centre instead strands a truck whenever
+        that centre is landlocked by landfill tiles (no adjacent road) — the
+        road-only round/depot routing can't then escape the site, and the truck
+        idles there forever. Fall back to the centre only if no gate is known,
+        and to the depot if there's no landfill at all."""
         lf = getattr(self.game.city, "landfill", None)
         if lf:
+            gate = lf.get("gate")
+            if gate:
+                return (gate[0], gate[1])
             return (lf["cx"], lf["cy"])
         return (self.depot_x, self.depot_y)
 
@@ -805,18 +1132,69 @@ class FleetManager:
         truck["service_bins"] = []
         route = self._route_to_landfill(truck)
         if route is None:
-            truck["load"] = 0.0
+            # Landfill unreachable — tip at the depot as a fallback so the load
+            # isn't silently lost from the economy.
+            self._tip_load(truck)
             self._depart_to_depot(truck)
             return
         truck["path"] = route
         truck["state"] = "to_landfill"
 
-    def _arrive_landfill(self, truck):
-        """Tip the load (this is where disposal volume is metered and charged),
-        then resume the round, pick a new one, or head home."""
-        if truck["load"] > 0:
+    def _tip_load(self, truck):
+        """Meter the truck's load into the pending disposal accumulators and
+        empty the body. The contaminated recycling fraction was accumulated per
+        stop from each round's own contamination rate (see _service), so the
+        reject reflects where the load actually came from."""
+        ls = truck["load_streams"]
+        if truck["load"] > 0 or ls[0] or ls[1] or ls[2] or ls[3]:
             self._pending_volume += truck["load"]
-            truck["load"] = 0.0
+            for i in range(wastestreams.STREAM_COUNT):
+                self._pending_streams[i] += ls[i]
+            reject = truck.get("load_reject", 0.0)
+            # Guard: reject can never exceed the recycling actually onboard.
+            self._pending_reject += min(reject, ls[wastestreams.RECYCLING])
+            # Usage wear: each tip is a compaction/hydraulic cycle; a tip while
+            # near capacity stresses the body (an overload event).
+            truck["load_cycles"] = truck.get("load_cycles", 0) + 1
+            if truck["load"] >= truck["capacity"] * 0.95:
+                truck["overload"] = truck.get("overload", 0) + 1
+        truck["load"] = 0.0
+        truck["load_streams"] = [0.0, 0.0, 0.0, 0.0]
+        truck["load_reject"] = 0.0
+
+    def _current_contamination(self, truck=None):
+        """Fraction of recycling rejected as contaminated. Borough-level for
+        now; a later phase makes this emergent from the areas serviced."""
+        waste = getattr(self.game, "waste", None)
+        if waste is None:
+            return 0.0
+        try:
+            return waste.contamination_rate()
+        except Exception:
+            return 0.0
+
+    def _arrive_landfill(self, truck):
+        """Begin the tip dwell (weigh-in, queue, tipping). The load is metered
+        and the round resumed when the dwell completes (_finish_tip)."""
+        truck["tip_t"] = 0.0
+        truck["tip_need"] = TIP_BASE_TIME + truck["load"] * TIP_TIME_PER_LOAD
+        truck["state"] = "tipping"
+
+    def _tip(self, truck, dt):
+        truck["tip_t"] = truck.get("tip_t", 0.0) + dt
+        if truck["tip_t"] < truck.get("tip_need", 0.0):
+            return
+        self._finish_tip(truck)
+
+    def _finish_tip(self, truck):
+        """Dwell complete: meter the load, then resume the round, pick a new
+        one, or head home."""
+        self._tip_load(truck)
+
+        # An empty eRCV low on charge heads for the depot chargers next.
+        if self._ev_needs_charge(truck):
+            self._begin_charge(truck)
+            return
 
         today = self._today()
         if truck["area_id"] != -1 and self._area_remaining(truck["area_id"], today) > 0:
@@ -878,8 +1256,7 @@ class FleetManager:
             if not area.due_today(today, week):
                 continue
             for (x, y) in area.building_tiles:
-                t = city.tiles[y][x]
-                if t.bin_fill > self.service_threshold:
+                if self._bin_serviceable(x, y, today, area.id):
                     count += 1
         return count
 
@@ -893,8 +1270,7 @@ class FleetManager:
             return 0
         count = 0
         for (x, y) in area.building_tiles:
-            t = city.tiles[y][x]
-            if t.bin_fill > self.service_threshold:
+            if self._bin_serviceable(x, y, today, area_id):
                 count += 1
         return count
 

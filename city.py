@@ -1,5 +1,6 @@
 import random
 from roads import RoadGenerator
+import wastestreams
 
 # ---------------------------------------------------------------------------
 #  Collection areas (rounds)
@@ -145,6 +146,12 @@ class Tile:
         self.roof_color = "#8b2d2d"
         self.seed = random.random()                # per-building visual jitter
         self.days_overflowing = 0
+        # Per-stream kerbside fills (residual, recycling, food, garden) for
+        # building tiles; None for road/green/landfill. Set when a building is
+        # created (see _make_building/_build_tile) and migrated for old saves
+        # via wastestreams.ensure_streams. bin_fill above is kept in sync as the
+        # fullest enabled bin so the renderer/HUD are unaffected.
+        self.streams = None
 
     def get_collection_day_name(self):
         return DAY_NAMES[self.collection_due]
@@ -469,6 +476,7 @@ class CityGenerator:
 
         tile.population = random.randint(data["pop"][0], data["pop"][1])
         tile.fill_rate = data["fill"]
+        tile.streams = wastestreams.new_streams()
 
         palettes = STYLE_PALETTES[style]
         tile.building_variant = random.randint(0, len(palettes) - 1)
@@ -535,6 +543,10 @@ class CityGenerator:
             "last": area.last_collected,
             "is_today": is_today,
             "route_type": area.route_type,
+            # Spatial social state (Phase 2); None until boroughsim seeds it.
+            "satisfaction": getattr(area, "satisfaction", None),
+            "complaints": getattr(area, "complaints_today", 0),
+            "contamination": getattr(area, "contamination", None),
         }
 
     # ---------------------------------------------------------------- access
@@ -592,6 +604,7 @@ class CityGenerator:
         tile.building_height = random.randint(h_min, h_max)
         tile.population = random.randint(data["pop"][0], data["pop"][1])
         tile.fill_rate = data["fill"]
+        tile.streams = wastestreams.new_streams()
         palettes = STYLE_PALETTES[style]
         tile.building_variant = random.randint(0, len(palettes) - 1)
         pal = palettes[tile.building_variant]
@@ -1012,6 +1025,7 @@ class CityGenerator:
                     t.wall_color_light = d.get("cl", t.wall_color_light)
                     t.wall_color_dark = d.get("cd", t.wall_color_dark)
                     t.roof_color = d.get("cr", t.roof_color)
+                    t.streams = wastestreams.new_streams()
                     c.metrics[tp] += 1
                     c.population += t.population
                     c.property_count += 1

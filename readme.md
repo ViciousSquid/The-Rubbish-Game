@@ -1,6 +1,4 @@
-### Run a UK borough's bin service without going bankrupt.
-
-A municipal logistics/tycoon simulation where waste generation, collection scheduling, routing and infrastructure interact to create an emergent management problem.
+#### Run a UK borough's bin service without going bankrupt.
 
 Buy the lorries, hire the crews, choose which waste streams to collect — and keep
 the residents happy and the recycling targets met before the council slides into
@@ -149,6 +147,61 @@ contamination and processing considerations.
 
 And meanwhile, the residents still expect their bins to disappear on collection
 day.
+
+---
+
+## A borough that behaves like one
+
+The simulation runs deep enough that problems have *causes* you can trace.
+
+### 🗑️ Separate waste streams, per property
+
+Every building keeps four independent bins — residual, recycling, food and
+garden — that fill on their own. A food caddy can be overflowing while the black
+bin is half empty; skip a fortnightly recycling collection and the recycling
+piles up until it tips over. What each property throws out depends on its
+building type, its residents, the season and the weather — a leafy street of
+detached houses in autumn is a very different problem from a tower-block estate.
+
+Frequency is physical. Weekly and fortnightly rounds genuinely accumulate
+differently, and dropping a service doesn't make the waste vanish — it lands in
+the black bin instead.
+
+### 🚚 Logistics with teeth
+
+Bulky garden waste eats truck capacity far faster than compacted residual, so
+capacity is a real constraint and disposal trips are a real cost — drive,
+collect, queue at the tip, weigh, tip, return. Rounds run through ambient
+**traffic congestion** and around **road works**. Crews have **productivity and
+fatigue**: experienced, rested crews are quicker; a stretched fleet working long
+days tires and slows. Lorries wear from **use, not just age** — a flogged young
+truck can be less reliable than an old, lightly-used one.
+
+### 🏞️ A living map
+
+Satisfaction and complaints are **spatial**. Each round tracks its own mood and
+its own resident cohorts, so the map itself is the management tool — Northgate
+sits at 91% while Lower-Damp slides to 48%. Recycling contamination is
+**emergent**, rising in dense, transient estates and falling where food and
+garden caddies keep the dry bin clean.
+
+### 🏗️ Strategy that bites back
+
+The **landfill is finite** — it fills, disposal costs escalate as it does, and
+eventually you must recycle harder or fund an expansion. Buy **electric** and
+you trade cheap running costs for charging downtime and limited winter range.
+**Procurement** rides a market of shortages and gluts. Borough **reputation**
+turns good service into grants, and every few years an **election** installs an
+administration — Austerity, Green, Pro-business or Populist — whose priorities
+reshape your targets.
+
+### 🍂 Crises that tell a story
+
+Above all, the trouble *emerges*. Autumn swells the garden waste; bins fill
+faster; trucks make more tip runs; rounds finish late; missed collections mount;
+complaints climb; satisfaction falls; the council takes notice. You don't get a
+random "Autumn Crisis" card — you watch the systems create one, and a situation
+report spells out the chain so you can see exactly where to intervene.
 
 ---
 

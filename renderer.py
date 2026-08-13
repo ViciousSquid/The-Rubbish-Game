@@ -1762,33 +1762,69 @@ class Renderer:
                 type_color = (220, 210, 150)
                 type_label = "MIX"
 
+            # Local satisfaction heatmap: colour the round's tag (and a small
+            # readout) by how happy that round is, so the map itself shows where
+            # the trouble is at a glance.
+            sat = getattr(area, "satisfaction", None)
+            if sat is None:
+                sat_col = (245, 245, 245)
+                sat_txt = None
+            else:
+                sat_col = self._satisfaction_color(sat)
+                sat_txt = f"{int(sat)}%"
+
             name      = font.render(area.name, True, (245, 245, 245))
             day_str   = (DAY_NAMES[area.collection_day]
                          + ("  (today)" if area.collection_day == today else ""))
             day       = small.render(day_str, True, (210, 210, 210))
             type_surf = small.render(type_label, True, type_color)
+            sat_surf  = (font.render(sat_txt, True, sat_col) if sat_txt else None)
 
-            w   = max(name.get_width(), day.get_width(), type_surf.get_width()) + 14
+            widths = [name.get_width(), day.get_width(), type_surf.get_width()]
+            if sat_surf:
+                widths.append(sat_surf.get_width())
+            w   = max(widths) + 14
             h   = (name.get_height() + day.get_height()
-                   + type_surf.get_height() + 14)
+                   + type_surf.get_height()
+                   + (sat_surf.get_height() if sat_surf else 0) + 14)
             box = pygame.Rect(sx - w // 2, sy - h // 2, w, h)
             pygame.draw.rect(self.screen, (24, 24, 24), box)
-            pygame.draw.rect(
-                self.screen,
-                (245, 245, 245) if area.collection_day == today else (250, 250, 250),
-                box, 2)
-            pygame.draw.rect(self.screen, type_color,
+            # Border tinted by satisfaction (bright white ring when due today).
+            border_col = (245, 245, 245) if area.collection_day == today else sat_col
+            pygame.draw.rect(self.screen, border_col, box, 2)
+            pygame.draw.rect(self.screen, sat_col,
                              pygame.Rect(box.x, box.y, 4, box.height))
-            self.screen.blit(name,
-                             (box.centerx - name.get_width() // 2, box.y + 4))
+            yy = box.y + 4
+            self.screen.blit(name, (box.centerx - name.get_width() // 2, yy))
+            yy += name.get_height() + 2
             self.screen.blit(type_surf,
-                             (box.centerx - type_surf.get_width() // 2,
-                              box.y + 6 + name.get_height()))
-            self.screen.blit(day,
-                             (box.centerx - day.get_width() // 2,
-                              box.y + 8 + name.get_height() + type_surf.get_height()))
+                             (box.centerx - type_surf.get_width() // 2, yy))
+            yy += type_surf.get_height() + 2
+            self.screen.blit(day, (box.centerx - day.get_width() // 2, yy))
+            if sat_surf:
+                yy += day.get_height() + 2
+                self.screen.blit(sat_surf,
+                                 (box.centerx - sat_surf.get_width() // 2, yy))
 
     # ─── helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _satisfaction_color(sat):
+        """Green (happy) -> amber -> red (crisis) ramp for the area heatmap."""
+        s = max(0.0, min(100.0, sat)) / 100.0
+        if s >= 0.5:
+            # amber -> green over 50..100
+            t = (s - 0.5) / 0.5
+            r = int(225 + (110 - 225) * t)
+            g = int(190 + (210 - 190) * t)
+            b = int(70 + (110 - 70) * t)
+        else:
+            # red -> amber over 0..50
+            t = s / 0.5
+            r = int(220 + (225 - 220) * t)
+            g = int(70 + (190 - 70) * t)
+            b = int(70 + (70 - 70) * t)
+        return (r, g, b)
 
     @staticmethod
     def _grow(quad, amount):

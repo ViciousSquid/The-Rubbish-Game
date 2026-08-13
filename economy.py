@@ -369,6 +369,18 @@ class Economy:
         self.satisfaction = preset["start_satisfaction"]
         self.complaints_total = 0
         self.complaints_today = 0
+        # Borough-wide recycling contamination, derived from the areas' emergent
+        # rates each day (see boroughsim); cached here for the HUD/Waste window.
+        self.borough_contamination = 0.06
+        # (name, satisfaction) of the unhappiest populated round, for the HUD.
+        self.worst_area = None
+
+        # Disposal-facility network (finite landfill + processors). Created once
+        # the city exists via init_facilities(); until then disposal is
+        # unconstrained (menu backdrop / very early startup).
+        self.facilities = None
+        self._residual_day_accum = 0.0   # residual disposed so far today
+        self.residual_per_day_est = 0.0  # smoothed estimate for "years left"
         # Baseline "you can't please everyone" gripes — a trickle of complaints
         # that never fully stops and rises as satisfaction falls. Tallied and
         # displayed separately from genuine overflow complaints so they never
@@ -378,12 +390,25 @@ class Economy:
         self.active_event = None
         self.pending_event = None
         self._bin_rate_multiplier = 1
+        self._event_bin_mult = 1           # event-only (no weather); see update()
         self._recycling_multiplier = 1.0   # boosted by recycling_drive
 
         # Editable difficulty levers
         self.event_chance = 0.30
         self.win_streak_target = preset["win_streak"]
         self.win_sat_floor = preset["win_sat_floor"]
+        self.win_sat_floor_base = preset["win_sat_floor"]   # elections re-derive
+
+        # ── Politics: reputation, administration & election cycle (Phase 4) ──
+        # The council as a feedback system (see politics.py). Reputation is a
+        # slow-moving performance score; the administration installs priorities
+        # at each election; the *_base fields are the difficulty baselines the
+        # administration modifiers are applied on top of (so they don't compound).
+        self.reputation = 60.0
+        self.administration = "balanced"
+        self.term_number = 0
+        self.business_relief = 0.0
+        self.grant_mult_base = preset.get("grant_mult", 1.0)
 
         # Notices raised during a day-rollover (loan cleared, diversion fines),
         # drained by the game loop and shown in the event banner.
@@ -398,6 +423,7 @@ class Economy:
 
         # ── Statutory recycling diversion tracking ───────────────────────────
         self.diversion_target       = preset["diversion_target"]
+        self.diversion_target_base  = preset["diversion_target"]   # election baseline
         self.residual_volume_year   = 0.0
         self.diverted_volume_year   = 0.0
         self._diversion_year_index  = 0
@@ -418,6 +444,21 @@ class Economy:
 
         # Procurement notifications
         self.procurement_events = []
+
+        # ── Dynamic procurement market (Phase 4) ─────────────────────────────
+        # External conditions move new-vehicle prices and lead times: a
+        # manufacturer shortage stretches deliveries and lifts prices, a battery
+        # shortage specifically hammers electric orders, a supplier glut is a
+        # buying opportunity. Shifts every few weeks; applied when an order is
+        # placed (see fleet.order_vehicle).
+        self.procurement_market = "normal"
+        self._market_timer = random.randint(20, 45)
+
+        # ── Emergent crisis monitor (Phase 5) ────────────────────────────────
+        # Watches the simulation and narrates crises that emerge from the systems
+        # themselves (see crises.py) — it never causes them.
+        import crises
+        self.crisis_monitor = crises.CrisisMonitor()
 
         # Ambient weather: "dry" | "rain" | "snow" | "overcast"
         self.weather = "dry"
@@ -559,7 +600,14 @@ class Economy:
             elif effect == "recyclingBonus":
                 self._recycling_multiplier = val
 
-        # Weather bin-rate bump (rain makes bags tear)
+        # The event-only portion (bank holiday, heatwave, ...), captured before
+        # weather is folded in. The per-stream waste model applies weather with
+        # stream resolution (rain hits residual/garden, not food), so it reads
+        # this event-only value to avoid double-counting weather.
+        self._event_bin_mult = self._bin_rate_multiplier
+
+        # Weather bin-rate bump (rain makes bags tear) — kept for the legacy
+        # aggregate path (menu backdrop / old readers of get_bin_rate_multiplier).
         if self.weather == "rain":
             self._bin_rate_multiplier *= 1.25
         elif self.weather == "snow":
@@ -596,18 +644,34 @@ class Economy:
         self.ledger["insurance"]      += insurance  * frac
         self.ledger["loan_repayment"] += loan_pay   * frac
 
-        volume = fleet.take_pending_volume()
-        if volume > 0:
-            gate, recycle, garden = waste.disposal_economics(
-                volume, self.landfill_tax_multiplier())
+        # Stream-accurate disposal: the fleet reports the actual per-stream mass
+        # tipped (and the recycling rejected as contaminated), so gate fees and
+        # diversion follow the real composition of what was collected rather than
+        # re-splitting a mixed volume by policy share.
+        masses, reject, total = fleet.take_pending_streams()
+        gate = recycle = garden = 0.0
+        if total > 0:
+            # Residual gate fee escalates both with the annual landfill-tax rise
+            # AND with how full the landfill is (a nearly-full site charges far
+            # more; a full one forces costly export). Diverted streams go to their
+            # own processors and are unaffected.
+            fac_mult = (self.facilities.residual_gate_multiplier()
+                        if self.facilities else 1.0)
+            gate, recycle, garden, res_u, div_u = waste.disposal_economics_streams(
+                masses, self.landfill_tax_multiplier() * fac_mult, reject_mass=reject)
             recycle *= self._recycling_multiplier
             self.ledger["gate_fees"]        += gate
             self.ledger["recycling_credit"] += recycle
             self.ledger["garden_charges"]   += garden
-            # Track residual vs diverted tonnage for the statutory annual review.
-            res_u, div_u = waste.diversion_split(volume)
+            # Track residual vs diverted mass for the statutory annual review.
             self.residual_volume_year += res_u
             self.diverted_volume_year += div_u
+            # Consume landfill capacity with the residual (incl. rejected
+            # recycling) actually landfilled, and accumulate today's intake for
+            # the "years left" estimate.
+            if self.facilities is not None:
+                self.facilities.dispose(res_u)
+                self._residual_day_accum += res_u
 
         revenue  = (council + business) * frac
         expenses = (base_wages + oncosts + vehicles + rental_costs
@@ -615,7 +679,7 @@ class Economy:
         self.daily_revenue  += revenue
         self.daily_expenses += expenses
         self.budget += (revenue - expenses)
-        if volume > 0:
+        if total > 0:
             self.budget += (recycle + garden - gate)
         # The budget is allowed to dip into the red (emergency borrowing), but a
         # hard overdraft floor exists. Reaching it is instant insolvency.
@@ -680,15 +744,37 @@ class Economy:
         # ---- advance road-works independently --------------------------------
         self._update_road_works(city, fleet)
 
+        # ---- disposal facilities: roll the day's intake, refresh estimate ----
+        if self.facilities is not None:
+            # Smoothed residual-per-day estimate drives the landfill "years left".
+            if self._residual_day_accum > 0:
+                if self.residual_per_day_est <= 0:
+                    self.residual_per_day_est = self._residual_day_accum
+                else:
+                    self.residual_per_day_est += (
+                        self._residual_day_accum - self.residual_per_day_est) * 0.25
+            self._residual_day_accum = 0.0
+            self.facilities.on_new_day()
+
         # ---- ambient weather transitions -------------------------------------
         self._tick_weather()
 
         # ---- diesel pump price drifts each day -------------------------------
         self._tick_fuel_index()
 
+        # ---- procurement market drifts (shortages / gluts) -------------------
+        _mkt_notice = self._tick_procurement_market()
+        if _mkt_notice:
+            self.day_notices.append(_mkt_notice)
+
         # ---- worker morale (wage-to-strike pipeline) -------------------------
         # Update morale BEFORE the event check so fresh morale affects today.
         self._update_worker_morale()
+
+        # ---- politics: reputation, performance grants, elections -------------
+        import politics
+        for notice in politics.update_daily(self):
+            self.day_notices.append(notice)
 
         # ---- fire a new event (at most one active at a time) -----------------
         if not self.active_event:
@@ -868,10 +954,27 @@ class Economy:
             t = (0.72 - m) / 0.72
             return 1.0 + t * 7.0
 
+    # Random-event weights. Events whose consequences the simulation now
+    # produces on its own (breakdowns from usage wear, grants from reputation,
+    # inspections from the reputation system) are dialled right down, so the
+    # drama increasingly *emerges* from the systems rather than being scripted
+    # (Phase 5). They're kept, not removed, for occasional variety.
+    EVENT_BASE_WEIGHTS = {
+        "vehicle_breakdown": 0.35,   # now emerges from usage-based wear
+        "fleet_breakdown":   0.4,    # ditto (maintenance bills come from wear)
+        "council_inspection": 0.5,   # reputation system covers performance review
+        "recycling_grant":   0.55,   # endogenous performance grants cover this
+    }
+
+    def _event_base_weight(self, e):
+        return self.EVENT_BASE_WEIGHTS.get(e["id"], 1.0)
+
     def _weighted_event_choice(self):
-        """Pick a random event, biasing crew_strike by current morale."""
+        """Pick a random event, biasing crew_strike by current morale and
+        down-weighting events the simulation now generates emergently."""
         weights = [
-            self._crew_strike_weight() if e["id"] == "crew_strike" else 1.0
+            (self._crew_strike_weight() if e["id"] == "crew_strike"
+             else self._event_base_weight(e))
             for e in self.events
         ]
         return random.choices(self.events, weights=weights, k=1)[0]
@@ -882,7 +985,8 @@ class Economy:
         if not self.events:
             return 0.0
         weights = [
-            self._crew_strike_weight() if e["id"] == "crew_strike" else 1.0
+            (self._crew_strike_weight() if e["id"] == "crew_strike"
+             else self._event_base_weight(e))
             for e in self.events
         ]
         total_w = sum(weights)
@@ -994,6 +1098,60 @@ class Economy:
         else:
             self.weather = "overcast"
 
+    # ----- dynamic procurement market --------------------------------------
+    # Each state carries multipliers on new-vehicle price and lead time, with an
+    # optional electric-specific overlay (a battery shortage hits eRCVs hardest).
+    PROCUREMENT_MARKETS = {
+        "normal": {"label": "Steady", "price": 1.0, "lead": 1.0,
+                   "ev_price": 1.0, "ev_lead": 1.0,
+                   "blurb": "The RCV market is steady."},
+        "shortage": {"label": "Manufacturer shortage", "price": 1.16, "lead": 1.45,
+                     "ev_price": 1.16, "ev_lead": 1.45,
+                     "blurb": "Chassis shortages: new lorries are dearer and "
+                              "slower to arrive."},
+        "battery": {"label": "Battery shortage", "price": 1.02, "lead": 1.05,
+                    "ev_price": 1.30, "ev_lead": 1.7,
+                    "blurb": "A cell-supply crunch: electric RCVs are much dearer "
+                             "and delivery times have blown out."},
+        "surge": {"label": "Demand surge", "price": 1.12, "lead": 1.3,
+                  "ev_price": 1.12, "ev_lead": 1.3,
+                  "blurb": "Councils nationwide are re-fleeting: order books are "
+                           "full, pushing up prices and lead times."},
+        "glut": {"label": "Supplier glut", "price": 0.88, "lead": 0.8,
+                 "ev_price": 0.9, "ev_lead": 0.85,
+                 "blurb": "Overcapacity at the factories — a good moment to buy."},
+    }
+    _MARKET_WEIGHTS = {"normal": 0.50, "shortage": 0.16, "battery": 0.12,
+                       "surge": 0.12, "glut": 0.10}
+
+    def _tick_procurement_market(self):
+        """Drift the procurement market. Returns a notice dict on a change."""
+        self._market_timer -= 1
+        if self._market_timer > 0:
+            return None
+        prev = self.procurement_market
+        states = list(self._MARKET_WEIGHTS.keys())
+        weights = list(self._MARKET_WEIGHTS.values())
+        self.procurement_market = random.choices(states, weights=weights, k=1)[0]
+        self._market_timer = random.randint(18, 40)
+        if self.procurement_market == prev or self.procurement_market == "normal":
+            return None
+        m = self.PROCUREMENT_MARKETS[self.procurement_market]
+        return {"name": f"Procurement: {m['label']}", "desc": m["blurb"],
+                "effect": "procurement"}
+
+    def procurement_market_info(self):
+        return self.PROCUREMENT_MARKETS.get(
+            getattr(self, "procurement_market", "normal"),
+            self.PROCUREMENT_MARKETS["normal"])
+
+    def procurement_mods(self, model_id):
+        """(price_multiplier, lead_multiplier) for ordering `model_id` now."""
+        m = self.procurement_market_info()
+        if model_id == "electric":
+            return m["ev_price"], m["ev_lead"]
+        return m["price"], m["lead"]
+
     # ----- diesel fuel market ----------------------------------------------
     def _tick_fuel_index(self):
         """Drift the diesel price index as a bounded random walk. Most days
@@ -1048,6 +1206,46 @@ class Economy:
         rise (6-8%)."""
         year = (self.day - 1) // COUNCIL_YEAR_DAYS
         return (1.0 + self.landfill_rise) ** year
+
+    # ----- disposal facilities ---------------------------------------------
+    def init_facilities(self, city):
+        """Create the disposal-facility network sized to the borough. Called when
+        a game (or edited city) starts."""
+        import facilities
+        self.facilities = facilities.FacilityNetwork(
+            getattr(city, "property_count", 1500))
+
+    def ensure_facilities(self, city):
+        if self.facilities is None:
+            self.init_facilities(city)
+        return self.facilities
+
+    def landfill_status(self):
+        """Landfill/disposal status dict for the UI, or None before init."""
+        if self.facilities is None:
+            return None
+        return self.facilities.status(self.residual_per_day_est)
+
+    def can_expand_landfill(self):
+        if self.facilities is None:
+            return False
+        cost = self.facilities.expansion_cost(self.facilities.default_expansion())
+        return self.budget >= cost
+
+    def expand_landfill(self):
+        """Buy a landfill expansion (capital cost). Returns (ok, message)."""
+        if self.facilities is None:
+            return False, "No landfill to expand."
+        added = self.facilities.default_expansion()
+        cost = self.facilities.expansion_cost(added)
+        if self.budget < cost:
+            return False, (f"Not enough in the bank — a "
+                           f"£{cost:,.0f} expansion is needed.")
+        self.budget -= cost
+        self.facilities.expand(added)
+        return True, (f"Landfill expanded by {added:,.0f} units for "
+                      f"£{cost:,.0f}. Capacity now "
+                      f"{self.facilities.landfill.capacity:,.0f}.")
 
     def landfill_tax_pct_increase(self):
         """How much dearer landfill is now vs year one, as a percentage."""
@@ -1160,8 +1358,9 @@ class Economy:
         relocate, eroding the commercial tax base the rate is levied on.
         Modelled as a softening multiplier on business-rate revenue -- about
         35% lost at double the baseline rate, floored so the line never
-        collapses to nothing."""
-        return max(0.55, 1.0 - self.business_rate_pressure() * 0.35)
+        collapses to nothing. A pro-business administration eases this."""
+        relief = getattr(self, "business_relief", 0.0)
+        return max(0.55, 1.0 - self.business_rate_pressure() * 0.35 * (1.0 - relief))
 
     def tax_satisfaction_penalty(self):
         """Combined drag on the satisfaction ceiling from rate pressure:
@@ -1174,71 +1373,31 @@ class Economy:
         return council_hit + business_hit
 
     # ----- service quality -------------------------------------------------
-    def register_day_quality(self, city, service_ceiling=100.0):
-        daily_complaints = 0
-        for y in range(city.height):
-            for x in range(city.width):
-                tile = city.tiles[y][x]
-                if tile.type in ("road", "green", "landfill"):
-                    continue
-                if tile.bin_fill >= 100:
-                    tile.days_overflowing += 1
-                    # Only raise a complaint after *three* consecutive days of
-                    # overflow (> 2).  This gives a natural 2-day weekend grace
-                    # period: bins that tip over on Saturday are still forgiven
-                    # on Sunday, and trucks can clear them Monday morning.
-                    # Single-event spikes (bank holidays, heatwaves) also survive
-                    # without killing the streak.
-                    if tile.days_overflowing > 2:
-                        daily_complaints += 1
-                else:
-                    tile.days_overflowing = 0
+    def register_day_quality(self, city, waste, service_ceiling=100.0):
+        """Once-per-day service-quality review. The heavy lifting now lives in
+        the spatial model (boroughsim): each collection round tracks its own
+        satisfaction, complaints and recycling contamination, driven by its
+        resident cohorts and the service it actually receives. The borough-wide
+        satisfaction and complaint totals the HUD/win-condition read are derived
+        from those areas, so the map itself becomes the management tool — a
+        missed collection primarily hurts the affected round, not the whole
+        borough at once."""
+        import boroughsim
+        result = boroughsim.update_day(city, self, waste, service_ceiling)
 
+        # Borough satisfaction is now a population-weighted average of the rounds.
+        self.satisfaction = max(0.0, min(100.0, result["satisfaction"]))
+
+        daily_complaints = result["complaints_today"]
         self.complaints_today  = daily_complaints
         self.complaints_total += daily_complaints
-
-        # ── "Karen" baseline gripes ──────────────────────────────────────────
-        # A residual trickle of complaints that never stops entirely: a small
-        # share of residents will always grumble, and that share grows as
-        # satisfaction falls. These are tallied and shown separately and apply
-        # only a gentle satisfaction drag — they never count toward the genuine
-        # overflow complaints that drive the perfect-service streak, so the win
-        # condition stays reachable.
-        karen = 0
-        if city.property_count > 0:
-            dissat = (100.0 - self.satisfaction) / 100.0
-            # A tetchier local press on harder settings (karen_mult ≥ 1).
-            base_rate = 0.0009 * (0.45 + dissat) * self.karen_mult
-            expected = city.property_count * base_rate
-            karen = int(expected + random.random())     # stochastic rounding
-        self.karen_complaints_today = karen
-        self.complaints_total += karen
-
-        # Where satisfaction can settle: the waste-policy ceiling minus any
-        # rate-pressure drag. Computed up front because clean-day recovery is
-        # capped here — residents will not rate a bare-bones service
-        # "excellent" no matter how punctually it runs, so broadening the
-        # service (food caddies, garden bins) is what raises the ceiling.
-        effective_ceiling = max(20.0, service_ceiling - self.tax_satisfaction_penalty())
-
-        if city.property_count > 0:
-            overflow_ratio = daily_complaints / city.property_count
-            if overflow_ratio <= 0.02:
-                # Recovery is deliberately slow: a clean day nudges satisfaction
-                # up only a little, so clawing back from a bad week takes
-                # sustained good service rather than a single tidy day.
-                # (Slower still on harder settings — trust is earned.)
-                # Recovery never pushes above the service ceiling; if the mood
-                # already sits higher (honeymoon start, ceiling just lowered),
-                # the downward drift below handles the decline gently.
-                if self.satisfaction < effective_ceiling:
-                    self.satisfaction = min(effective_ceiling,
-                                            self.satisfaction + self.sat_recovery)
-            else:
-                # Decay bites harder than recovery heals — one bad day can undo
-                # a week of clean ones.
-                drop = min(32.0, overflow_ratio * 185.0)
-                self.satisfaction = max(0.0, self.satisfaction - drop)
+        # Baseline "you can't please everyone" gripes, summed from the rounds and
+        # tallied separately so they never break the perfect-service streak.
+        self.karen_complaints_today = result["karen_today"]
+        self.complaints_total += result["karen_today"]
+        # Cached for the HUD/heatmap and as a fallback contamination figure.
+        self.borough_contamination = boroughsim.borough_contamination(city, waste)
+        self.worst_area = result.get("worst_area")
 
         # A perfect day only counts toward the win if satisfaction is also
         # holding above the statutory floor — residents won't reward a borough
@@ -1263,25 +1422,14 @@ class Economy:
                 f"Held a {self.win_streak_target}-day perfect service streak "
                 f"on {self.difficulty_label} difficulty.")
 
-        # A gentle drag from baseline gripes — small enough that good service
-        # still climbs, but it stops satisfaction sitting pinned at a flawless
-        # 100% (there's always *someone* with a grievance).
-        if city.property_count > 0 and karen > 0:
-            karen_drag = min(1.0, karen / city.property_count * 28.0)
-            self.satisfaction = max(0.0, self.satisfaction - karen_drag)
-
-        # Drift toward the service ceiling, but slowly — this is the passive
-        # pull that used to snap satisfaction back to the ceiling at 10%/day.
-        # At 4%/day a bad week genuinely lingers and has to be worked off.
-        # Rate pressure (council tax / business rates pushed above baseline)
-        # pulls the ceiling itself down, so a high-tax borough settles at a
-        # permanently lower satisfaction even on otherwise-perfect days.
-        self.satisfaction += (effective_ceiling - self.satisfaction) * 0.04
-        self.satisfaction  = max(0.0, min(100.0, self.satisfaction))
-
     # ----- queries ---------------------------------------------------------
     def get_bin_rate_multiplier(self):
         return self._bin_rate_multiplier
+
+    def get_event_bin_multiplier(self):
+        """Event-only bin-rate multiplier (excludes weather, which the
+        per-stream waste model applies itself)."""
+        return getattr(self, "_event_bin_mult", self._bin_rate_multiplier)
 
     def get_day_progress(self):
         return self.day_timer / self.day_duration

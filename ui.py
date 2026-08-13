@@ -52,7 +52,7 @@ ROUTE_TYPE_COLORS = {
 # fleet = 3 catalogue rows + the fleet/orders footer; data = buttons + the
 # import/export notes.
 WINDOW_DEFS = [
-    ("rounds",  "Rounds",  "Collection Rounds",    872, 530),
+    ("rounds",  "Rounds",  "Collection Rounds",    952, 530),
     ("waste",   "Waste",   "Waste Streams",        660, 520),
     ("fleet",   "Fleet",   "Fleet & Procurement",  800, 648),
     ("staff",   "Staff",   "Staff & Vehicles",     864, 560),
@@ -2165,7 +2165,49 @@ class UIManager:
         ui.label("Baseline gripes", x, y)
         ui.value(str(karen_n), right, y,
                  c.TEXT_DIM if karen_n == 0 else c.STATUS_WARN, align="right")
-        y += 26
+        y += 22
+        # Unhappiest round — points the player at the trouble spot on the map.
+        worst = getattr(eco, "worst_area", None)
+        if worst is not None:
+            wname, wsat = worst
+            wcol = c.STATUS_GOOD if wsat >= 70 else c.STATUS_WARN if wsat >= 45 else c.STATUS_BAD
+            ui.label("Worst round", x, y)
+            wlabel = self._ellipsize(f"{wname} {int(wsat)}%",
+                                     ui.fonts.get("body_b"), 150)
+            ui.value(wlabel, right, y, wcol, align="right")
+            y += 22
+        # Landfill fill gauge — a quiet long-term pressure that becomes a crisis.
+        st = eco.landfill_status()
+        if st:
+            fill = st["fill_pct"]
+            fcol = (c.STATUS_GOOD if fill < 50 else
+                    c.STATUS_WARN if fill < 80 else c.STATUS_BAD)
+            ui.label("Landfill used", x, y)
+            extra = " FULL" if st["is_full"] else ""
+            ui.value(f"{fill:.0f}%{extra}", right, y, fcol, align="right")
+            y += 18
+            ui.progress_bar(x, y, HUD_W - 28, 4, int(fill), 100, color=fcol, show_text=False)
+            y += 12
+        y += 4
+
+        # ── Emergent situations ──────────────────────────────────────────────
+        # Live situations the simulation has thrown up (autumn surge, fleet
+        # stretched, landfill crunch...). The full causal narrative arrives in
+        # the event banner as each emerges; here it's a compact standing list so
+        # the player can see what's going on at a glance.
+        mon = getattr(eco, "crisis_monitor", None)
+        sits = mon.active_situations() if mon else []
+        if sits:
+            ui.section_header(x, y, "SITUATIONS", w=HUD_W - 28)
+            y += 22
+            for sit in sits[:4]:
+                sev = sit.get("severity", "medium")
+                scol = c.STATUS_BAD if sev == "high" else c.STATUS_WARN
+                pygame.draw.circle(screen, scol, (x + 4, y + 7), 3)
+                nm = self._ellipsize(sit["name"], ui.fonts.get("body_s"), HUD_W - 46)
+                ui.text("body_s", nm, c.TEXT_SECONDARY, x + 14, y)
+                y += 20
+            y += 4
 
         # ── Scroll bookkeeping ───────────────────────────────────────────────
         content_bottom = y + self._hud_scroll + 8   # natural bottom of content
@@ -2414,9 +2456,20 @@ class UIManager:
         mcol = (c.STATUS_GOOD if morale >= 65 else
                 c.STATUS_WARN if morale >= 40 else c.STATUS_BAD)
 
+        # Ambient road congestion (from the fleet's traffic field).
+        traffic = getattr(self.game.fleet, "traffic", None)
+        cong_avg = traffic.average() if traffic else 0.0
+        if cong_avg < 0.22:
+            tlabel, tcol = "Free", c.STATUS_GOOD
+        elif cong_avg < 0.42:
+            tlabel, tcol = "Busy", c.STATUS_WARN
+        else:
+            tlabel, tcol = "Congested", c.STATUS_BAD
+
         segs = [
             ("WEATHER", wlabel, wcol),
             ("SEASON",  eco.season_name(), c.ACCENT_SAGE),
+            ("TRAFFIC", tlabel, tcol),
             ("DIESEL",  f"£{eco.fuel_price():.2f}/L {arrow}", dcol),
             ("MORALE",  f"{int(morale)}%", mcol),
         ]
@@ -2480,14 +2533,14 @@ class UIManager:
         fleet = self.game.fleet
         today = eco.get_day_of_week()
         week = eco.week_index
-        ui.text("body_s", "Click a weekday to move a round. FREQ toggles weekly/fortnightly.", c.TEXT_MUTED, x, y)
+        ui.text("body_s", "Click a weekday to move a round. FREQ toggles weekly/fortnightly. SAT is that round's local satisfaction.", c.TEXT_MUTED, x, y)
         ty = y + 24
         name_w = 160
         day_w = 38
-        freq_w = 90
-        type_w = 80
+        freq_w = 84
+        type_w = 72
         left_cols = name_w + 7 * day_w + freq_w + type_w
-        rest = {"props": 60, "due": 60, "status": 110}
+        rest = {"props": 52, "due": 52, "sat": 74, "status": 104}
         ui.label("ROUND", x, ty)
         cxp = x + name_w
         for i, d in enumerate(DAY_NAMES):
@@ -2500,7 +2553,7 @@ class UIManager:
         tx = fx + freq_w
         ui.text("caption", "TYPE", c.TEXT_DIM, tx + type_w // 2, ty, align="center")
         sx = tx + type_w
-        for label, key in (("PROPS", "props"), ("LEFT", "due"), ("STATUS", "status")):
+        for label, key in (("PROPS", "props"), ("LEFT", "due"), ("SAT", "sat"), ("STATUS", "status")):
             ui.text("caption", label, c.TEXT_DIM, sx + rest[key] // 2, ty, align="center")
             sx += rest[key]
         ty += 20
@@ -2540,6 +2593,17 @@ class UIManager:
             left_color = c.STATUS_BAD if left > 5 else c.STATUS_WARN if left > 0 else c.TEXT_MUTED
             ui.text("mono_s", str(left), left_color, sx + rest["due"] // 2, ty + 2, align="center")
             sx += rest["due"]
+            # Local satisfaction for this round (the map-as-management readout),
+            # plus a small complaint count when the round is grumbling.
+            sat = st.get("satisfaction")
+            if sat is None:
+                ui.text("mono_s", "--", c.TEXT_DIM, sx + rest["sat"] // 2, ty + 2, align="center")
+            else:
+                satcol = c.STATUS_GOOD if sat >= 70 else c.STATUS_WARN if sat >= 45 else c.STATUS_BAD
+                cmp = st.get("complaints", 0)
+                sat_txt = f"{int(sat)}%" + (f" !{cmp}" if cmp else "")
+                ui.text("mono_s", sat_txt, satcol, sx + rest["sat"] // 2, ty + 2, align="center")
+            sx += rest["sat"]
             stcol = c.STATUS_BAD if st["status"] in ("OVERFLOW", "DUE TODAY") else c.STATUS_WARN if st["status"] in ("WATCH", "NEXT WEEK") else c.TEXT_MUTED
             stkey = "body_s" if st["status"] in ("OVERFLOW", "DUE TODAY") else "caption"
             ui.text(stkey, st["status"], stcol, sx + rest["status"] // 2, ty + 2, align="center")
@@ -2611,12 +2675,24 @@ class UIManager:
         ui.label("Satisfaction ceiling", x + 280, ty)
         ui.value(f"{int(waste.satisfaction_ceiling())}%", x + 450, ty, c.ACCENT_TEAL)
         ty += 26
-        cont = waste.contamination_rate()
+        # Emergent borough contamination (population-weighted across the rounds),
+        # falling back to the policy estimate before the sim has run a day.
+        eco = self.game.economy
+        rec = waste.get("recycling")
+        if rec and rec.enabled:
+            cont = getattr(eco, "borough_contamination", None)
+            if cont is None:
+                cont = waste.contamination_rate()
+            band = "low" if cont < 0.10 else "high" if cont >= 0.16 else "moderate"
+            cont_label = f"{cont * 100:.0f}% ({band})"
+        else:
+            cont = 0.0
+            cont_label = "n/a"
         cont_col = c.ACCENT_TEAL if cont < 0.10 else (c.TEXT_MUTED if cont < 0.16 else c.ACCENT_CORAL)
         ui.label("Recycling rejected", x, ty)
-        ui.value(waste.contamination_label(), x + 140, ty, cont_col)
+        ui.value(cont_label, x + 140, ty, cont_col)
         if cont >= 0.10:
-            ui.text("caption", "Add food/garden caddies to keep loads clean.", c.TEXT_DIM, x + 280, ty + 2)
+            ui.text("caption", "Varies by area — students/dense estates foul loads; food/garden caddies clean them.", c.TEXT_DIM, x + 280, ty + 2)
 
     def _tab_fleet(self, screen, x, y, w, h):
         ui = self.ui
@@ -2624,7 +2700,16 @@ class UIManager:
         eco = self.game.economy
         fleet = self.game.fleet
         ui.text("body_s", "Choose a procurement method, then select a vehicle model and place your order.", c.TEXT_MUTED, x, y)
-        ty = y + 24
+        # Live procurement-market banner (shortages / gluts move price & lead time).
+        mkt_id = getattr(eco, "procurement_market", "normal")
+        if mkt_id != "normal":
+            mkt = eco.procurement_market_info()
+            mcol = c.STATUS_GOOD if mkt_id == "glut" else c.STATUS_WARN
+            ui.text("body_s", f"Market: {mkt['label']} — {mkt['blurb']}",
+                    mcol, x, y + 12)
+            ty = y + 34
+        else:
+            ty = y + 24
         tier_w = (w - 24) // 3
         tier_h = 64
         tier_data = [
@@ -3255,6 +3340,69 @@ class UIManager:
         ui.text("caption",
                 f"Miss the {_tgt:.0f}% statutory target at year-end for a DEFRA fine.",
                 c.TEXT_DIM, gx, ry)
+        ry += 18
+
+        # ── Council & reputation (politics feedback loop) ─────────────────────
+        import politics
+        ry += 8
+        ui.section_header(gx, ry, "COUNCIL & REPUTATION", gw)
+        ry += 22
+        rep = getattr(eco, "reputation", 60.0)
+        repcol = (c.STATUS_GOOD if rep >= 65 else
+                  c.STATUS_WARN if rep >= 40 else c.STATUS_BAD)
+        ui.label("Reputation", gx, ry)
+        ui.text("mono_b", f"{rep:.0f}/100", repcol, gx + gw, ry, align="right")
+        ry += 18
+        ui.text("caption", politics.reputation_label(rep), c.TEXT_DIM, gx, ry)
+        admin = politics.administration(getattr(eco, "administration", "balanced"))
+        ui.text("body_s", admin["label"] + " council",
+                c.ACCENT_TEAL, gx + gw, ry, align="right")
+        ry += 18
+        for bl in self._wrap_text(admin["blurb"], ui.fonts.get("caption"), gw)[:3]:
+            ui.text("caption", bl, c.TEXT_DIM, gx, ry)
+            ry += 13
+        ry += 6
+
+        # ── Landfill capacity ────────────────────────────────────────────────
+        st = eco.landfill_status()
+        if st:
+            ry += 8
+            ui.section_header(gx, ry, "LANDFILL", gw)
+            ry += 22
+            fill = st["fill_pct"]
+            fcol = (c.STATUS_GOOD if fill < 50 else
+                    c.STATUS_WARN if fill < 80 else c.STATUS_BAD)
+            ui.label("Site capacity used", gx, ry)
+            extra = " — FULL, exporting" if st["is_full"] else ""
+            ui.text("mono_b", f"{fill:.0f}%{extra}", fcol, gx + gw, ry, align="right")
+            ry += 18
+            ui.progress_bar(gx, ry, gw, 6, int(fill), 100, color=fcol, show_text=False)
+            ry += 14
+            gm = st["gate_mult"]
+            ui.label("Disposal cost factor", gx, ry)
+            gmcol = (c.STATUS_GOOD if gm < 1.15 else
+                     c.STATUS_WARN if gm < 1.8 else c.STATUS_BAD)
+            ui.text("mono", f"x{gm:.2f}", gmcol, gx + gw, ry, align="right")
+            ry += 18
+            yl = st["years_left"]
+            if yl is not None and not st["is_full"]:
+                ui.label("Estimated life", gx, ry)
+                ylcol = c.STATUS_BAD if yl < 0.5 else c.STATUS_WARN if yl < 1.2 else c.TEXT_SECONDARY
+                ui.text("mono", f"{yl:.1f} yrs", ylcol, gx + gw, ry, align="right")
+                ry += 18
+            ui.text("caption",
+                    "Recycling diverts waste from the tip and slows the rise in "
+                    "disposal cost.", c.TEXT_DIM, gx, ry)
+            ry += 26
+            fac = eco.facilities
+            added = fac.default_expansion()
+            cost = fac.expansion_cost(added)
+            can = eco.can_expand_landfill()
+            exp_rect = pygame.Rect(gx, ry, gw, 28)
+            self._pbtn(screen, exp_rect,
+                       f"Expand landfill (+{added/1000:.0f}k units, £{cost:,.0f})",
+                       self._expand_landfill, enabled=can, accent=can)
+            ry += 36
 
         # ── Achievements ─────────────────────────────────────────────────────
         if eco.achievements:
@@ -4316,6 +4464,42 @@ class UIManager:
         ui.label("Age in service", x, ty)
         ui.text("mono", f"{yrs:.1f} yrs", c.TEXT_SECONDARY, x + w, ty, align="right")
         ty += 18
+        # Usage-based wear: how hard this lorry has been worked for its age.
+        uf = fleet.usage_factor(truck)
+        ucol = (c.STATUS_GOOD if uf < 0.95 else
+                c.STATUS_WARN if uf < 1.25 else c.STATUS_BAD)
+        ulabel = ("Light" if uf < 0.85 else "Normal" if uf < 1.15
+                  else "Heavy" if uf < 1.5 else "Flogged")
+        ui.label("Utilisation", x, ty)
+        ui.text("body_s", f"{ulabel} (x{uf:.2f})", ucol, x + w, ty, align="right")
+        ty += 18
+        ui.label("Mileage / tips", x, ty)
+        ui.text("mono", f"{truck.get('mileage', 0):,.0f} / {truck.get('load_cycles', 0)}",
+                c.TEXT_DIM, x + w, ty, align="right")
+        ty += 18
+        # Crew fatigue & experience (drive service speed and reliability).
+        fat = truck.get("fatigue", 0.0)
+        fcol = (c.STATUS_GOOD if fat < 0.25 else
+                c.STATUS_WARN if fat < 0.55 else c.STATUS_BAD)
+        flabel = ("Fresh" if fat < 0.2 else "Steady" if fat < 0.45
+                  else "Tired" if fat < 0.7 else "Exhausted")
+        ui.label("Crew fatigue", x, ty)
+        ui.text("body_s", f"{flabel} ({int(fat*100)}%)", fcol, x + w, ty, align="right")
+        ty += 18
+        exp = truck.get("crew_experience", 0.45)
+        ui.label("Crew experience", x, ty)
+        elabel = ("Green" if exp < 0.45 else "Competent" if exp < 0.75 else "Veteran")
+        ui.text("body_s", elabel, c.ACCENT_TEAL, x + w, ty, align="right")
+        ty += 18
+        # Electric range: the eRCV's state of charge (diesels don't have one).
+        if truck.get("model_id") == "electric":
+            bat = truck.get("battery", 1.0)
+            bcol = (c.STATUS_GOOD if bat >= 0.4 else
+                    c.STATUS_WARN if bat >= 0.15 else c.STATUS_BAD)
+            btxt = f"{int(bat*100)}%" + (" (charging)" if truck.get("state") == "charging" else "")
+            ui.label("Battery charge", x, ty)
+            ui.text("body_s", btxt, bcol, x + w, ty, align="right")
+            ty += 18
         daily_cost = (truck.get("lease_weekly", 0) / 7.0 if truck.get("leased")
                       else truck.get("running_cost", 0))
         ui.label("Daily cost", x, ty)
@@ -4341,9 +4525,18 @@ class UIManager:
 
     def _toggle_stream(self, sid):
         self.game.waste.toggle(sid)
+        # Toggling a stream physically changes what's at the kerb: material for a
+        # dropped stream folds into the black bin. Refresh the per-property bins
+        # right away rather than waiting for them to drift.
+        import wastestreams
+        wastestreams.redistribute_on_policy_change(self.game.city, self.game.waste)
 
     def _cycle_stream_freq(self, sid):
         self.game.waste.cycle_frequency(sid)
+
+    def _expand_landfill(self):
+        ok, msg = self.game.economy.expand_landfill()
+        self.game.set_toast(msg)
 
     def _buy_vehicle(self, model_id, tier_id, lease):
         eco = self.game.economy
