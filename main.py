@@ -3,7 +3,7 @@ import sys
 import math
 from city import CityGenerator
 from renderer import Renderer
-from economy import Economy
+from economy import Economy, DIFFICULTY_ORDER
 from ui import UIManager
 from fleet import FleetManager
 from waste import WastePolicy
@@ -116,6 +116,7 @@ class WasteCityGame:
         self._editor_source = None     # ("new", density) | ("saved", path)
         self._menu_cam_t = 0.0         # drives the slow cinematic backdrop pan
         self.settings = {
+            "difficulty": "easy",      # easy | medium | hard
             "day_length": "normal",    # short | normal | long
             "events": "normal",        # calm | normal | chaotic
             "show_areas": True,
@@ -126,7 +127,7 @@ class WasteCityGame:
         self.show_areas = not self.show_areas
 
     def _clear_and_regenerate(self, city_path=None):
-        self.economy = Economy()
+        self.economy = Economy(self.settings.get("difficulty", "easy"))
         self.waste = WastePolicy()
         self.fleet = FleetManager(self)
         if city_path:
@@ -192,6 +193,9 @@ class WasteCityGame:
                 self._start_new_game(city_path=val)
             elif kind == "edit_saved":
                 self._start_editor(("saved", val))
+            elif kind == "difficulty":
+                # Difficulty chip in the Start New Game panel.
+                self.settings["difficulty"] = val
             return
 
         if action == "new":
@@ -219,6 +223,11 @@ class WasteCityGame:
             self.ui._menu_settings_open = False
             self.ui._menu_newgame_open = False
             self.ui._menu_editor_open = False
+        elif action == "set_difficulty":
+            order = DIFFICULTY_ORDER
+            cur = self.settings.get("difficulty", "easy")
+            idx = order.index(cur) if cur in order else 0
+            self.settings["difficulty"] = order[(idx + 1) % len(order)]
         elif action == "set_day_length":
             order = ["short", "normal", "long"]
             cur = self.settings.get("day_length", "normal")
@@ -305,7 +314,7 @@ class WasteCityGame:
             self.set_toast("Place a landfill site first (Landfill tool).")
             return
         stranded = len(self.city.unreachable_building_tiles())
-        self.economy = Economy()
+        self.economy = Economy(self.settings.get("difficulty", "easy"))
         self.waste = WastePolicy()
         self.fleet = FleetManager(self)
         self.fleet.setup_initial_fleet()
